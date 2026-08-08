@@ -1,0 +1,37 @@
+[package]
+name = "walkforward"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+postgres = ["dataloader/postgres"]
+
+[dependencies]
+# External dependencies
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+# Logging
+ultra-logger = { path = "../../LoggingEngine/ultra-logger" }
+once_cell = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+
+# Performance optimizations
+rayon = "1.8"
+futures = "0.3"  # For async execution in Rayon threads
+
+# Internal workspace dependencies
+# Removed circular dependency: backtest now depends on walkforward
+# backtest = { path = "../backtest" }
+genetic = { path = "../genetic" }
+config = { path = "../config" }
+dataloader = { path = "../dataloader" }
+data_prep = { path = "../data_prep" }
+orderbook = { path = "../orderbook" }
+portfoliomanager = { path = "../portfoliomanager" }
+riskmanager = { path = "../riskmanager" }
+strategy = { path = "../strategy" }
+metrics = { path = "../metrics" }

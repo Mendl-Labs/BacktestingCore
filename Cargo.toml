@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "backtest",
+    "orderbook",
+    "dataloader",
+    "walkforward",
+    "data_prep",
+    "metrics",
+    "derivatives",
+    "greeks",
+    "signal",
+    "smartrouter",
+    "portfoliomanager",
+    "quant-diagnostics",
+    "riskmanager",
+    "genetic",
+    "strategy",
+    "config",
+]

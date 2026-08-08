@@ -1,0 +1,53 @@
+[package]
+name = "genetic"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+postgres = ["databaseschema", "diesel", "dataloader/postgres", "strategy/postgres", "orderbook/postgres", "dep:bigdecimal"]
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+dataloader = { path = "../dataloader" }
+config = { path = "../config" }
+# Removed circular dependency: backtest now depends on genetic, not vice versa
+# backtest = { path = "../backtest" }
+strategy = { path = "../strategy" }
+orderbook = { path = "../orderbook" }
+portfoliomanager = { path = "../portfoliomanager" }
+riskmanager = { path = "../riskmanager" }
+tokio = { version = "1.0", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+bigdecimal = { version = "0.4", optional = true }
+databaseschema = { path = "../../databaseschema", optional = true }
+diesel = { version = "2.1", features = ["postgres", "r2d2", "chrono", "uuid", "serde_json", "numeric"], optional = true }
+uuid = "1.0"
+
+# Performance optimizations
+rayon = "1.8"
+num_cpus = "1.16"
+rustc-hash = "1.1"
+smallvec = "1.11"
+futures = "0.3"  # For async execution in Rayon threads
+parking_lot = "0.12"  # Lock-free primitives for diversity registry
+bincode = "1.3"
+
+# Logging
+ultra-logger = { path = "../../LoggingEngine/ultra-logger" }
+once_cell = "1.0"
+
+[dev-dependencies]
+# backtest = { path = "../backtest" }
+strategy = { path = "../strategy" }
+orderbook = { path = "../orderbook" }
+portfoliomanager = { path = "../portfoliomanager" }
+riskmanager = { path = "../riskmanager" }
+criterion = "0.5"
+
+[[bench]]
+name = "genetic_benchmark"
+harness = false
