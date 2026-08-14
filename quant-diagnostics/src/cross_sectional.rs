@@ -171,6 +171,18 @@ fn cross_sectional_rank_spread_by(
         });
     }
 
+    finish_result(n_symbols, periods, spreads)
+}
+
+/// Shared tail for both `cross_sectional_rank_spread_by` and
+/// `cross_sectional_rank_spread_by_class`: turns a completed period/spread
+/// list into the significance-tested result. Pulled out so the class-aware
+/// ranking variant doesn't have to re-derive the same t-test/guard logic.
+fn finish_result(
+    n_symbols: usize,
+    periods: Vec<RebalancePeriod>,
+    spreads: Vec<f64>,
+) -> CrossSectionalRankResult {
     let n = spreads.len();
     let mean_spread = spreads.iter().sum::<f64>() / n as f64;
 
@@ -209,6 +221,184 @@ fn cross_sectional_rank_spread_by(
         significant,
         periods,
     }
+}
+
+/// Same rebalance-period/forward-spread test as `cross_sectional_rank_spread`,
+/// but ranks each period by within-asset-class z-scored trailing return
+/// instead of a flat cross-universe trailing return -- so a crypto asset is
+/// only ever compared against other crypto assets (and forex against forex,
+/// equities against equities) when deciding who's a "winner" this period,
+/// never against a different asset class's return distribution directly.
+///
+/// This matters because momentum's magnitude/base-rate differs materially by
+/// asset class (2026-07-30 quant council "Mathematical Purist" ruling) -- a
+/// flat rank across a mixed-asset-class universe would let one class's wider
+/// return dispersion (crypto routinely swings far more than forex) silently
+/// dominate the ranking, so "winners" would just mean "was crypto" rather
+/// than "actually outperformed its own peers." `classes[i]` is symbol `i`'s
+/// asset-class id (any `usize`, e.g. an index into the caller's own class
+/// list) -- symbols sharing the same id are compared against each other.
+/// A class with fewer than 2 members can't be z-scored against peers, so
+/// every member of a singleton class gets a neutral (zero) signal that
+/// period -- it still participates in the overall rank (so it CAN end up a
+/// winner/loser if the other classes' spread is thin enough), it just never
+/// gets a same-class comparison boost.
+///
+/// Forward returns (what `winner_mean_forward_return`/`spread` measure) are
+/// always the raw, un-z-scored return -- only the ranking SIGNAL is
+/// class-relative; the payoff being measured is real dollars, not a
+/// standardized score.
+pub fn cross_sectional_rank_spread_by_class(
+    returns: &[Vec<f64>],
+    classes: &[usize],
+    lookback_bars: usize,
+    holding_bars: usize,
+) -> CrossSectionalRankResult {
+    let n_symbols = returns.len();
+    if n_symbols < MIN_SYMBOLS || lookback_bars == 0 || holding_bars == 0 || classes.len() != n_symbols {
+        return CrossSectionalRankResult::empty(n_symbols);
+    }
+    let min_len = returns.iter().map(|r| r.len()).min().unwrap_or(0);
+    let period_len = lookback_bars + holding_bars;
+    if min_len < period_len {
+        return CrossSectionalRankResult::empty(n_symbols);
+    }
+
+    let half = n_symbols / 2;
+    let n_periods = min_len / period_len;
+
+    let mut periods = Vec::with_capacity(n_periods);
+    let mut spreads = Vec::with_capacity(n_periods);
+
+    for k in 0..n_periods {
+        let period_start = k * period_len;
+        let rank_end = period_start + lookback_bars;
+        let hold_end = rank_end + holding_bars;
+
+        let raw_signal: Vec<f64> = (0..n_symbols)
+            .map(|i| returns[i][period_start..rank_end].iter().sum::<f64>())
+            .collect();
+
+        // Per-class mean/stdev of this period's raw trailing-return signal.
+        let mut class_sum: std::collections::HashMap<usize, (f64, usize)> = std::collections::HashMap::new();
+        for (i, &v) in raw_signal.iter().enumerate() {
+            let e = class_sum.entry(classes[i]).or_insert((0.0, 0));
+            e.0 += v;
+            e.1 += 1;
+        }
+        let class_mean: std::collections::HashMap<usize, f64> =
+            class_sum.iter().map(|(&c, &(sum, n))| (c, sum / n as f64)).collect();
+        let mut class_sq_dev: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+        for (i, &v) in raw_signal.iter().enumerate() {
+            let mean = class_mean[&classes[i]];
+            *class_sq_dev.entry(classes[i]).or_insert(0.0) += (v - mean).powi(2);
+        }
+        let class_std: std::collections::HashMap<usize, f64> = class_sq_dev
+            .iter()
+            .map(|(&c, &sq)| {
+                let n = class_sum[&c].1 as f64;
+                (c, if n > 1.0 { (sq / (n - 1.0)).sqrt() } else { 0.0 })
+            })
+            .collect();
+
+        let z_signal: Vec<(usize, f64)> = (0..n_symbols)
+            .map(|i| {
+                let std = class_std[&classes[i]];
+                let z = if std > 1e-12 { (raw_signal[i] - class_mean[&classes[i]]) / std } else { 0.0 };
+                (i, z)
+            })
+            .collect();
+
+        let mut signal = z_signal;
+        signal.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let winner_indices: Vec<usize> = signal[..half].iter().map(|(i, _)| *i).collect();
+        let loser_indices: Vec<usize> = signal[n_symbols - half..].iter().map(|(i, _)| *i).collect();
+
+        let fwd_return = |idx: usize| returns[idx][rank_end..hold_end].iter().sum::<f64>();
+        let winner_mean = winner_indices.iter().map(|&i| fwd_return(i)).sum::<f64>() / half as f64;
+        let loser_mean = loser_indices.iter().map(|&i| fwd_return(i)).sum::<f64>() / half as f64;
+        let spread = winner_mean - loser_mean;
+
+        spreads.push(spread);
+        periods.push(RebalancePeriod {
+            period_index: k,
+            winner_indices,
+            loser_indices,
+            winner_mean_forward_return: winner_mean,
+            loser_mean_forward_return: loser_mean,
+            spread,
+        });
+    }
+
+    finish_result(n_symbols, periods, spreads)
+}
+
+/// Grinold's Fundamental Law of Active Management, restated as an effective
+/// (correlation-adjusted) breadth: `N / (1 + (N-1) * rho_avg)`, where
+/// `rho_avg` is the average pairwise correlation across `returns`' full
+/// series. A universe of 10 assets that are all 90%+ correlated has an
+/// effective breadth close to 1 real independent bet, not 10 -- this is what
+/// should feed a multiple-comparisons/DSR trial count for a cross-sectional
+/// strategy built on that universe, not the raw symbol count (2026-08 quant
+/// council Phase 0 measurement: cross-asset-class correlation runs 5-15x
+/// lower than within-crypto correlation, which is exactly the gap this
+/// formula is meant to capture -- a low-rho universe keeps close to its full
+/// nominal breadth, a high-rho one collapses toward 1).
+///
+/// Returns `n_symbols` unchanged (no correlation adjustment) if fewer than 2
+/// series are supplied or all series are too short to correlate. Clamped to
+/// `[1.0, n_symbols]` -- a negative average correlation could otherwise push
+/// the formula above the nominal count, which isn't a meaningful "more
+/// independent bets than assets" result.
+pub fn effective_breadth(returns: &[Vec<f64>]) -> f64 {
+    let n = returns.len();
+    if n < 2 {
+        return n as f64;
+    }
+
+    let mut sum_rho = 0.0;
+    let mut n_pairs = 0usize;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if let Some(rho) = pearson_correlation(&returns[i], &returns[j]) {
+                sum_rho += rho;
+                n_pairs += 1;
+            }
+        }
+    }
+    if n_pairs == 0 {
+        return n as f64;
+    }
+    let rho_avg = sum_rho / n_pairs as f64;
+    let n_f = n as f64;
+    let effective = n_f / (1.0 + (n_f - 1.0) * rho_avg);
+    effective.clamp(1.0, n_f)
+}
+
+fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+    let len = a.len().min(b.len());
+    if len < 2 {
+        return None;
+    }
+    let a = &a[..len];
+    let b = &b[..len];
+    let mean_a = a.iter().sum::<f64>() / len as f64;
+    let mean_b = b.iter().sum::<f64>() / len as f64;
+    let mut cov = 0.0;
+    let mut var_a = 0.0;
+    let mut var_b = 0.0;
+    for i in 0..len {
+        let da = a[i] - mean_a;
+        let db = b[i] - mean_b;
+        cov += da * db;
+        var_a += da * da;
+        var_b += db * db;
+    }
+    if var_a <= 1e-18 || var_b <= 1e-18 {
+        return None;
+    }
+    Some(cov / (var_a.sqrt() * var_b.sqrt()))
 }
 
 #[cfg(test)]
@@ -402,5 +592,114 @@ mod tests {
         assert!(!result.significant);
         assert_eq!(result.t_stat, 0.0);
         assert_eq!(result.p_value, 1.0);
+    }
+
+    // --- cross_sectional_rank_spread_by_class ---
+
+    #[test]
+    fn by_class_too_few_symbols_returns_empty() {
+        let returns = vec![vec![0.01; 20]; 3];
+        let classes = vec![0, 0, 1];
+        let result = cross_sectional_rank_spread_by_class(&returns, &classes, 5, 5);
+        assert_eq!(result.n_periods, 0);
+    }
+
+    #[test]
+    fn by_class_mismatched_classes_length_returns_empty() {
+        let returns = vec![vec![0.01; 40]; 4];
+        let classes = vec![0, 0, 1]; // one short
+        let result = cross_sectional_rank_spread_by_class(&returns, &classes, 5, 5);
+        assert_eq!(result.n_periods, 0);
+    }
+
+    #[test]
+    fn by_class_ranks_within_class_not_across() {
+        // Two classes of 2. Class 0's symbols both have modest positive
+        // returns; class 1's symbols both have huge positive returns. A flat
+        // (non-class-aware) rank would put both class-1 symbols in the
+        // winner half every period since their raw return dwarfs class 0's.
+        // A class-relative rank instead compares each symbol only to its own
+        // class peer, so within EACH class one symbol should win and one
+        // should lose, regardless of the cross-class magnitude gap.
+        let period_len = 10;
+        let n_periods = 20;
+        let total_bars = period_len * n_periods;
+        // Class 0: symbol 0 slightly beats symbol 1 every period.
+        let c0_hi: Vec<f64> = (0..total_bars).map(|i| if i % 2 == 0 { 0.011 } else { 0.009 }).collect();
+        let c0_lo: Vec<f64> = (0..total_bars).map(|i| if i % 2 == 0 { 0.009 } else { 0.011 }).collect();
+        // Class 1: symbol 2 slightly beats symbol 3 every period, but both
+        // are an order of magnitude larger than class 0's returns.
+        let c1_hi: Vec<f64> = (0..total_bars).map(|i| if i % 2 == 0 { 0.31 } else { 0.29 }).collect();
+        let c1_lo: Vec<f64> = (0..total_bars).map(|i| if i % 2 == 0 { 0.29 } else { 0.31 }).collect();
+        let returns = vec![c0_hi, c0_lo, c1_hi, c1_lo];
+        let classes = vec![0, 0, 1, 1];
+
+        let result = cross_sectional_rank_spread_by_class(&returns, &classes, 5, 5);
+        assert!(result.n_periods > 0);
+        for p in &result.periods {
+            // Exactly one winner and one loser from each class, not both
+            // class-1 symbols sweeping the winner half.
+            let winner_classes: Vec<usize> = p.winner_indices.iter().map(|&i| classes[i]).collect();
+            let loser_classes: Vec<usize> = p.loser_indices.iter().map(|&i| classes[i]).collect();
+            assert!(winner_classes.contains(&0), "class 0 should have a representative among winners");
+            assert!(winner_classes.contains(&1), "class 1 should have a representative among winners");
+            assert!(loser_classes.contains(&0), "class 0 should have a representative among losers");
+            assert!(loser_classes.contains(&1), "class 1 should have a representative among losers");
+        }
+    }
+
+    #[test]
+    fn by_class_singleton_class_gets_neutral_signal() {
+        // Class 2 has only one member (symbol 3) -- it can't be z-scored
+        // against a peer, so it should get signal 0 every period rather than
+        // panicking or dividing by zero.
+        let returns = vec![vec![0.01; 40]; 4];
+        let classes = vec![0, 0, 1, 2];
+        let result = cross_sectional_rank_spread_by_class(&returns, &classes, 5, 5);
+        assert!(result.n_periods > 0);
+    }
+
+    // --- effective_breadth ---
+
+    #[test]
+    fn effective_breadth_of_fewer_than_two_series_is_the_raw_count() {
+        assert_eq!(effective_breadth(&[]), 0.0);
+        assert_eq!(effective_breadth(&[vec![0.01, 0.02, 0.03]]), 1.0);
+    }
+
+    #[test]
+    fn effective_breadth_of_perfectly_correlated_assets_collapses_toward_one() {
+        let series = vec![0.01, 0.02, -0.01, 0.03, -0.02, 0.01, 0.02, -0.01, 0.03, -0.02];
+        let returns = vec![series.clone(); 8];
+        let breadth = effective_breadth(&returns);
+        assert!(breadth < 1.5, "8 perfectly correlated assets should collapse close to 1 effective bet, got {}", breadth);
+    }
+
+    #[test]
+    fn effective_breadth_of_uncorrelated_assets_stays_close_to_raw_count() {
+        // Deterministic pseudo-independent series (distinct phase-shifted
+        // sinusoids) rather than a random seed, so the test is reproducible.
+        let n = 6;
+        let bars = 200;
+        let returns: Vec<Vec<f64>> = (0..n)
+            .map(|k| {
+                (0..bars)
+                    .map(|i| ((i as f64 * 0.7 + k as f64 * 2.3).sin()) * 0.01)
+                    .collect()
+            })
+            .collect();
+        let breadth = effective_breadth(&returns);
+        assert!(breadth > n as f64 * 0.5, "near-independent assets should keep most of their raw breadth, got {} of {}", breadth, n);
+    }
+
+    #[test]
+    fn effective_breadth_is_clamped_to_at_most_the_raw_count() {
+        // Strongly negatively correlated pair -- rho_avg near -1 would push
+        // the raw formula above n without the clamp.
+        let a: Vec<f64> = (0..50).map(|i| (i as f64 * 0.3).sin()).collect();
+        let b: Vec<f64> = a.iter().map(|v| -v).collect();
+        let returns = vec![a, b];
+        let breadth = effective_breadth(&returns);
+        assert!(breadth <= 2.0);
     }
 }

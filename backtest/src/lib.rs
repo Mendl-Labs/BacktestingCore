@@ -47,6 +47,7 @@ pub mod indicator_precompute;
 pub mod fast_signal_eval;
 pub mod pair_simulation;
 pub mod basket_simulation;
+pub mod cross_sectional_simulation;
 
 // Python strategy simulation (requires python feature)
 #[cfg(feature = "python")]
