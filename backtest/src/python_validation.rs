@@ -15,8 +15,12 @@ use std::sync::Arc;
 use anyhow::Result;
 #[cfg(feature = "python")]
 use anyhow::Context;
+// Unconditional: WalkForwardWindow's *_date fields (below) use DateTime<Utc>
+// regardless of the `python` feature; Duration/NaiveDate stay gated since
+// every other use of them in this file is inside python-gated code.
+use chrono::{DateTime, Utc};
 #[cfg(feature = "python")]
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "python")]
 use crate::{log_error, log_info, log_warn};
@@ -137,23 +141,150 @@ pub fn simple_returns(prices: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Counts contiguous regime **segments** -- maximal runs of the same
-/// trailing volatility-tercile label -- across an already-classified regime
-/// series. `None` entries (not enough trailing history yet to classify) are
-/// skipped without resetting the running label, so a gap mid-series doesn't
-/// spuriously split or merge two segments of the same regime around it.
-fn regime_segment_count(regimes: &[Option<quant_diagnostics::VolatilityRegime>]) -> usize {
-    let mut count = 0usize;
-    let mut prev: Option<quant_diagnostics::VolatilityRegime> = None;
-    for &r in regimes {
+/// Contiguous regime **segments** -- maximal runs of the same trailing
+/// volatility-tercile label -- across an already-classified regime series.
+/// `None` entries (not enough trailing history yet to classify) are skipped
+/// without resetting the running label or extending the current segment's
+/// span, so a gap mid-series doesn't spuriously split or merge two segments
+/// of the same regime around it. `end_idx` is inclusive (the last classified
+/// index carrying that label), matching how callers use it to find a
+/// representative bar inside the segment, not an exclusive Rust-range bound.
+fn regime_segments(
+    regimes: &[Option<quant_diagnostics::VolatilityRegime>],
+) -> Vec<(usize, usize, quant_diagnostics::VolatilityRegime)> {
+    let mut segments = Vec::new();
+    let mut current: Option<(usize, usize, quant_diagnostics::VolatilityRegime)> = None;
+    for (i, &r) in regimes.iter().enumerate() {
         if let Some(label) = r {
-            if prev != Some(label) {
-                count += 1;
+            match current {
+                Some((start, _, prev_label)) if prev_label == label => {
+                    current = Some((start, i, label));
+                }
+                Some(seg) => {
+                    segments.push(seg);
+                    current = Some((i, i, label));
+                }
+                None => {
+                    current = Some((i, i, label));
+                }
             }
-            prev = Some(label);
         }
     }
-    count
+    if let Some(seg) = current {
+        segments.push(seg);
+    }
+    segments
+}
+
+/// Counts contiguous regime segments -- see `regime_segments`' doc comment
+/// for the exact definition. Kept as a thin wrapper (rather than duplicating
+/// the walk) for `resolve_auto_wf_windows`'s hot path, which only needs the
+/// count, not the spans.
+fn regime_segment_count(regimes: &[Option<quant_diagnostics::VolatilityRegime>]) -> usize {
+    regime_segments(regimes).len()
+}
+
+/// Resolve the actual list of walk-forward window start offsets, ascending.
+/// Each window spans `[offset, offset + window_size)` (train + purge gap +
+/// test, contiguous); its TEST slice is the last `test_size` bars of that
+/// span.
+///
+/// When `regimes` is `Some`, up to one window per DISTINCT regime label
+/// actually present in the data (Low/Medium/High -- there are only ever
+/// three) is reserved first, scarcest label first -- so a common regime's
+/// placement can never accidentally consume the only viable slot for a
+/// scarce one -- before the remaining window budget is filled with the
+/// existing uniform, back-to-back spacing scheme. This is the placement half
+/// of the regime-diversity work `resolve_auto_wf_windows` already does for
+/// window *count*; see that function's 2026-08-07 doc comment for the gap
+/// this closes (count alone doesn't guarantee any window's TEST slice
+/// actually lands in an under-represented regime).
+///
+/// `regimes: None` reproduces the prior uniform-only placement exactly --
+/// no behavior change for any caller that doesn't pass regime data.
+///
+/// Windows are kept mutually disjoint throughout (both the regime-reserved
+/// ones and the uniform fill) -- overlapping OOS test windows correlate
+/// their errors and overstate how much independent evidence walk-forward
+/// actually gathered (see `resolve_wf_step`'s doc comment). This is a
+/// reasonable, not perfectly optimal, interval packer: a regime segment near
+/// the very end of the data can still get clipped by the `max_offset`
+/// bound, and a real-but-too-short segment (fewer bars than `test_size`
+/// could ever fit) is skipped rather than forced -- same "untested" outcome
+/// `regime_coverage_narrative` already reports today, just now because
+/// coverage is genuinely infeasible rather than an oversight.
+pub fn resolve_wf_window_offsets(
+    n: usize,
+    window_size: usize,
+    num_windows: usize,
+    test_size: usize,
+    regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
+) -> Vec<usize> {
+    if num_windows == 0 || window_size == 0 || window_size > n {
+        return Vec::new();
+    }
+    let max_offset = n - window_size;
+    let uniform_step = resolve_wf_step(n, window_size, num_windows);
+
+    let Some(regimes) = regimes else {
+        return (0..num_windows).map(|i| (i * uniform_step).min(max_offset)).collect();
+    };
+
+    use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+    let mut present: Vec<quant_diagnostics::VolatilityRegime> = [Low, Medium, High]
+        .into_iter()
+        .filter(|label| regimes.iter().any(|r| *r == Some(*label)))
+        .collect();
+    present.sort_by_key(|label| regimes.iter().filter(|r| **r == Some(*label)).count());
+
+    let segments = regime_segments(regimes);
+    let overlaps = |claimed: &[(usize, usize)], start: usize, end: usize| {
+        claimed.iter().any(|(cs, ce)| start < *ce && end > *cs)
+    };
+
+    let mut claimed: Vec<(usize, usize)> = Vec::new();
+    let mut reserved_offsets: Vec<usize> = Vec::new();
+
+    for label in present.into_iter().take(num_windows) {
+        // Prefer the LARGEST segment of this label -- more robust than a
+        // segment so short it's likely a one-bar classifier blip.
+        let mut candidates: Vec<&(usize, usize, quant_diagnostics::VolatilityRegime)> =
+            segments.iter().filter(|(_, _, l)| *l == label).collect();
+        candidates.sort_by_key(|(s, e, _)| std::cmp::Reverse(e.saturating_sub(*s)));
+
+        for (seg_start, seg_end, _) in candidates {
+            // Place the window so its test slice's midpoint sits inside the
+            // segment: test slice = [offset + window_size - test_size,
+            // offset + window_size), midpoint ~= offset + window_size -
+            // test_size/2. Solving for offset given a target midpoint:
+            let target_mid = (seg_start + seg_end) / 2;
+            let offset = (target_mid + test_size / 2).saturating_sub(window_size).min(max_offset);
+            let end = offset + window_size;
+            if overlaps(&claimed, offset, end) {
+                continue;
+            }
+            claimed.push((offset, end));
+            reserved_offsets.push(offset);
+            break;
+        }
+        // No viable placement found for this (real but too-short, or fully
+        // claimed-over) regime -- skip it, matching the pre-existing
+        // "genuinely untestable" outcome.
+    }
+
+    let mut offsets = reserved_offsets;
+    let mut candidate = 0usize;
+    while offsets.len() < num_windows && candidate <= max_offset {
+        let end = candidate + window_size;
+        if !overlaps(&claimed, candidate, end) {
+            claimed.push((candidate, end));
+            offsets.push(candidate);
+        }
+        candidate += uniform_step.max(1);
+    }
+
+    offsets.sort_unstable();
+    offsets
 }
 
 /// Per-bar close/reference price series from `MarketData`, mirroring the
@@ -254,6 +385,31 @@ pub fn regime_coverage_narrative(
             untested.join("/")
         )
     }
+}
+
+/// Structured counterpart to `regime_coverage_narrative`: `true` when at
+/// least one volatility regime genuinely present in `all_regimes` was never
+/// tested out-of-sample per `tested_regimes`. Exists so callers that need to
+/// GATE on coverage (e.g. downgrading a Promising verdict) don't have to
+/// parse the prose narrative -- see `regime_coverage_narrative`'s own doc
+/// comment for the shared `present`/`tested_counts` logic this mirrors.
+/// `false` when regime classification wasn't available at all (nothing
+/// "present" to have missed), same as the narrative's empty-string case.
+pub fn regime_coverage_incomplete(
+    tested_regimes: &[Option<quant_diagnostics::VolatilityRegime>],
+    all_regimes: &[Option<quant_diagnostics::VolatilityRegime>],
+) -> bool {
+    use quant_diagnostics::VolatilityRegime;
+    let present: Vec<VolatilityRegime> = [VolatilityRegime::Low, VolatilityRegime::Medium, VolatilityRegime::High]
+        .into_iter()
+        .filter(|label| all_regimes.iter().any(|r| *r == Some(*label)))
+        .collect();
+    if present.is_empty() {
+        return false;
+    }
+    present
+        .iter()
+        .any(|&label| !tested_regimes.iter().any(|&r| r == Some(label)))
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +914,10 @@ pub struct WalkForwardResult {
     /// doc comment. Empty string when no regime could be classified at all.
     #[serde(default)]
     pub regime_coverage_narrative: String,
+    /// Structured counterpart to `regime_coverage_narrative` -- see
+    /// `regime_coverage_incomplete`'s doc comment.
+    #[serde(default)]
+    pub regime_coverage_incomplete: bool,
 }
 
 /// A single walk-forward window result.
@@ -768,6 +928,21 @@ pub struct WalkForwardWindow {
     pub train_end_idx: usize,
     pub test_start_idx: usize,
     pub test_end_idx: usize,
+    /// Real calendar bounds for the same indices above, so a UI can place
+    /// this window on an actual timeline instead of a meaningless bar
+    /// count -- added alongside the *_idx fields rather than replacing them
+    /// since every existing consumer (parameter_stability, regime labeling)
+    /// keys off the indices. `None` on old, already-persisted results
+    /// (`#[serde(default)]`) rather than backfilling, since the source bar
+    /// data needed to compute them isn't available after the fact.
+    #[serde(default)]
+    pub train_start_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub train_end_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub test_start_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub test_end_date: Option<DateTime<Utc>>,
     /// Training period metrics.
     pub train_pnl: f64,
     pub train_sharpe: f64,
@@ -2364,7 +2539,6 @@ async fn run_walk_forward(
     let window_size = n / num_windows.max(1);
     let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
     let test_size = window_size - train_size;
-    let step = resolve_wf_step(n, window_size, num_windows);
 
     // Convert WF_PURGE_GAP_DAYS to a bar count from the data's own average
     // spacing (capped at half the test window so a short/coarse-granularity
@@ -2388,12 +2562,25 @@ async fn run_walk_forward(
     // window_regime_label/regime_coverage_narrative's doc comments.
     let regimes = quant_diagnostics::volatility_tercile_regimes(&simple_returns(&close_prices_from_market_data(data)), REGIME_WINDOW);
 
+    // Window placement (2026-08 stratified-by-regime upgrade, Phase 2):
+    // reserves a window per detected regime before falling back to uniform
+    // spacing -- see resolve_wf_window_offsets' doc comment. Filtered against
+    // the same bound the original while-loop enforced (offset + train + gap
+    // + test <= n), since the placement function itself doesn't know about
+    // the purge gap.
+    let offsets: Vec<usize> = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes))
+        .into_iter()
+        .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+        .collect();
+
     let mut windows: Vec<WalkForwardWindow> = Vec::new();
     let mut oos_results: Vec<BacktestResult> = Vec::new();
-    let mut offset = 0usize;
     let mut window_idx = 0usize;
 
-    while offset + train_size + purge_gap_bars + test_size <= n && windows.len() < num_windows {
+    for offset in offsets {
+        if windows.len() >= num_windows {
+            break;
+        }
         let train_start = offset;
         let train_end = offset + train_size;
         let test_start = train_end + purge_gap_bars;
@@ -2418,7 +2605,6 @@ async fn run_walk_forward(
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF] Window {} train backtest failed, skipping: {}", windows.len() + 1, e);
-                offset += step;
                 continue;
             }
         };
@@ -2429,7 +2615,6 @@ async fn run_walk_forward(
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF] Window {} test backtest failed, skipping: {}", windows.len() + 1, e);
-                offset += step;
                 continue;
             }
         };
@@ -2464,6 +2649,10 @@ async fn run_walk_forward(
             train_end_idx: train_end,
             test_start_idx: test_start,
             test_end_idx: test_end,
+            train_start_date: data.get(train_start).map(market_data_timestamp),
+            train_end_date: data.get(train_end.saturating_sub(1)).map(market_data_timestamp),
+            test_start_date: data.get(test_start).map(market_data_timestamp),
+            test_end_date: data.get(test_end.saturating_sub(1)).map(market_data_timestamp),
             train_pnl,
             train_sharpe,
             train_trades: train_result.num_trades,
@@ -2479,8 +2668,6 @@ async fn run_walk_forward(
         oos_results.push(test_result);
         window_idx += 1;
         on_window_complete(window_idx, num_windows);
-
-        offset += step;
     }
 
     if windows.is_empty() {
@@ -2534,6 +2721,7 @@ async fn run_walk_forward(
 
     let tested_regimes: Vec<Option<quant_diagnostics::VolatilityRegime>> = windows.iter().map(|w| w.test_regime).collect();
     let regime_coverage_narrative = regime_coverage_narrative(&tested_regimes, &regimes);
+    let regime_coverage_incomplete = regime_coverage_incomplete(&tested_regimes, &regimes);
 
     Ok(WalkForwardResult {
         windows,
@@ -2547,6 +2735,7 @@ async fn run_walk_forward(
         oos_combined_result: oos_combined,
         ga_trial_count: None,
         regime_coverage_narrative,
+        regime_coverage_incomplete,
     })
 }
 
@@ -2700,7 +2889,6 @@ async fn run_walk_forward_with_ga(
     let window_size = n / num_windows.max(1);
     let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
     let test_size = window_size - train_size;
-    let step = resolve_wf_step(n, window_size, num_windows);
 
     // Bar-based annualization factor derived from this dataset's OWN average
     // bar spacing (2026-08 annualization fix, mirroring run_walk_forward's
@@ -2737,9 +2925,15 @@ async fn run_walk_forward_with_ga(
     // Regime-coverage signal (2026-08) -- see run_walk_forward's identical fix.
     let regimes = quant_diagnostics::volatility_tercile_regimes(&simple_returns(&close_prices_from_market_data(data)), REGIME_WINDOW);
 
+    // Window placement (2026-08 stratified-by-regime upgrade, Phase 2) -- see
+    // run_walk_forward's identical fix and resolve_wf_window_offsets' doc
+    // comment. No purge gap in this path (test_start = train_end directly),
+    // so window_size already matches what resolve_wf_window_offsets expects
+    // exactly, no extra bounds filtering needed.
+    let offsets = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes));
+
     let mut windows: Vec<WalkForwardWindow> = Vec::new();
     let mut oos_results: Vec<BacktestResult> = Vec::new();
-    let mut offset = 0usize;
     // Each window below runs its own fresh, uncached AdaptiveGeneticOptimizer
     // (mini_ga) -- a genuinely independent population x generations search
     // against that window's training slice. Accumulate the REAL number of
@@ -2748,7 +2942,10 @@ async fn run_walk_forward_with_ga(
     // visible to the DSR trial count instead of vanishing entirely.
     let mut total_mini_ga_trials: usize = 0;
 
-    while offset + train_size + test_size <= n && windows.len() < num_windows {
+    for offset in offsets {
+        if windows.len() >= num_windows {
+            break;
+        }
         let train_start = offset;
         let train_end = offset + train_size;
         let test_start = train_end;
@@ -3002,7 +3199,6 @@ async fn run_walk_forward_with_ga(
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF-GA] Window {} train backtest failed, skipping: {}", windows.len() + 1, e);
-                offset += step;
                 continue;
             }
         };
@@ -3013,7 +3209,6 @@ async fn run_walk_forward_with_ga(
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF-GA] Window {} test backtest failed, skipping: {}", windows.len() + 1, e);
-                offset += step;
                 continue;
             }
         };
@@ -3043,6 +3238,10 @@ async fn run_walk_forward_with_ga(
             train_end_idx: train_end,
             test_start_idx: test_start,
             test_end_idx: test_end,
+            train_start_date: data.get(train_start).map(market_data_timestamp),
+            train_end_date: data.get(train_end.saturating_sub(1)).map(market_data_timestamp),
+            test_start_date: data.get(test_start).map(market_data_timestamp),
+            test_end_date: data.get(test_end.saturating_sub(1)).map(market_data_timestamp),
             train_pnl: train_result.total_pnl,
             train_sharpe: train_result.sharpe_ratio.unwrap_or(0.0),
             train_trades: train_result.num_trades,
@@ -3057,7 +3256,6 @@ async fn run_walk_forward_with_ga(
 
         oos_results.push(test_result);
         on_window_complete(windows.len(), num_windows);
-        offset += step;
     }
 
     if windows.is_empty() {
@@ -3106,6 +3304,7 @@ async fn run_walk_forward_with_ga(
     let num_win = windows.len();
     let tested_regimes: Vec<Option<quant_diagnostics::VolatilityRegime>> = windows.iter().map(|w| w.test_regime).collect();
     let regime_coverage_narrative = regime_coverage_narrative(&tested_regimes, &regimes);
+    let regime_coverage_incomplete = regime_coverage_incomplete(&tested_regimes, &regimes);
     Ok(WalkForwardResult {
         windows,
         avg_oos_sharpe,
@@ -3118,6 +3317,7 @@ async fn run_walk_forward_with_ga(
         oos_combined_result: oos_combined,
         ga_trial_count: Some(total_mini_ga_trials),
         regime_coverage_narrative,
+        regime_coverage_incomplete,
     })
 }
 
@@ -3851,6 +4051,133 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // regime_segments / resolve_wf_window_offsets
+    // ---------------------------------------------------------------------
+
+    fn make_regimes(spec: &[(usize, quant_diagnostics::VolatilityRegime)]) -> Vec<Option<quant_diagnostics::VolatilityRegime>> {
+        spec.iter().flat_map(|(count, label)| std::iter::repeat(Some(*label)).take(*count)).collect()
+    }
+
+    #[test]
+    fn regime_segments_splits_on_label_change_and_skips_none_gaps() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let mut regimes = make_regimes(&[(5, Low), (3, High), (4, Medium)]);
+        // Insert a None gap inside the Low run -- must not split it.
+        regimes[2] = None;
+        let segments = regime_segments(&regimes);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].2, Low);
+        assert_eq!(segments[0].0, 0);
+        assert_eq!(segments[0].1, 4); // still spans the whole Low run despite the gap at index 2
+        assert_eq!(segments[1].2, High);
+        assert_eq!(segments[2].2, Medium);
+    }
+
+    #[test]
+    fn regime_segment_count_matches_regime_segments_len() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let regimes = make_regimes(&[(5, Low), (3, High), (4, Medium), (2, Low)]);
+        assert_eq!(regime_segment_count(&regimes), regime_segments(&regimes).len());
+        assert_eq!(regime_segment_count(&regimes), 4);
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_none_regimes_matches_prior_uniform_behavior() {
+        let n = 10_000;
+        let num_windows = 8;
+        let window_size = n / num_windows;
+        let step = resolve_wf_step(n, window_size, num_windows);
+        let expected: Vec<usize> = (0..num_windows).map(|i| (i * step).min(n - window_size)).collect();
+        assert_eq!(resolve_wf_window_offsets(n, window_size, num_windows, window_size / 3, None), expected);
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_places_a_window_in_every_present_regime() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        // 900 bars: a long Low run, then a short High spike, then Medium --
+        // uniform spacing alone (3 evenly-spaced windows) would very plausibly
+        // miss the short High segment entirely.
+        let regimes = make_regimes(&[(600, Low), (60, High), (240, Medium)]);
+        let n = regimes.len();
+        let window_size = 150;
+        let test_size = 45;
+        let num_windows = 3;
+        let offsets = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes));
+
+        let segments = regime_segments(&regimes);
+        let mut covered: Vec<quant_diagnostics::VolatilityRegime> = Vec::new();
+        for &offset in &offsets {
+            let test_start = offset + window_size - test_size;
+            let test_end = offset + window_size;
+            let mid = (test_start + test_end) / 2;
+            if let Some(label) = regimes.get(mid.min(n - 1)).copied().flatten() {
+                if !covered.contains(&label) {
+                    covered.push(label);
+                }
+            }
+        }
+        for (_, _, label) in &segments {
+            assert!(
+                covered.contains(label),
+                "regime {:?} present in the data but no window's test slice landed in it (offsets={:?})",
+                label, offsets
+            );
+        }
+        assert!(covered.contains(&Low) && covered.contains(&High) && covered.contains(&Medium));
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_windows_stay_disjoint_with_regimes() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let regimes = make_regimes(&[(300, Low), (50, High), (300, Medium), (50, Low), (300, High)]);
+        let n = regimes.len();
+        let window_size = 120;
+        let offsets = resolve_wf_window_offsets(n, window_size, 6, 36, Some(&regimes));
+        for i in 0..offsets.len() {
+            for j in (i + 1)..offsets.len() {
+                let (a, b) = (offsets[i], offsets[j]);
+                assert!(
+                    a + window_size <= b || b + window_size <= a,
+                    "windows at {} and {} overlap (window_size={})", a, b, window_size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_skips_a_regime_too_short_to_fit_a_test_slice() {
+        use quant_diagnostics::VolatilityRegime::{High, Low};
+        // A single-bar High blip can never host a 40-bar test slice -- must
+        // not panic or produce a malformed offset, just quietly omit it.
+        let mut regimes = make_regimes(&[(500, Low)]);
+        regimes[250] = Some(High);
+        let n = regimes.len();
+        let offsets = resolve_wf_window_offsets(n, 120, 4, 40, Some(&regimes));
+        assert!(!offsets.is_empty());
+        for &offset in &offsets {
+            assert!(offset + 120 <= n);
+        }
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_empty_regimes_falls_back_to_uniform() {
+        let n = 1000;
+        let window_size = 200;
+        let num_windows = 4;
+        let empty_regimes: Vec<Option<quant_diagnostics::VolatilityRegime>> = vec![None; n];
+        let with_none_regimes = resolve_wf_window_offsets(n, window_size, num_windows, 60, Some(&empty_regimes));
+        let with_no_regimes = resolve_wf_window_offsets(n, window_size, num_windows, 60, None);
+        assert_eq!(with_none_regimes, with_no_regimes);
+    }
+
+    #[test]
+    fn resolve_wf_window_offsets_zero_window_size_or_num_windows_returns_empty() {
+        assert!(resolve_wf_window_offsets(1000, 0, 4, 10, None).is_empty());
+        assert!(resolve_wf_window_offsets(1000, 100, 0, 10, None).is_empty());
+        assert!(resolve_wf_window_offsets(100, 500, 4, 10, None).is_empty());
+    }
+
+    // ---------------------------------------------------------------------
     // window_regime_label / regime_coverage_narrative
     // ---------------------------------------------------------------------
 
@@ -3899,6 +4226,28 @@ mod tests {
         assert!(narrative.contains("Medium"));
         assert!(narrative.contains("High"));
         assert!(narrative.contains("never tested out-of-sample"));
+    }
+
+    #[test]
+    fn regime_coverage_incomplete_is_false_when_no_regime_classified() {
+        assert!(!regime_coverage_incomplete(&[], &[]));
+        assert!(!regime_coverage_incomplete(&[], &[None, None]));
+    }
+
+    #[test]
+    fn regime_coverage_incomplete_is_false_for_full_coverage() {
+        use quant_diagnostics::VolatilityRegime;
+        let tested_regimes = vec![Some(VolatilityRegime::Low), Some(VolatilityRegime::Medium), Some(VolatilityRegime::High)];
+        let all_regimes = vec![Some(VolatilityRegime::Low), Some(VolatilityRegime::Medium), Some(VolatilityRegime::High)];
+        assert!(!regime_coverage_incomplete(&tested_regimes, &all_regimes));
+    }
+
+    #[test]
+    fn regime_coverage_incomplete_is_true_for_partial_coverage() {
+        use quant_diagnostics::VolatilityRegime;
+        let tested_regimes: Vec<Option<VolatilityRegime>> = vec![Some(VolatilityRegime::Low); 6];
+        let all_regimes = vec![Some(VolatilityRegime::Low), Some(VolatilityRegime::Medium), Some(VolatilityRegime::High)];
+        assert!(regime_coverage_incomplete(&tested_regimes, &all_regimes));
     }
 
     // ---------------------------------------------------------------------
@@ -4057,6 +4406,7 @@ mod tests {
             oos_combined_result: None,
             ga_trial_count: Some(400),
             regime_coverage_narrative: String::new(),
+            regime_coverage_incomplete: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: WalkForwardResult = serde_json::from_str(&json).unwrap();
@@ -4073,6 +4423,10 @@ mod tests {
             train_end_idx: 1000,
             test_start_idx: 1000,
             test_end_idx: 1200,
+            train_start_date: None,
+            train_end_date: None,
+            test_start_date: None,
+            test_end_date: None,
             train_pnl: 500.0,
             train_sharpe: 1.8,
             train_trades: 50,
@@ -4184,6 +4538,7 @@ mod tests {
             oos_combined_result: None,
             ga_trial_count: None,
             regime_coverage_narrative: String::new(),
+            regime_coverage_incomplete: false,
         };
         assert_eq!(result.windows.len(), 0);
         assert_eq!(result.num_windows, 0);
