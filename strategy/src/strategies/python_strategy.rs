@@ -186,22 +186,85 @@ del _name, _src, _sub, _k
 "#.to_string()
 }
 
+/// SDK injection state, shared process-wide since `sys.modules` is a single
+/// global table shared by every `Python::with_gil` caller regardless of
+/// which OS thread invoked it.
+const SDK_NOT_STARTED: u8 = 0;
+const SDK_IN_PROGRESS: u8 = 1;
+const SDK_DONE_OK: u8 = 2;
+const SDK_DONE_ERR: u8 = 3;
+static SDK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SDK_NOT_STARTED);
+static SDK_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Helper: inject the SDK into a Python interpreter.
 /// Must be called after the sandbox is installed but before user code.
 /// Public so other crates (`backtest`, etc.) can call it before loading
 /// user Python modules that `from trading_platform import ...`.
+///
+/// This used to unconditionally re-exec the SDK source into `sys.modules`
+/// on every call, i.e. once per backtest job via `init_python()`. `sys.modules`
+/// is one process-wide table, and the GIL does not protect a multi-step
+/// operation like this from being interleaved with another thread's
+/// concurrent `inject_sdk` call: CPython yields the GIL mid-bytecode at
+/// periodic check intervals, so one job's still-building
+/// `trading_platform.types`/`trading_platform.strategy` submodules could be
+/// observed (or clobbered by a fresh, empty module of the same name) by
+/// another job running concurrently -- e.g. parallel GA workers or
+/// portfolio-leg validation. That produced live, intermittent failures:
+/// `ImportError: cannot import name 'DataRequirements' from
+/// 'trading_platform.types' (unknown location)`,
+/// `AttributeError: 'Strategy' object has no attribute 'initialize'`, and
+/// `TypeError: Strategy.initialize() takes 1 positional argument but 2 were
+/// given` (confirmed against real `backtest_jobs` rows from 2026-08-15).
+///
+/// Fixed by making injection idempotent and run-once: the first caller
+/// performs the actual exec under an atomic CAS; concurrent callers detect
+/// `SDK_IN_PROGRESS` and release the GIL (`py.allow_threads`) while they
+/// wait, so the initializing thread can still be scheduled and finish --
+/// spin-waiting here without releasing the GIL would deadlock the two
+/// threads against each other.
 pub fn inject_sdk(py: Python<'_>) -> Result<(), StrategyError> {
-    let locals = PyDict::new_bound(py);
-    locals.set_item("_sdk_types_src", PYTHON_SDK_TYPES).unwrap();
-    locals.set_item("_sdk_strategy_src", PYTHON_SDK_STRATEGY).unwrap();
-    locals.set_item("_sdk_indicators_src", PYTHON_SDK_INDICATORS).unwrap();
-    locals.set_item("_sdk_init_src", PYTHON_SDK_INIT).unwrap();
+    loop {
+        match SDK_STATE.compare_exchange(
+            SDK_NOT_STARTED,
+            SDK_IN_PROGRESS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let locals = PyDict::new_bound(py);
+                locals.set_item("_sdk_types_src", PYTHON_SDK_TYPES).unwrap();
+                locals.set_item("_sdk_strategy_src", PYTHON_SDK_STRATEGY).unwrap();
+                locals.set_item("_sdk_indicators_src", PYTHON_SDK_INDICATORS).unwrap();
+                locals.set_item("_sdk_init_src", PYTHON_SDK_INIT).unwrap();
 
-    py.run_bound(&sdk_injection_code(), None, Some(&locals))
-        .map_err(|e| {
-            StrategyError::ConfigurationError(format!("SDK injection error: {}", e))
-        })?;
-    Ok(())
+                return match py.run_bound(&sdk_injection_code(), None, Some(&locals)) {
+                    Ok(_) => {
+                        SDK_STATE.store(SDK_DONE_OK, Ordering::Release);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let msg = format!("SDK injection error: {}", e);
+                        let _ = SDK_ERROR.set(msg.clone());
+                        SDK_STATE.store(SDK_DONE_ERR, Ordering::Release);
+                        Err(StrategyError::ConfigurationError(msg))
+                    }
+                };
+            }
+            Err(SDK_DONE_OK) => return Ok(()),
+            Err(SDK_DONE_ERR) => {
+                return Err(StrategyError::ConfigurationError(
+                    SDK_ERROR
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| "SDK injection failed previously".to_string()),
+                ));
+            }
+            Err(_) => {
+                py.allow_threads(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+            }
+        }
+    }
 }
 
 /// Global kill switch for the optional `compute_features()` diagnostic hook.
