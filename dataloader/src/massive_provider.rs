@@ -681,6 +681,29 @@ impl MarketDataProvider for MassiveDataProvider {
             .map(|b| {
                 // Polygon timestamps are milliseconds since Unix epoch
                 let ts = Utc.timestamp_millis_opt(b.t).single().unwrap_or_else(Utc::now);
+                // Polygon's daily equity bars are timestamped at midnight US
+                // Eastern Time (e.g. "2024-01-02" -> 1704171600000, 05:00
+                // UTC in winter), while forex/crypto daily bars are
+                // timestamped at midnight UTC (same date -> 1704153600000,
+                // 00:00 UTC) -- confirmed directly against the API for
+                // MSFT/AUD-USD/BTC-USD on the same dates. That ~4-5 hour
+                // (DST-dependent) offset means an exact-timestamp intersect
+                // join (`intersect_timestamps_ascending`) finds ZERO shared
+                // bars between a stocks leg and any forex/crypto leg even on
+                // days both markets are open, breaking every cross-asset-
+                // class backtest (pairs, basket, cross-sectional) that
+                // includes an equity. Re-anchor stocks' daily bars to UTC
+                // midnight of the same calendar date so they align with
+                // every other asset class's convention. Safe because ET is
+                // always behind UTC, so the ET-midnight timestamp always
+                // falls within the SAME UTC calendar date, never rolls over.
+                let ts = if granularity == CandleGranularity::Day1
+                    && request.asset_class.as_deref() == Some("stocks")
+                {
+                    ts.date_naive().and_hms_opt(0, 0, 0).map(|dt| dt.and_utc()).unwrap_or(ts)
+                } else {
+                    ts
+                };
                 MarketData::Candle(Candle {
                     timestamp: ts,
                     symbol: Arc::clone(&symbol),
