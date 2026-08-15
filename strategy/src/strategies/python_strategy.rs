@@ -1713,21 +1713,46 @@ impl Strategy for PythonStrategy {
         // Initialize Python interpreter and load strategy
         let py_obj = self.init_python()?;
 
-        // Call Python initialize() with parameters
+        // Call Python initialize() with parameters.
+        //
+        // Strategy classes are expected to inherit BaseStrategy, whose
+        // initialize(self, parameters: dict) accepts exactly this call
+        // shape. Two malformed-but-real submissions show up in practice
+        // (confirmed against live AI-generated strategy jobs --
+        // backtest_jobs 1e0e7cc8/2efb9572/31eaa6ff/4b1c5a94, all predating
+        // the SDK-injection-race fix and unaffected by it, since these are
+        // deterministic authoring defects, not a race):
+        //   1. The class doesn't inherit BaseStrategy at all, so it has no
+        //      `initialize` attribute -- raises AttributeError. Treated as
+        //      a no-op init rather than a hard failure: nothing in the
+        //      actually-required interface (name(), compute_signals())
+        //      depends on it.
+        //   2. The class overrides `initialize(self)` with no parameters
+        //      arg, raising "takes 1 positional argument but 2 were given"
+        //      when called with the params dict. Retried with a bare
+        //      zero-arg call -- a strategy that declined the parameters arg
+        //      has nothing to do with the dict anyway.
         Python::with_gil(|py| {
             let strategy = py_obj.bind(py);
+
+            if !strategy.hasattr("initialize").unwrap_or(false) {
+                return Ok::<(), StrategyError>(());
+            }
+
             let params_dict = Self::params_to_py(py, &parameters).map_err(|e| {
                 StrategyError::ConfigurationError(format!("Parameter conversion error: {}", e))
             })?;
 
-            strategy
-                .call_method1("initialize", (params_dict,))
-                .map_err(|e| {
-                    StrategyError::ConfigurationError(format!(
-                        "Python initialize() error: {}",
-                        e
-                    ))
-                })?;
+            if let Err(e) = strategy.call_method1("initialize", (params_dict,)) {
+                let arity_mismatch = e.to_string().contains("positional argument");
+                if arity_mismatch && strategy.call_method0("initialize").is_ok() {
+                    return Ok(());
+                }
+                return Err(StrategyError::ConfigurationError(format!(
+                    "Python initialize() error: {}",
+                    e
+                )));
+            }
 
             Ok::<(), StrategyError>(())
         })?;
