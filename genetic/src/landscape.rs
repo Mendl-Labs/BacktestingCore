@@ -266,6 +266,55 @@ pub struct ConvergencePoint {
     pub mean_fitness: f64,
 }
 
+/// Discount ratio applied to a GA's raw evaluation count (`GAReport::
+/// total_fresh_evaluations`) before it feeds DSR's multiple-comparisons
+/// trial count -- an approximation of "how many of these evaluations were
+/// genuinely independent trials" using data already collected by every GA
+/// run, without requiring new per-evaluation instrumentation.
+///
+/// The problem this addresses: DSR treats every GA evaluation as an
+/// independent random draw, but a GA doesn't sample parameter space
+/// uniformly -- selection pressure concentrates later generations around
+/// already-promising regions, so many evaluations are refinements of a
+/// known solution rather than independent bets. Counting them at full
+/// weight over-penalizes a genuinely GA-optimized strategy's DSR relative
+/// to what a correlation-aware trial count would show. A fully rigorous
+/// fix would track each population member's own return series and apply
+/// an `effective_breadth`-style (Grinold) correlation adjustment across
+/// all of them -- that data isn't currently collected (would need new
+/// per-evaluation instrumentation in the GA's hot loop), so this is a
+/// principled, conservative proxy instead, not a replacement for that
+/// eventual, more rigorous version.
+///
+/// Proxy: the fraction of generations whose best_fitness meaningfully
+/// improved over the previous generation's. A generation whose incumbent
+/// didn't improve found nothing better than what the GA already knew --
+/// its evaluations still happened and still carry real overfitting risk
+/// against the same data, but they didn't expand the set of genuinely
+/// distinct candidate solutions the way an improving generation did, so
+/// weighting them at full strength toward the multiple-comparisons penalty
+/// is likely too harsh. The first generation always counts as informative
+/// (it improves over "nothing"). Floored at 0.1 -- even a fully plateaued
+/// search still represents real evaluations against real data with real
+/// overfitting risk, never discounted by more than 10x. Returns 1.0 (no
+/// discount) when there's no usable convergence curve to measure from
+/// (e.g. NSGA-II multi-objective runs, which don't populate it) --
+/// conservative in the "don't under-penalize" direction when the signal
+/// isn't available.
+pub fn effective_trial_ratio(convergence_curve: &[ConvergencePoint]) -> f64 {
+    if convergence_curve.len() < 2 {
+        return 1.0;
+    }
+    let improved = convergence_curve
+        .windows(2)
+        .filter(|w| w[1].best_fitness > w[0].best_fitness + 1e-9)
+        .count();
+    // +1 credits the first generation as informative by construction.
+    let informative = improved + 1;
+    let ratio = informative as f64 / convergence_curve.len() as f64;
+    ratio.max(0.1)
+}
+
 /// Overfitting gap report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverfitReport {
@@ -851,5 +900,56 @@ mod tests {
             assert!(pt[0] >= 0.0 && pt[0] <= 1.0, "x out of [0,1]: {}", pt[0]);
             assert!(pt[1] >= 0.0 && pt[1] <= 1.0, "y out of [0,1]: {}", pt[1]);
         }
+    }
+
+    fn cp(generation: usize, best_fitness: f64) -> ConvergencePoint {
+        ConvergencePoint { generation, best_fitness, mean_fitness: best_fitness }
+    }
+
+    #[test]
+    fn effective_trial_ratio_is_1_when_no_curve_or_single_point() {
+        assert_eq!(effective_trial_ratio(&[]), 1.0);
+        assert_eq!(effective_trial_ratio(&[cp(0, 1.0)]), 1.0);
+    }
+
+    #[test]
+    fn effective_trial_ratio_is_1_when_every_generation_improves() {
+        let curve: Vec<ConvergencePoint> = (0..10).map(|g| cp(g, g as f64)).collect();
+        assert_eq!(effective_trial_ratio(&curve), 1.0);
+    }
+
+    #[test]
+    fn effective_trial_ratio_discounts_a_fully_plateaued_search_to_the_floor() {
+        // First generation finds fitness=1.0; the other 9 never improve on it.
+        let mut curve = vec![cp(0, 1.0)];
+        curve.extend((1..10).map(|g| cp(g, 1.0)));
+        // 1 informative generation (the first) out of 10 = 0.1, exactly the floor.
+        assert!((effective_trial_ratio(&curve) - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_trial_ratio_never_discounts_below_the_floor() {
+        // Even a single-generation improvement out of 1000 stays >= 0.1,
+        // not 1/1000 -- the floor caps how aggressive the discount can be.
+        let mut curve = vec![cp(0, 1.0)];
+        curve.extend((1..1000).map(|g| cp(g, 1.0)));
+        assert_eq!(effective_trial_ratio(&curve), 0.1);
+    }
+
+    #[test]
+    fn effective_trial_ratio_reflects_partial_improvement() {
+        // Generations: 0 (base, informative), 1 (improves), 2 (plateau),
+        // 3 (improves), 4 (plateau) -- 3 informative out of 5 = 0.6.
+        let curve = vec![cp(0, 1.0), cp(1, 2.0), cp(2, 2.0), cp(3, 3.0), cp(4, 3.0)];
+        assert!((effective_trial_ratio(&curve) - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_trial_ratio_ignores_floating_point_noise_as_non_improvement() {
+        // An "improvement" of 1e-12 is numerical noise, not a real improving
+        // generation -- only generation 0 counts as informative, 1 of 3 = 0.333
+        // (above the 0.1 floor, so not floored).
+        let curve = vec![cp(0, 1.0), cp(1, 1.0 + 1e-12), cp(2, 1.0 + 2e-12)];
+        assert!((effective_trial_ratio(&curve) - (1.0 / 3.0)).abs() < 1e-9);
     }
 }
