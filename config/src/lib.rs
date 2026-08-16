@@ -1540,6 +1540,27 @@ pub struct GeneticConfig {
     #[serde(default)]
     pub check_seed_stability: bool,
 
+    /// When `true`, every GA population-generation step (in
+    /// `AdaptiveGeneticOptimizer::run()`, including per-window
+    /// re-optimization inside walk-forward) draws each non-elite candidate
+    /// via `Chromosome::random()` instead of tournament selection +
+    /// crossover + mutation -- i.e. this becomes a same-budget, i.i.d.
+    /// random-search control arm rather than a guided evolutionary search.
+    /// Elite carryover (remembering the best chromosome seen so far) is
+    /// left untouched so both arms share identical bookkeeping and only the
+    /// search mechanism itself differs -- the one thing under test.
+    ///
+    /// Exists to falsify (or confirm) the standing assumption that guided
+    /// GA search finds real, OOS-generalizing alpha rather than just
+    /// overfitting noise faster than random sampling would. A job submitted
+    /// with this set to `true` runs through the exact same production
+    /// pipeline (walk-forward, DSR, everything) as a normal job -- compare
+    /// its persisted OOS metrics against a paired guided run on the same
+    /// asset/params/seed to get an apples-to-apples answer. `false` by
+    /// default preserves all existing behavior.
+    #[serde(default)]
+    pub random_control: bool,
+
     /// Weight (0.0 = disabled, the default) for a parsimony/complexity
     /// penalty applied on top of the normal fitness score:
     /// `fitness -= chromosome.complexity() * complexity_penalty_weight`.
@@ -1818,6 +1839,7 @@ impl Default for GeneticConfig {
             min_behavioral_distance: 0.3,       // Reject strategies < 30% different from deployed
             random_seed: None,                  // Non-deterministic by default
             check_seed_stability: false,        // Disabled by default (doubles GA cost)
+            random_control: false,              // Disabled by default (guided search is normal behavior)
             complexity_penalty_weight: 0.0,      // Disabled by default (no behavior change)
         }
     }
@@ -2334,5 +2356,24 @@ mod tests {
         
         // Cleanup
         fs::remove_file(&temp_path).ok();
+    }
+
+    #[test]
+    fn genetic_config_default_keeps_random_control_off() {
+        // Regression guard: random_control must default to false so every
+        // existing job (which never sets it) keeps running guided GA search,
+        // not the random-perturbation control arm.
+        assert!(!GeneticConfig::default().random_control);
+    }
+
+    #[test]
+    fn genetic_config_random_control_round_trips_through_json() {
+        // The job-submission path threads this through BacktestJobParams's
+        // JSONB params_json blob -- confirm it actually survives a
+        // serialize/deserialize cycle rather than silently dropping.
+        let config = GeneticConfig { random_control: true, ..GeneticConfig::default() };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: GeneticConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.random_control);
     }
 }

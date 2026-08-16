@@ -1552,30 +1552,41 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
                 break;
             }
             
-            // Generate new population (tournament-3 selection + crossover + mutation)
-            let pop_len = indexed_population.len();
-            while new_population.len() < population.len() {
-                // Tournament-3 selection for both parents
-                let select = |rng: &mut rand::rngs::StdRng| -> usize {
-                    let (a, b, c) = (
-                        rng.gen_range(0..pop_len),
-                        rng.gen_range(0..pop_len),
-                        rng.gen_range(0..pop_len),
-                    );
-                    if indexed_population[a].2 >= indexed_population[b].2
-                        && indexed_population[a].2 >= indexed_population[c].2 { a }
-                    else if indexed_population[b].2 >= indexed_population[c].2 { b }
-                    else { c }
-                };
-                let parent1_idx = select(&mut rng);
-                let parent2_idx = select(&mut rng);
-                
-                let mut child = indexed_population[parent1_idx].1.clone();
-                if rng.gen::<f64>() < self.config.crossover_rate {
-                    child = child.crossover(indexed_population[parent2_idx].1, &mut rng);
+            // Generate new population. `random_control` (see GeneticConfig's doc
+            // comment) swaps this for i.i.d. random draws -- same evaluation
+            // budget, no selection pressure, no crossover, no mutation -- so
+            // the rest of this loop (elite carryover, convergence tracking,
+            // fitness evaluation) stays identical between the guided and
+            // control arms and only the search mechanism itself differs.
+            if self.config.random_control {
+                while new_population.len() < population.len() {
+                    new_population.push(C::random(&mut rng));
                 }
-                child.mutate(&mut rng, self.config.mutation_rate);
-                new_population.push(child);
+            } else {
+                // Tournament-3 selection for both parents
+                let pop_len = indexed_population.len();
+                while new_population.len() < population.len() {
+                    let select = |rng: &mut rand::rngs::StdRng| -> usize {
+                        let (a, b, c) = (
+                            rng.gen_range(0..pop_len),
+                            rng.gen_range(0..pop_len),
+                            rng.gen_range(0..pop_len),
+                        );
+                        if indexed_population[a].2 >= indexed_population[b].2
+                            && indexed_population[a].2 >= indexed_population[c].2 { a }
+                        else if indexed_population[b].2 >= indexed_population[c].2 { b }
+                        else { c }
+                    };
+                    let parent1_idx = select(&mut rng);
+                    let parent2_idx = select(&mut rng);
+
+                    let mut child = indexed_population[parent1_idx].1.clone();
+                    if rng.gen::<f64>() < self.config.crossover_rate {
+                        child = child.crossover(indexed_population[parent2_idx].1, &mut rng);
+                    }
+                    child.mutate(&mut rng, self.config.mutation_rate);
+                    new_population.push(child);
+                }
             }
             
             population = new_population;

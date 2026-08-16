@@ -327,6 +327,7 @@ async fn optimize_parameters(train_data: &[MarketData]) -> HashMap<String, serde
         convergence_threshold: None,
         random_seed: None,
         check_seed_stability: false,
+        random_control: false,
         complexity_penalty_weight: 0.0,
     };
 
