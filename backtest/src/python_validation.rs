@@ -1855,6 +1855,21 @@ pub async fn run_validation_pipeline(
 
         // Run landscape heatmap (top 3 sensitivity-ranked pairs, 7×7 grid each)
         // Landscape/sensitivity use AsyncFitnessFn — wrap our context fn with full resolution.
+        //
+        // Each point gets its own short outer timeout (2026-08-16), well below the
+        // strategy executor's own 30s compute_signals() timeout. This is a
+        // diagnostic-only phase (sensitivity ranking + landscape visualization,
+        // never feeds the actual GA decision), so a skipped point just means a
+        // slightly sparser heatmap -- an acceptable tradeoff for capping the
+        // worst case. Without this, a single pathological parameter combination
+        // (e.g. an extreme lookback window) can cost up to the full 30s per
+        // point, and with ~40 points evaluated mostly sequentially here, that
+        // compounds into hours -- observed live on a random_control_arm job,
+        // whose best_chromosome (never fitness-selected against, unlike guided
+        // search) is disproportionately likely to sit in a slow-to-evaluate
+        // region that guided search's own selection pressure would normally
+        // steer away from. A timed-out point is skipped, not retried.
+        const LANDSCAPE_EVAL_TIMEOUT_SECS: u64 = 8;
         let landscape_fitness_fn: AsyncFitnessFn<DynamicChromosome> = {
             let ctx_fn = fitness_fn.clone();
             let total_gens = ga_config.generations;
@@ -1863,7 +1878,12 @@ pub async fn run_validation_pipeline(
                 let c = chromo.clone();
                 Box::pin(async move {
                     let ctx = FitnessContext::full_resolution(total_gens.saturating_sub(1), total_gens);
-                    f(&c, ctx).await
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(LANDSCAPE_EVAL_TIMEOUT_SECS),
+                        f(&c, ctx),
+                    )
+                    .await
+                    .unwrap_or_else(|_| FitnessResult::failure())
                 }) as std::pin::Pin<Box<dyn std::future::Future<Output = FitnessResult> + Send>>
             })
         };
