@@ -329,6 +329,7 @@ async fn optimize_parameters(train_data: &[MarketData]) -> HashMap<String, serde
         check_seed_stability: false,
         random_control: false,
         complexity_penalty_weight: 0.0,
+        bayesian_optimization: false,
     };
 
     let fitness_fn = Arc::new(|chromo: &DynamicChromosome| {

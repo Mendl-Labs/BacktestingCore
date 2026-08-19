@@ -73,7 +73,7 @@ mod tests {
             mutation_rate: 0.1, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
 
         let fitness_fn = create_test_fitness_fn();
@@ -104,7 +104,7 @@ mod tests {
             mutation_rate: 0.2, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
 
         let fitness_fn = create_test_fitness_fn();
@@ -139,7 +139,7 @@ mod tests {
             mutation_rate: 0.1, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
 
         // Counter to track how many fitness evaluations occurred
@@ -185,7 +185,7 @@ mod tests {
             mutation_rate: 0.1, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
         
         assert!(config.population_size > 0);
@@ -201,7 +201,7 @@ mod tests {
             mutation_rate: 0.0, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
         
         assert!(edge_config.population_size > 0);
@@ -221,7 +221,7 @@ mod tests {
             top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
 
         // Fitness function that returns the first value
@@ -276,7 +276,7 @@ mod tests {
             mutation_rate: 0.3, optimization_mode: Default::default(), use_monte_carlo_fitness: false, mc_sample_size: 50, top_percentile_threshold: 0.10,
             force_sequential: true, convergence_threshold: None,
             enable_fitness_sharing: false, sharing_radius: 0.15, enable_crowding_penalty: false, crowding_weight: 0.3, min_behavioral_distance: 0.3,
-            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0,
+            random_seed: None, check_seed_stability: false, complexity_penalty_weight: 0.0, random_control: false, bayesian_optimization: false,
         };
 
         let fitness_fn = create_test_fitness_fn();

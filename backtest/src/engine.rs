@@ -549,6 +549,7 @@ impl BacktestEngine {
             check_seed_stability: false,
             random_control: false,
             complexity_penalty_weight: 0.0,
+            bayesian_optimization: false,
         };
 
         // --- 2. Pre-compute candle arrays (shared across all candidates) ----------

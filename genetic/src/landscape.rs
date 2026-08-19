@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rand::Rng;
+use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
@@ -70,10 +71,14 @@ fn backward_solve(l: &[f64], b: &[f64], n: usize) -> Vec<f64> {
     x
 }
 
-/// Minimal 2D Gaussian Process surrogate with squared-exponential (RBF) kernel.
-/// Inputs are expected to be in normalised [0, 1]² space.
+/// General N-dimensional Gaussian Process surrogate with squared-exponential
+/// (RBF) kernel. Inputs are expected to be in normalised [0, 1]^d space.
+/// Generalized 2026-08-18 from a 2D-only version (built for `bo_landscape_heatmap`'s
+/// 2-parameter visualization slices) so the same GP math can drive a real
+/// N-dimensional Bayesian-optimization search -- the RBF kernel and Cholesky
+/// solve don't care about dimensionality, only the call sites did.
 struct GpSurrogate {
-    xs: Vec<[f64; 2]>,
+    xs: Vec<Vec<f64>>,
     alpha: Vec<f64>,  // (K + σ²I)^{-1} y
     chol_l: Vec<f64>, // lower Cholesky factor, n×n row-major
     n: usize,
@@ -86,20 +91,20 @@ impl GpSurrogate {
         Self { xs: vec![], alpha: vec![], chol_l: vec![], n: 0, length_scale, noise_var }
     }
 
-    /// k(a, b) = exp(-‖a − b‖² / (2 l²))
+    /// k(a, b) = exp(-‖a − b‖² / (2 l²)). `a`/`b` must have equal length.
     #[inline]
-    fn rbf(&self, a: [f64; 2], b: [f64; 2]) -> f64 {
-        let sq = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2);
+    fn rbf(&self, a: &[f64], b: &[f64]) -> f64 {
+        let sq: f64 = a.iter().zip(b.iter()).map(|(ai, bi)| (ai - bi).powi(2)).sum();
         (-sq / (2.0 * self.length_scale.powi(2))).exp()
     }
 
     /// Fit the GP to observed (xs, y) pairs.
-    fn fit(&mut self, xs: Vec<[f64; 2]>, y: Vec<f64>) {
+    fn fit(&mut self, xs: Vec<Vec<f64>>, y: Vec<f64>) {
         let n = xs.len();
         let mut k = vec![0.0_f64; n * n];
         for i in 0..n {
             for j in 0..n {
-                k[i * n + j] = self.rbf(xs[i], xs[j]);
+                k[i * n + j] = self.rbf(&xs[i], &xs[j]);
             }
             // σ²I + small jitter to ensure positive-definiteness
             k[i * n + i] += self.noise_var + 1e-6;
@@ -114,15 +119,15 @@ impl GpSurrogate {
     }
 
     /// Posterior mean at x*.
-    fn predict_mean(&self, x: &[f64; 2]) -> f64 {
+    fn predict_mean(&self, x: &[f64]) -> f64 {
         if self.n == 0 { return 0.0; }
-        self.xs.iter().zip(&self.alpha).map(|(xi, a)| self.rbf(*x, *xi) * a).sum()
+        self.xs.iter().zip(&self.alpha).map(|(xi, a)| self.rbf(x, xi) * a).sum()
     }
 
     /// Posterior variance at x*.
-    fn predict_var(&self, x: &[f64; 2]) -> f64 {
+    fn predict_var(&self, x: &[f64]) -> f64 {
         if self.n == 0 { return 1.0; }
-        let k_star: Vec<f64> = self.xs.iter().map(|xi| self.rbf(*x, *xi)).collect();
+        let k_star: Vec<f64> = self.xs.iter().map(|xi| self.rbf(x, xi)).collect();
         let v = forward_solve(&self.chol_l, &k_star, self.n);
         // k(x*,x*) = 1 for RBF; subtract ||v||²
         (1.0 - v.iter().map(|vi| vi * vi).sum::<f64>()).max(0.0)
@@ -130,19 +135,212 @@ impl GpSurrogate {
 
 }
 
-/// Latin Hypercube Sample: n points in [0, 1]².
-fn latin_hypercube_sample(n: usize, rng: &mut impl Rng) -> Vec<[f64; 2]> {
-    let mut strata_a: Vec<usize> = (0..n).collect();
-    let mut strata_b: Vec<usize> = (0..n).collect();
-    strata_a.shuffle(rng);
-    strata_b.shuffle(rng);
-    strata_a.iter().zip(strata_b.iter())
-        .map(|(&a, &b)| {
-            let a_norm = (a as f64 + rng.gen::<f64>()) / n as f64;
-            let b_norm = (b as f64 + rng.gen::<f64>()) / n as f64;
-            [a_norm, b_norm]
+/// Latin Hypercube Sample: n points in [0, 1]^dims. Each dimension gets its
+/// own independently-shuffled permutation of n strata (standard LHS), so
+/// every stratum along every axis is hit exactly once regardless of `dims`.
+fn latin_hypercube_sample(n: usize, dims: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+    let per_dim_strata: Vec<Vec<usize>> = (0..dims)
+        .map(|_| {
+            let mut s: Vec<usize> = (0..n).collect();
+            s.shuffle(rng);
+            s
+        })
+        .collect();
+    (0..n)
+        .map(|i| {
+            (0..dims)
+                .map(|d| (per_dim_strata[d][i] as f64 + rng.gen::<f64>()) / n as f64)
+                .collect()
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Bayesian optimization: acquisition function + inner search
+// (2026-08-18 -- built to drive a real optimizer, not just visualize one;
+// see run_bayesian_optimization below for the outer evaluate-refit loop.)
+// ---------------------------------------------------------------------------
+
+/// Upper Confidence Bound acquisition: `mean + kappa * sqrt(variance)`.
+/// Balances exploitation (go where the GP predicts high fitness) against
+/// exploration (go where the GP is uncertain, since that's where a real
+/// evaluation teaches it the most) -- the standard, simplest real acquisition
+/// function. Higher `kappa` biases toward exploration.
+fn acquisition_ucb(gp: &GpSurrogate, x: &[f64], kappa: f64) -> f64 {
+    gp.predict_mean(x) + kappa * gp.predict_var(x).sqrt()
+}
+
+/// Propose the next point to evaluate by maximizing the UCB acquisition
+/// function over `[0, 1]^dims`, via random-restart local search. Standard,
+/// sufficient practice at this dimensionality (the strategies this drives
+/// expose 3-6 tunable parameters) -- no need for a heavier global optimizer
+/// just to maximize a cheap-to-evaluate (GP-predicted, not real-backtest)
+/// surface.
+///
+/// `n_restarts` independent random starting points are each locally refined
+/// via coordinate-wise hill climbing over `n_local_iters` iterations with a
+/// shrinking step size (simple, no learning-rate tuning needed at this
+/// scale); the best point found across every restart wins.
+fn maximize_acquisition(
+    gp: &GpSurrogate,
+    dims: usize,
+    kappa: f64,
+    n_restarts: usize,
+    n_local_iters: usize,
+    rng: &mut impl Rng,
+) -> Vec<f64> {
+    let mut best_point: Vec<f64> = (0..dims).map(|_| rng.gen::<f64>()).collect();
+    let mut best_score = acquisition_ucb(gp, &best_point, kappa);
+
+    for _ in 0..n_restarts {
+        let mut point: Vec<f64> = (0..dims).map(|_| rng.gen::<f64>()).collect();
+        let mut score = acquisition_ucb(gp, &point, kappa);
+
+        let mut step = 0.25_f64;
+        for _ in 0..n_local_iters {
+            let dim = rng.gen_range(0..dims);
+            let delta = if rng.gen::<bool>() { step } else { -step };
+            let mut candidate = point.clone();
+            candidate[dim] = (candidate[dim] + delta).clamp(0.0, 1.0);
+            let candidate_score = acquisition_ucb(gp, &candidate, kappa);
+            if candidate_score > score {
+                point = candidate;
+                score = candidate_score;
+            }
+            step *= 0.95; // shrink for finer refinement as iterations proceed
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_point = point;
+        }
+    }
+
+    best_point
+}
+
+/// Above this many total evaluations, refitting a GP from scratch every
+/// iteration (Cholesky decomposition, O(n^3) in the number of accumulated
+/// points) becomes computationally infeasible -- a naive refit at n=5000
+/// (a realistic Deep-tier GA budget: population_size=100 * generations=50)
+/// would be ~125 BILLION operations for the last refit alone. This isn't a
+/// shortcut: real BO's entire value proposition is sample efficiency at
+/// SMALL budgets, so comparing it against GA at a budget this large would
+/// defeat the point of using it even if it were computationally free. Any
+/// `total_evals` above this cap is silently clamped down to it, spending
+/// the same real backtest-evaluation budget a GA run at that size would.
+pub const BO_MAX_TOTAL_EVALS: usize = 150;
+
+/// Acquisition-maximization search budget used INSIDE the iterative BO loop
+/// (as opposed to the more thorough search the standalone
+/// `maximize_acquisition` unit tests use, where the GP is small and fixed).
+/// `predict_var` costs O(n) via a forward-solve against the Cholesky factor,
+/// so each candidate evaluated during acquisition maximization costs O(n) --
+/// and this runs once per real BO iteration, with n growing every iteration.
+/// (n_restarts * n_local_iters) candidates per outer iteration, summed
+/// across a growing n, must stay cheap relative to n^3 (the GP refit cost)
+/// or acquisition search dominates runtime instead of the model it's
+/// supposed to be cheap relative to. 6*30=180 candidates/iteration is ample
+/// for a 2-6 dimensional space and keeps this firmly a minor cost next to
+/// the refit.
+const BO_INNER_SEARCH_RESTARTS: usize = 6;
+const BO_INNER_SEARCH_LOCAL_ITERS: usize = 30;
+
+/// Run Bayesian optimization as a search mechanism, structurally parallel to
+/// `AdaptiveGeneticOptimizer::run()` -- takes a total real-evaluation budget
+/// (the BO analogue of `population_size * generations`, so a guided-GA-vs-BO
+/// comparison spends the same real backtest cost) and returns the best
+/// `(chromosome, fitness)` found, the same shape the GA path returns.
+///
+/// Two phases:
+/// 1. **Initialization**: the first `max(dims + 1, total_evals / 5)` points
+///    (capped at the full budget) are Latin Hypercube samples -- the GP has
+///    nothing to condition on yet, so uniform coverage is the right thing to
+///    spend early evaluations on, same reasoning `bo_landscape_heatmap` uses
+///    for visualization (just serving optimization here, not a picture).
+/// 2. **Iterative refinement**: for the remaining budget, fit a GP on every
+///    point observed so far, propose the next point via UCB acquisition
+///    maximization (`maximize_acquisition`), evaluate it for real, fold it
+///    back into the observed set, repeat.
+///
+/// `kappa` is the UCB exploration weight passed straight through to
+/// `maximize_acquisition` -- higher explores more, matching that function's
+/// own doc comment.
+pub async fn run_bayesian_optimization(
+    schema: &Arc<ParameterSchema>,
+    fitness_fn: &AsyncFitnessFn<DynamicChromosome>,
+    total_evals: usize,
+    kappa: f64,
+    on_eval: &(dyn Fn() + Send + Sync),
+) -> (DynamicChromosome, f64) {
+    let dims = schema.params.len().max(1);
+    let total_evals = total_evals.min(BO_MAX_TOTAL_EVALS).max(1);
+    // NOT rand::thread_rng() -- this fn is spawned inside a tokio task and
+    // holds `rng` across multiple `fitness_fn(...).await` points (unlike
+    // bo_landscape_heatmap's rng, which is scoped to a single non-async
+    // block before its own await loop begins). ThreadRng is
+    // Rc<UnsafeCell<..>>-backed and not Send, so it can't survive a yield
+    // point in a future that must itself be Send. StdRng has no thread-local
+    // storage and is Send, safe to hold for the whole function.
+    let mut rng = rand::rngs::StdRng::from_entropy();
+
+    let n_init = (total_evals / 5).max(dims + 1).min(total_evals);
+
+    let to_chromosome = |point: &[f64]| -> DynamicChromosome {
+        let mut chromo = schema.default_chromosome();
+        for (i, def) in schema.params.iter().enumerate() {
+            let (min, max) = param_range(&def.param_type);
+            let raw = min + point[i] * (max - min).max(1e-9);
+            let mut gene = f64_to_gene(&def.param_type, raw);
+            def.enforce_bounds(&mut gene);
+            chromo.genes[i] = gene;
+        }
+        chromo
+    };
+
+    let mut xs_norm: Vec<Vec<f64>> = Vec::with_capacity(total_evals);
+    let mut ys: Vec<f64> = Vec::with_capacity(total_evals);
+    let mut best_chromo: Option<DynamicChromosome> = None;
+    let mut best_fitness = f64::NEG_INFINITY;
+
+    let record = |chromo: DynamicChromosome, fitness: f64, best_chromo: &mut Option<DynamicChromosome>, best_fitness: &mut f64| {
+        if fitness > *best_fitness {
+            *best_fitness = fitness;
+            *best_chromo = Some(chromo);
+        }
+    };
+
+    // Phase 1: LHS initialization.
+    let init_points = latin_hypercube_sample(n_init, dims, &mut rng);
+    for point in init_points {
+        let chromo = to_chromosome(&point);
+        let result: FitnessResult = fitness_fn(&chromo).await;
+        on_eval();
+        record(chromo, result.fitness, &mut best_chromo, &mut best_fitness);
+        xs_norm.push(point);
+        ys.push(result.fitness);
+    }
+
+    // Phase 2: iterative acquisition-guided refinement for the rest of the budget.
+    let remaining = total_evals.saturating_sub(n_init);
+    for _ in 0..remaining {
+        let mut gp = GpSurrogate::new(0.3, 1e-3);
+        gp.fit(xs_norm.clone(), ys.clone());
+        let next_point = maximize_acquisition(
+            &gp, dims, kappa, BO_INNER_SEARCH_RESTARTS, BO_INNER_SEARCH_LOCAL_ITERS, &mut rng,
+        );
+        let chromo = to_chromosome(&next_point);
+        let result: FitnessResult = fitness_fn(&chromo).await;
+        on_eval();
+        record(chromo, result.fitness, &mut best_chromo, &mut best_fitness);
+        xs_norm.push(next_point);
+        ys.push(result.fitness);
+    }
+
+    (
+        best_chromo.unwrap_or_else(|| schema.default_chromosome()),
+        if best_fitness.is_finite() { best_fitness } else { 0.0 },
+    )
 }
 
 /// Return (min, max) of a parameter in its native f64 representation.
@@ -471,10 +669,10 @@ pub async fn bo_landscape_heatmap(
 
     let lhs_pts = {
         let mut rng = rand::thread_rng();
-        latin_hypercube_sample(n_init, &mut rng)
+        latin_hypercube_sample(n_init, 2, &mut rng)
     };
 
-    let mut xs_norm: Vec<[f64; 2]> = Vec::with_capacity(n_init);
+    let mut xs_norm: Vec<Vec<f64>> = Vec::with_capacity(n_init);
     let mut ys: Vec<f64> = Vec::with_capacity(n_init);
 
     // Evaluate LHS points — uniform spatial coverage is the correct objective for visualization.
@@ -486,7 +684,7 @@ pub async fn bo_landscape_heatmap(
         probe.genes[param_b_idx] = f64_to_gene(&param_b.param_type, b_raw);
         let result: FitnessResult = fitness_fn(&probe).await;
         on_eval();
-        xs_norm.push(*pt);
+        xs_norm.push(pt.clone());
         ys.push(result.fitness);
     }
 
@@ -845,7 +1043,7 @@ mod tests {
     fn gp_predicts_observed_values_approximately() {
         // A GP with low noise should interpolate observed points closely.
         let mut gp = GpSurrogate::new(0.5, 1e-4);
-        let xs = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let xs = vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
         let ys = vec![0.0, 1.0, 1.0, 2.0];
         gp.fit(xs.clone(), ys.clone());
         for (x, &y) in xs.iter().zip(&ys) {
@@ -857,9 +1055,48 @@ mod tests {
     #[test]
     fn gp_variance_is_small_at_observed_and_large_elsewhere() {
         let mut gp = GpSurrogate::new(0.5, 1e-4);
-        gp.fit(vec![[0.0, 0.0]], vec![1.0]);
+        gp.fit(vec![vec![0.0, 0.0]], vec![1.0]);
         let near_var = gp.predict_var(&[0.0, 0.0]);
         let far_var = gp.predict_var(&[1.0, 1.0]);
+        assert!(near_var < 0.01, "variance near observation should be small, got {near_var:.4}");
+        assert!(far_var > 0.1, "variance far from observation should be large, got {far_var:.4}");
+    }
+
+    // --- N-D generalization coverage (2026-08-18): the two tests above only
+    // prove the 2D call shape still works: these prove the GP is genuinely
+    // dimension-agnostic, not just compiling with a wider signature.
+
+    #[test]
+    fn gp_interpolates_in_3d_not_just_2d() {
+        // Same interpolation property as gp_predicts_observed_values_approximately,
+        // but in a dimensionality bo_landscape_heatmap never exercises (it's
+        // permanently fixed at 2 swept parameters) -- a real BO search over a
+        // 3+ parameter strategy needs this to hold.
+        let mut gp = GpSurrogate::new(0.5, 1e-4);
+        let xs = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 1.0],
+        ];
+        let ys = vec![0.0, 1.0, 1.0, 1.0, 3.0];
+        gp.fit(xs.clone(), ys.clone());
+        for (x, &y) in xs.iter().zip(&ys) {
+            let pred = gp.predict_mean(x);
+            assert!((pred - y).abs() < 0.1, "GP mean {pred:.3} far from observed {y} at {x:?}");
+        }
+    }
+
+    #[test]
+    fn gp_variance_behaves_correctly_in_5d() {
+        // Same near/far variance property, at a dimensionality closer to a
+        // real strategy's parameter_space() (most tested strategies expose
+        // 3-6 tunable parameters).
+        let mut gp = GpSurrogate::new(0.5, 1e-4);
+        gp.fit(vec![vec![0.0, 0.0, 0.0, 0.0, 0.0]], vec![1.0]);
+        let near_var = gp.predict_var(&[0.0, 0.0, 0.0, 0.0, 0.0]);
+        let far_var = gp.predict_var(&[1.0, 1.0, 1.0, 1.0, 1.0]);
         assert!(near_var < 0.01, "variance near observation should be small, got {near_var:.4}");
         assert!(far_var > 0.1, "variance far from observation should be large, got {far_var:.4}");
     }
@@ -894,11 +1131,182 @@ mod tests {
     #[test]
     fn lhs_produces_n_points_in_unit_square() {
         let mut rng = rand::thread_rng();
-        let pts = latin_hypercube_sample(10, &mut rng);
+        let pts = latin_hypercube_sample(10, 2, &mut rng);
         assert_eq!(pts.len(), 10);
         for pt in &pts {
+            assert_eq!(pt.len(), 2);
             assert!(pt[0] >= 0.0 && pt[0] <= 1.0, "x out of [0,1]: {}", pt[0]);
             assert!(pt[1] >= 0.0 && pt[1] <= 1.0, "y out of [0,1]: {}", pt[1]);
+        }
+    }
+
+    #[test]
+    fn lhs_produces_n_points_in_unit_hypercube_at_5d() {
+        // Proves the per-dimension shuffle generalizes past 2D -- a real BO
+        // search's initial batch needs this for a 3-6 parameter strategy.
+        let mut rng = rand::thread_rng();
+        let pts = latin_hypercube_sample(8, 5, &mut rng);
+        assert_eq!(pts.len(), 8);
+        for pt in &pts {
+            assert_eq!(pt.len(), 5);
+            for &v in pt {
+                assert!((0.0..=1.0).contains(&v), "coordinate out of [0,1]: {v}");
+            }
+        }
+    }
+
+    // --- run_bayesian_optimization end-to-end (2026-08-18) -- exercises the
+    // real ParameterSchema/DynamicChromosome plumbing (not just the GP math
+    // in isolation above) against a synthetic fitness function with a known
+    // peak, still no real backtest pipeline involved.
+
+    #[tokio::test]
+    async fn run_bayesian_optimization_converges_toward_a_known_peak() {
+        // simple_schema(): two float params "x","y", each range [0, 10].
+        // Fitness peaks at (7, 3) -- negative squared distance, maximized at zero.
+        let schema = simple_schema();
+        let fitness_fn: AsyncFitnessFn<DynamicChromosome> = Arc::new(|chromo: &DynamicChromosome| {
+            let x = chromo.genes[0].as_f64();
+            let y = chromo.genes[1].as_f64();
+            Box::pin(async move {
+                let dist_sq = (x - 7.0).powi(2) + (y - 3.0).powi(2);
+                FitnessResult::new(-dist_sq, vec![])
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = FitnessResult> + Send>>
+        });
+
+        let (best, best_fitness) =
+            run_bayesian_optimization(&schema, &fitness_fn, 60, 1.0, &|| {}).await;
+
+        let x = best.genes[0].as_f64();
+        let y = best.genes[1].as_f64();
+        let dist = ((x - 7.0).powi(2) + (y - 3.0).powi(2)).sqrt();
+        assert!(
+            dist < 2.0,
+            "BO found ({x:.2}, {y:.2}) with fitness {best_fitness:.3}, too far from the true \
+             peak (7, 3): dist={dist:.2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bayesian_optimization_respects_the_max_evals_safety_cap() {
+        // A budget far above BO_MAX_TOTAL_EVALS must not attempt a GP refit
+        // on anywhere near that many points -- clamped down silently rather
+        // than hanging or blowing up. Cheap fitness fn + small clamp target
+        // keeps this test itself fast.
+        let schema = simple_schema();
+        let eval_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_fn = eval_count.clone();
+        let fitness_fn: AsyncFitnessFn<DynamicChromosome> = Arc::new(move |chromo: &DynamicChromosome| {
+            let x = chromo.genes[0].as_f64();
+            counter_for_fn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move { FitnessResult::new(-x, vec![]) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = FitnessResult> + Send>>
+        });
+
+        let _ = run_bayesian_optimization(&schema, &fitness_fn, 50_000, 1.0, &|| {}).await;
+        let actual_evals = eval_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            actual_evals <= BO_MAX_TOTAL_EVALS,
+            "expected at most {BO_MAX_TOTAL_EVALS} real evaluations, got {actual_evals}"
+        );
+    }
+
+    // --- Acquisition function / inner search (2026-08-18) -- no backtest
+    // pipeline involved, pure math against known synthetic objectives.
+
+    #[test]
+    fn maximize_acquisition_finds_a_near_optimal_point_on_a_known_peak() {
+        // Fit a GP to samples of a simple, single-peaked 2D function with a
+        // known analytical maximum at (0.7, 0.3), then verify pure-exploitation
+        // acquisition maximization (kappa=0) converges close to it.
+        let peak = [0.7_f64, 0.3_f64];
+        let f = |x: &[f64]| -((x[0] - peak[0]).powi(2) + (x[1] - peak[1]).powi(2));
+
+        let mut rng = rand::thread_rng();
+        let samples = latin_hypercube_sample(20, 2, &mut rng);
+        let ys: Vec<f64> = samples.iter().map(|s| f(s)).collect();
+
+        let mut gp = GpSurrogate::new(0.3, 1e-4);
+        gp.fit(samples, ys);
+
+        let proposed = maximize_acquisition(&gp, 2, 0.0, 20, 200, &mut rng);
+        let dist = ((proposed[0] - peak[0]).powi(2) + (proposed[1] - peak[1]).powi(2)).sqrt();
+        assert!(
+            dist < 0.15,
+            "proposed point {proposed:?} too far from true peak {peak:?} (dist={dist:.3})"
+        );
+    }
+
+    #[test]
+    fn maximize_acquisition_does_not_lose_to_plain_random_sampling() {
+        // The proposed point's acquisition score should not be worse than the
+        // best of a comparable number of purely random samples -- a sanity
+        // floor proving the local search is actually doing something smarter
+        // than chance, not a strong optimality claim.
+        let peak = [0.5_f64, 0.5_f64, 0.5_f64];
+        let f = |x: &[f64]| -x.iter().zip(peak.iter()).map(|(xi, pi)| (xi - pi).powi(2)).sum::<f64>();
+
+        let mut rng = rand::thread_rng();
+        let samples = latin_hypercube_sample(15, 3, &mut rng);
+        let ys: Vec<f64> = samples.iter().map(|s| f(s)).collect();
+        let mut gp = GpSurrogate::new(0.3, 1e-4);
+        gp.fit(samples, ys);
+
+        let proposed = maximize_acquisition(&gp, 3, 0.0, 20, 200, &mut rng);
+        let proposed_score = acquisition_ucb(&gp, &proposed, 0.0);
+
+        let random_best = (0..50)
+            .map(|_| {
+                let pt: Vec<f64> = (0..3).map(|_| rng.gen::<f64>()).collect();
+                acquisition_ucb(&gp, &pt, 0.0)
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        assert!(
+            proposed_score >= random_best - 1e-6,
+            "maximize_acquisition ({proposed_score:.4}) did worse than the best of 50 random samples ({random_best:.4})"
+        );
+    }
+
+    #[test]
+    fn higher_kappa_explores_more_than_lower_kappa() {
+        // With one observed point, a kappa=0 (pure exploitation) search
+        // should propose a point close to that observation (highest
+        // predicted mean is right there); a large kappa (exploration-heavy)
+        // should propose something farther away, chasing the higher
+        // uncertainty in unobserved regions instead.
+        let mut rng = rand::thread_rng();
+        let mut gp = GpSurrogate::new(0.3, 1e-4);
+        gp.fit(vec![vec![0.5, 0.5]], vec![1.0]);
+
+        let exploit_pt = maximize_acquisition(&gp, 2, 0.0, 20, 200, &mut rng);
+        let explore_pt = maximize_acquisition(&gp, 2, 5.0, 20, 200, &mut rng);
+
+        let dist = |p: &[f64]| ((p[0] - 0.5_f64).powi(2) + (p[1] - 0.5_f64).powi(2)).sqrt();
+        assert!(
+            dist(&explore_pt) > dist(&exploit_pt),
+            "high-kappa point (dist={:.3}) should be farther from the sole observation than \
+             low-kappa point (dist={:.3})",
+            dist(&explore_pt),
+            dist(&exploit_pt)
+        );
+    }
+
+    #[test]
+    fn lhs_covers_every_stratum_exactly_once_per_dimension() {
+        // The defining LHS property: for each dimension independently, the n
+        // points fall into n distinct strata (no two points share a stratum
+        // on that axis) -- what actually distinguishes LHS from plain random
+        // sampling and gives it better space-filling coverage.
+        let mut rng = rand::thread_rng();
+        let n = 12;
+        let dims = 4;
+        let pts = latin_hypercube_sample(n, dims, &mut rng);
+        for d in 0..dims {
+            let mut strata: Vec<usize> = pts.iter().map(|p| (p[d] * n as f64).floor() as usize).collect();
+            strata.sort_unstable();
+            strata.dedup();
+            assert_eq!(strata.len(), n, "dimension {d} did not hit all {n} strata exactly once");
         }
     }
 
