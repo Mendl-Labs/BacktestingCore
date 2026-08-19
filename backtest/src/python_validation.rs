@@ -1770,6 +1770,43 @@ pub async fn run_validation_pipeline(
                 nsga2_result = Some(result);
                 (knee_chromo, knee_fitness)
             }
+            config::OptimizationMode::SingleObjective if ga_config.bayesian_optimization => {
+                // Bayesian optimization replaces the whole GA search here --
+                // see GeneticConfig::bayesian_optimization's doc comment for
+                // why (guided GA not shown to reliably beat random search on
+                // these small, expensive-to-evaluate parameter spaces).
+                // Budget matches what a GA run at this population/generation
+                // count would have spent (clamped -- see BO_MAX_TOTAL_EVALS).
+                let total_evals = ga_config.population_size * ga_config.generations;
+                log_info!(BACKTEST_LOGGER, "[VALIDATION] Running Bayesian optimization instead of GA (requested budget={}, clamped to <= {})", total_evals, landscape::BO_MAX_TOTAL_EVALS);
+                // run_bayesian_optimization takes the plain (context-free)
+                // genetic::AsyncFitnessFn, but fitness_fn here is the
+                // generation-aware genetic::AsyncContextFitnessFn (needed by
+                // optimizer.run()'s adaptive/progressive sampling below).
+                // BO has no notion of "generation" -- every one of its
+                // (comparatively few, <= BO_MAX_TOTAL_EVALS) evaluations
+                // should be full-resolution, not progressively sampled, so
+                // adapt with a fixed full_resolution context rather than
+                // threading a second fitness-fn type through the genetic
+                // crate's public API.
+                let fitness_fn_for_bo: genetic::AsyncFitnessFn<DynamicChromosome> = {
+                    let inner = fitness_fn.clone();
+                    Arc::new(move |chromo: &DynamicChromosome| {
+                        let inner = inner.clone();
+                        let chromo = chromo.clone();
+                        Box::pin(async move {
+                            inner(&chromo, genetic::FitnessContext::full_resolution(0, 1)).await
+                        })
+                    })
+                };
+                landscape::run_bayesian_optimization(
+                    schema,
+                    &fitness_fn_for_bo,
+                    total_evals,
+                    1.0, // UCB kappa -- moderate exploration, no tuning evidence yet either way
+                    &|| {},
+                ).await
+            }
             config::OptimizationMode::SingleObjective => {
                 optimizer.run().await
             }
@@ -1870,6 +1907,20 @@ pub async fn run_validation_pipeline(
         // region that guided search's own selection pressure would normally
         // steer away from. A timed-out point is skipped, not retried.
         const LANDSCAPE_EVAL_TIMEOUT_SECS: u64 = 8;
+
+        // Skip the whole phase for random_control_arm comparison jobs: it's
+        // diagnostic-only (sensitivity ranking + landscape visualization for the
+        // UI), never feeds the guided-vs-random comparison metrics themselves,
+        // and costs ~40 extra fitness evaluations per job -- on top of that, a
+        // random_control job's best_chromosome is the one most likely to sit in
+        // a slow-to-evaluate region (see comment above), so it pays the worst
+        // case of the per-point timeout most often. Empty vecs are already a
+        // schema-safe state (same as the `schema.len() < 2` path below feeds
+        // into GAReport).
+        let (sensitivity, landscape_reports): (Vec<landscape::SensitivityEntry>, Vec<landscape::LandscapeReport>) = if ga_config.random_control {
+            report_progress(3, "ga_landscape", 0, 0);
+            (vec![], vec![])
+        } else {
         let landscape_fitness_fn: AsyncFitnessFn<DynamicChromosome> = {
             let ctx_fn = fitness_fn.clone();
             let total_gens = ga_config.generations;
@@ -1945,6 +1996,8 @@ pub async fn run_validation_pipeline(
             vec![]
         };
         report_progress(3, "ga_landscape", total_landscape_evals, total_landscape_evals);
+        (sensitivity, landscape_reports)
+        };
 
         // B1: report memoization effectiveness across GA + landscape/sensitivity.
         {

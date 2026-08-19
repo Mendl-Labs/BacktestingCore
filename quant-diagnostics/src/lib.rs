@@ -15,6 +15,7 @@ pub mod cross_sectional;
 pub mod cointegration;
 pub mod linalg;
 pub mod johansen;
+pub mod spread;
 
 pub use variance_ratio::{variance_ratio as compute_variance_ratio, VrResult};
 pub use ic::{compute_ic, IcResult};
@@ -31,3 +32,4 @@ pub use cointegration::{
     CointegrationResult, CriticalValues, OlsResult,
 };
 pub use johansen::{johansen_test, normalize_cointegrating_vector, JohansenResult};
+pub use spread::corwin_schultz_spread;

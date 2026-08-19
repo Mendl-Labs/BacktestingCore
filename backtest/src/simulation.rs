@@ -243,39 +243,20 @@ impl SimulationLoop {
     /// Delegates recording to TransactionCostCollector.
     fn calculate_market_impact(&mut self, order_size: f64, price: f64, avg_volume: f64, config: &config::BacktestConfig, timestamp: chrono::DateTime<chrono::Utc>) -> f64 {
         let impact_config = &config.data.market_impact;
-        
-        if !impact_config.enabled || avg_volume == 0.0 {
+
+        // Pure arithmetic lives on MarketImpactConfig::impact_bps so the
+        // pre-submission cost-hurdle gate (asset_diagnostics_service.rs) can
+        // reuse the exact same real, volume-aware model instead of a flat
+        // per-asset-class guess -- see that gate's own doc comment.
+        let Some(impact_bps) = impact_config.impact_bps(order_size, avg_volume) else {
             return 0.0;
-        }
-        
-        let size_ratio = order_size / avg_volume;
-        
-        // Only apply impact if order is significant relative to volume
-        if size_ratio < impact_config.min_impact_ratio {
-            return 0.0;
-        }
-        
-        let impact_bps = match impact_config.model {
-            config::MarketImpactModel::None => 0.0,
-            config::MarketImpactModel::Linear => {
-                impact_config.linear_coefficient * size_ratio
-            }
-            config::MarketImpactModel::SquareRoot => {
-                impact_config.sqrt_coefficient * size_ratio.sqrt()
-            }
-            config::MarketImpactModel::AlmgrenChriss => {
-                // Simplified Almgren-Chriss: permanent + temporary impact
-                let permanent = impact_config.linear_coefficient * 0.3 * size_ratio;
-                let temporary = impact_config.sqrt_coefficient * size_ratio.sqrt();
-                permanent + temporary
-            }
         };
-        
+
         // Delegate impact recording to the TransactionCostCollector
         if let Some(tc) = collectors::get_collector_mut::<collectors::TransactionCostCollector>(&mut self.collectors) {
             tc.record_market_impact(impact_bps, price, order_size, avg_volume, timestamp);
         }
-        
+
         // Return the computed impact cost
         (impact_bps / 10000.0) * price * order_size
     }
@@ -1769,6 +1750,28 @@ mod tests {
         let ts = chrono::Utc::now();
         let impact = sim.calculate_market_impact(100.0, 50000.0, 0.0, &config, ts);
         assert_eq!(impact, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_market_impact_delegates_to_config_impact_bps() {
+        // Regression guard for the impact_bps() extraction: the method's
+        // observable output must still equal the same formula, just
+        // computed through MarketImpactConfig::impact_bps now.
+        let mut sim = SimulationLoop::new();
+        let config = config::BacktestConfig::default();
+        let ts = chrono::Utc::now();
+        let order_size = 5000.0;
+        let price = 50000.0;
+        let avg_volume = 100_000.0;
+
+        let impact = sim.calculate_market_impact(order_size, price, avg_volume, &config, ts);
+
+        let expected_bps = config.data.market_impact
+            .impact_bps(order_size, avg_volume)
+            .unwrap_or(0.0);
+        let expected = (expected_bps / 10000.0) * price * order_size;
+        assert!((impact - expected).abs() < 1e-9);
+        assert!(impact > 0.0, "sanity check: this order size should be large enough to trigger impact");
     }
 
     #[test]

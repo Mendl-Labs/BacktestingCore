@@ -1362,6 +1362,101 @@ impl Default for MarketImpactConfig {
     }
 }
 
+impl MarketImpactConfig {
+    /// Pure market-impact arithmetic in bps. `order_size` and `avg_volume`
+    /// must be in the same units (both asset units or both USD). `None`
+    /// means "no impact worth applying" (disabled, zero volume, or below
+    /// `min_impact_ratio`) -- distinct from `Some(0.0)`, which means a model
+    /// was evaluated (e.g. `MarketImpactModel::None`) and came out to zero.
+    pub fn impact_bps(&self, order_size: f64, avg_volume: f64) -> Option<f64> {
+        if !self.enabled || avg_volume == 0.0 {
+            return None;
+        }
+        let size_ratio = order_size / avg_volume;
+        if size_ratio < self.min_impact_ratio {
+            return None;
+        }
+        Some(match self.model {
+            MarketImpactModel::None => 0.0,
+            MarketImpactModel::Linear => self.linear_coefficient * size_ratio,
+            MarketImpactModel::SquareRoot => self.sqrt_coefficient * size_ratio.sqrt(),
+            MarketImpactModel::AlmgrenChriss => {
+                let permanent = self.linear_coefficient * 0.3 * size_ratio;
+                let temporary = self.sqrt_coefficient * size_ratio.sqrt();
+                permanent + temporary
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod market_impact_config_tests {
+    use super::{MarketImpactConfig, MarketImpactModel};
+
+    fn base_config() -> MarketImpactConfig {
+        MarketImpactConfig {
+            enabled: true,
+            model: MarketImpactModel::Linear,
+            min_impact_ratio: 0.01,
+            linear_coefficient: 10.0,
+            sqrt_coefficient: 5.0,
+        }
+    }
+
+    #[test]
+    fn impact_bps_returns_none_when_disabled() {
+        let config = MarketImpactConfig { enabled: false, ..base_config() };
+        assert_eq!(config.impact_bps(1000.0, 10000.0), None);
+    }
+
+    #[test]
+    fn impact_bps_returns_none_when_avg_volume_is_zero() {
+        let config = base_config();
+        assert_eq!(config.impact_bps(1000.0, 0.0), None);
+    }
+
+    #[test]
+    fn impact_bps_returns_none_below_min_impact_ratio() {
+        let config = base_config();
+        // size_ratio = 1000 / 1_000_000 = 0.001, below min_impact_ratio 0.01
+        assert_eq!(config.impact_bps(1000.0, 1_000_000.0), None);
+    }
+
+    #[test]
+    fn impact_bps_linear_model_matches_expected_formula() {
+        let config = MarketImpactConfig { model: MarketImpactModel::Linear, ..base_config() };
+        // size_ratio = 1000 / 10000 = 0.1 -> 10.0 * 0.1 = 1.0
+        let result = config.impact_bps(1000.0, 10000.0).expect("above min_impact_ratio");
+        assert!((result - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn impact_bps_sqrt_model_matches_expected_formula() {
+        let config = MarketImpactConfig { model: MarketImpactModel::SquareRoot, ..base_config() };
+        // size_ratio = 1000 / 10000 = 0.1 -> 5.0 * sqrt(0.1)
+        let result = config.impact_bps(1000.0, 10000.0).expect("above min_impact_ratio");
+        assert!((result - 5.0 * 0.1_f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn impact_bps_almgren_chriss_combines_permanent_and_temporary() {
+        let config = MarketImpactConfig { model: MarketImpactModel::AlmgrenChriss, ..base_config() };
+        // size_ratio = 0.1 -> permanent = 10.0*0.3*0.1 = 0.3, temporary = 5.0*sqrt(0.1)
+        let result = config.impact_bps(1000.0, 10000.0).expect("above min_impact_ratio");
+        let expected = 10.0 * 0.3 * 0.1 + 5.0 * 0.1_f64.sqrt();
+        assert!((result - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn impact_bps_none_model_returns_some_zero() {
+        let config = MarketImpactConfig { model: MarketImpactModel::None, ..base_config() };
+        // Still above min_impact_ratio, so this must evaluate to Some(0.0),
+        // not None -- the two are semantically different (skip-recording vs
+        // a genuinely-computed zero).
+        assert_eq!(config.impact_bps(1000.0, 10000.0), Some(0.0));
+    }
+}
+
 /// Output and reporting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
@@ -1560,6 +1655,30 @@ pub struct GeneticConfig {
     /// default preserves all existing behavior.
     #[serde(default)]
     pub random_control: bool,
+
+    /// When `true`, replaces the whole genetic-algorithm search with
+    /// Bayesian optimization (`genetic::landscape::run_bayesian_optimization`)
+    /// -- a Gaussian-process surrogate model plus UCB acquisition, instead of
+    /// evolutionary selection/crossover/mutation. Only applies when
+    /// `optimization_mode` is `SingleObjective` (BO here doesn't support
+    /// multi-objective search); ignored otherwise. Takes priority over
+    /// `random_control` when both are somehow set, since they're mutually
+    /// exclusive alternate search mechanisms, not combinable modifiers.
+    ///
+    /// Exists because the `random_control` falsification experiment (see its
+    /// own doc comment above) found guided GA search not reliably better
+    /// than random sampling across 33 combined pairs at two budget tiers --
+    /// small parameter spaces (3-6 tunable params) with expensive
+    /// evaluations (a real backtest per point) are the textbook case for BO
+    /// instead, where GA's crossover advantage doesn't show and random
+    /// search wastes evaluations BO's surrogate model would have spent more
+    /// deliberately. `false` by default preserves all existing behavior. The
+    /// effective evaluation budget is `population_size * generations`,
+    /// clamped to `genetic::landscape::BO_MAX_TOTAL_EVALS` -- see that
+    /// constant's own doc comment for why a naive GP refit can't scale to a
+    /// GA-sized budget.
+    #[serde(default)]
+    pub bayesian_optimization: bool,
 
     /// Weight (0.0 = disabled, the default) for a parsimony/complexity
     /// penalty applied on top of the normal fitness score:
@@ -1840,6 +1959,7 @@ impl Default for GeneticConfig {
             random_seed: None,                  // Non-deterministic by default
             check_seed_stability: false,        // Disabled by default (doubles GA cost)
             random_control: false,              // Disabled by default (guided search is normal behavior)
+            bayesian_optimization: false,        // Disabled by default (GA is normal behavior)
             complexity_penalty_weight: 0.0,      // Disabled by default (no behavior change)
         }
     }
