@@ -350,7 +350,11 @@ impl RiskManager {
         false
     }
 
-    /// Check if the given metrics are within risk limits (legacy method)
+    /// Check if the given metrics are within risk limits (position size, order
+    /// size, inventory skew, volatility) against `self.limits`. Actively used
+    /// by the live simulation path (`backtest::simulation`,
+    /// `backtest::python_simulation`) -- despite the name's plainness, this
+    /// is the current risk-limit check, not a superseded one.
     pub fn check(&self, metrics: &RiskMetrics) -> Result<(), String> {
         if let Some(max_pos) = self.limits.max_position {
             if metrics.current_position.abs() > max_pos {
@@ -882,17 +886,17 @@ mod tests {
         assert!(rm.check_stop_loss(100.0, 106.0, false));
     }
 
-    // ── check (legacy) ──
+    // ── check ──
 
     #[test]
-    fn check_legacy_ok() {
+    fn check_ok_within_limits() {
         let rm = RiskManager::new();
         let metrics = RiskMetrics::default();
         assert!(rm.check(&metrics).is_ok());
     }
 
     #[test]
-    fn check_legacy_position_exceeded() {
+    fn check_position_exceeded() {
         let rm = RiskManager::new();
         let mut m = RiskMetrics::default();
         m.current_position = 20.0;
