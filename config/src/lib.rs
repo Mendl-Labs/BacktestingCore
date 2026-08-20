@@ -1677,6 +1677,13 @@ pub struct GeneticConfig {
     /// clamped to `genetic::landscape::BO_MAX_TOTAL_EVALS` -- see that
     /// constant's own doc comment for why a naive GP refit can't scale to a
     /// GA-sized budget.
+    ///
+    /// This is the already-resolved value on the concrete `GeneticConfig` --
+    /// `BacktestingEngine`'s `worker::build_ga_config` is what actually
+    /// decides it for a real job, auto-selecting BO for exactly the small-
+    /// params/small-budget shape described above (via
+    /// `worker::should_auto_select_bayesian_optimization`) unless the job
+    /// explicitly forces one arm or the other.
     #[serde(default)]
     pub bayesian_optimization: bool,
 
