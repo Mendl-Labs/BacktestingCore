@@ -13,7 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 derivatives = { path = "../derivatives" }
 
 # Logging
-ultra-logger = { path = "../../LoggingEngine/ultra-logger" }
+ultra-logger = { git = "https://github.com/Nwagbara-Group-LLC/LoggingEngine", tag = "v0.1.0" }
 once_cell = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 

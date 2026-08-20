@@ -1,0 +1,10 @@
+# Several crates here (backtest, dataloader, data_prep, genetic, metrics,
+# orderbook, and everything depending on ultra-logger) depend on sibling
+# repos (databaseschema, LoggingEngine) as git dependencies pinned to tags
+# instead of local `path =` deps. Cargo's own bundled libgit2 doesn't
+# reliably pick up the same credential helpers the `git` CLI already has
+# configured (Windows Credential Manager locally, a PAT-based `insteadOf`
+# rewrite in CI) -- shelling out to the real `git` binary for fetches
+# avoids re-solving credentials a second, different way.
+[net]
+git-fetch-with-cli = true
