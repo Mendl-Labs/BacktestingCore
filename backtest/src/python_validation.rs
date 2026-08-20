@@ -1534,6 +1534,10 @@ pub async fn run_validation_pipeline(
         // provided. Mirrors the built-in engine's hard gate (engine.rs), which
         // this Python GA path previously lacked entirely.
         let dd_hard_cap = config.max_drawdown_hard_cap.unwrap_or(0.40).clamp(0.05, 0.60);
+        // Captured as a plain f64 (not the whole `ga_config`) so this doesn't
+        // fight the later `ga_config.clone()` at optimizer construction --
+        // see the fitness_fn closure's embedded-OOS-folding branch.
+        let embedded_oos_gap_penalty = ga_config.embedded_oos_gap_penalty;
 
         // --- B1: fitness memoization ---
         // The GA generations, NSGA-II, and the post-GA landscape/sensitivity sweeps all
@@ -1568,6 +1572,7 @@ pub async fn run_validation_pipeline(
             // across the returned future's lifetime.
             let param_count = chromosome.genes.len();
             let sample_rate = ctx.sample_rate;
+            let oos_folds = ctx.oos_folds;
             let params = chromosome.to_param_map();
 
             // Convert to ParameterValue map, preserving int vs float distinction
@@ -1596,14 +1601,17 @@ pub async fn run_validation_pipeline(
             let cache_misses = fitness_cache_misses.clone();
             // B1: deterministic memoization key. ParameterValue derives Debug and its repr
             // is stable for identical values, so identical chromosomes (at the same sample
-            // rate) map to identical keys.
+            // rate AND fold count) map to identical keys -- oos_folds is part of the key
+            // because it changes what gets computed for otherwise-identical params (a
+            // single full-range evaluation vs an embedded IS/OOS-folded one), not just how
+            // finely the same computation samples the data.
             let cache_key = {
                 let mut parts: Vec<String> = param_values
                     .iter()
                     .map(|(k, v)| format!("{}={:?}", k, v))
                     .collect();
                 parts.sort();
-                format!("sr{}|{}", sample_rate, parts.join("|"))
+                format!("sr{}|f{}|{}", sample_rate, oos_folds, parts.join("|"))
             };
 
             Box::pin(async move {
@@ -1618,90 +1626,145 @@ pub async fn run_validation_pipeline(
                 // Apply adaptive sampling: early generations use coarser data for speed.
                 let sampled = genetic::adaptive_sampling::sample_market_data(&data, sample_rate);
                 let eval_data = sampled.as_slice();
-                let result = {
-                    let sim_config = crate::PythonSimConfig {
+
+                // Scores one BacktestResult into a full FitnessResult --
+                // extracted (unchanged from before) so the embedded-OOS-
+                // folding branch below can reuse the exact same scoring
+                // logic per fold instead of duplicating it.
+                let score_backtest_result = |br: &BacktestResult| -> FitnessResult {
+                    let sharpe = br.sharpe_ratio.unwrap_or(0.0);
+                    let sortino = br.sortino_ratio.unwrap_or(sharpe);
+                    let trades = br.num_trades;
+                    let pf = br.profit_factor.unwrap_or(1.0);
+                    let wr = br.win_rate.unwrap_or(0.0);
+                    let _calmar = br.calmar_ratio.unwrap_or(0.0);
+                    let fill = br.execution_metrics.as_ref().map(|m| m.fill_rate).unwrap_or(0.0);
+                    let dd_frac = (br.max_drawdown / init_cap.max(1.0)).abs();
+                    // Date-range-aware activity check: distinct from the
+                    // n>=MIN_TRADES_FOR_SIGNIFICANCE floor (sample-size
+                    // trust) -- this asks whether the strategy traded often
+                    // enough, given the calendar span it was tested over, to
+                    // have plausibly been exercised across multiple regimes.
+                    // See quant council 2026-07-27.
+                    let data_span_days = match (br.first_trade_timestamp, br.last_trade_timestamp) {
+                        (Some(first), Some(last)) => ((last - first).num_seconds() as f64 / 86400.0).max(1.0),
+                        _ => 1.0,
+                    };
+                    // Minimum Track Record Length (Bailey & López de
+                    // Prado, 2014): self-referential to THIS candidate's
+                    // own realized Sharpe/SE, distinct from the fixed
+                    // MIN_TRADES_FOR_SIGNIFICANCE floor -- a candidate can
+                    // clear 30 trades and still have an unproven Sharpe if
+                    // its own statistics say it needs more. Annualization
+                    // factor doesn't affect min_track_record_length itself
+                    // (computed from per-period Sharpe/SE before
+                    // annualizing).
+                    let min_trl = if br.trade_pct_returns.len() >= 3 {
+                        crate::statistical_significance::compute_sharpe_significance(
+                            &br.trade_pct_returns, 0.0, 252.0,
+                        ).min_track_record_length
+                    } else {
+                        None
+                    };
+
+                    // Every GA candidate-evaluation call site on the
+                    // platform routes through the same caller-supplied
+                    // `FitnessFunction` so they all reward/penalize the
+                    // same things -- see `ValidationConfig::fitness_scorer`.
+                    let inputs = genetic::fitness::FitnessInputs {
+                        equity_curve: br.equity_curve.clone(),
+                        num_trades: trades,
+                        total_liquidations: 0, // Python strategies don't evolve leverage today
+                        net_pnl: br.total_pnl,
+                        initial_capital: init_cap,
+                        sharpe,
+                        sortino,
+                        profit_factor: pf,
+                        win_rate: wr,
+                        max_drawdown_frac: dd_frac,
+                        max_drawdown_abs: br.max_drawdown,
+                        fill_rate: fill,
+                        total_fees: br.transaction_costs.as_ref().map(|tc| tc.total_commission).unwrap_or(0.0),
+                        param_count,
+                        min_trl,
+                        data_span_days,
+                        max_drawdown_hard_cap: dd_hard_cap,
+                        leverage_evolved: false,
+                        ..Default::default()
+                    };
+                    scorer.compute(&inputs)
+                };
+
+                let fitness_result = if oos_folds > 0 {
+                    // === EMBEDDED IN-SAMPLE/OUT-OF-SAMPLE FOLDING ===
+                    // (GeneticConfig::embedded_oos_folds) -- candidate
+                    // selection gets real OOS awareness instead of only
+                    // one full-range in-sample evaluation. Always uses the
+                    // full-resolution `data` (not the adaptively tick-
+                    // sampled `eval_data`): oos_folds is only > 0 during the
+                    // same late-generation window sample_rate is already 1
+                    // in, so they'd be identical here anyway -- see
+                    // `AdaptiveSamplingConfig::oos_folds_for_generation`'s
+                    // doc comment.
+                    let validation_config = ValidationConfig {
                         python_source: (*source).clone(),
                         backtest_config: (*bc).clone(),
                         fee_config: (*fc).clone(),
                         supplementary_data: (*supp).clone(),
-                        parameters: param_values,
-                        progress_callback: None,
-                        risk_manager: None,
-                        max_trade_log_size: Some(500),
-                        orderbook_snapshots: None,
-                        multi_venue_data: None,
+                        parameters: param_values.clone(),
+                        ..Default::default()
                     };
-                    crate::python_simulation::run(eval_data, sim_config).await
-                        .map(|r| r.backtest_result)
-                };
-
-                let fitness_result = match result {
-                    Ok(br) => {
-                        let sharpe = br.sharpe_ratio.unwrap_or(0.0);
-                        let sortino = br.sortino_ratio.unwrap_or(sharpe);
-                        let trades = br.num_trades;
-                        let pf = br.profit_factor.unwrap_or(1.0);
-                        let wr = br.win_rate.unwrap_or(0.0);
-                        let calmar = br.calmar_ratio.unwrap_or(0.0);
-                        let fill = br.execution_metrics.as_ref().map(|m| m.fill_rate).unwrap_or(0.0);
-                        let dd_frac = (br.max_drawdown / init_cap.max(1.0)).abs();
-                        // Date-range-aware activity check: distinct from the
-                        // n>=MIN_TRADES_FOR_SIGNIFICANCE floor (sample-size
-                        // trust) -- this asks whether the strategy traded often
-                        // enough, given the calendar span it was tested over, to
-                        // have plausibly been exercised across multiple regimes.
-                        // See quant council 2026-07-27.
-                        let data_span_days = match (br.first_trade_timestamp, br.last_trade_timestamp) {
-                            (Some(first), Some(last)) => ((last - first).num_seconds() as f64 / 86400.0).max(1.0),
-                            _ => 1.0,
-                        };
-                        // Minimum Track Record Length (Bailey & López de
-                        // Prado, 2014): self-referential to THIS candidate's
-                        // own realized Sharpe/SE, distinct from the fixed
-                        // MIN_TRADES_FOR_SIGNIFICANCE floor -- a candidate can
-                        // clear 30 trades and still have an unproven Sharpe if
-                        // its own statistics say it needs more. Annualization
-                        // factor doesn't affect min_track_record_length itself
-                        // (computed from per-period Sharpe/SE before
-                        // annualizing).
-                        let min_trl = if br.trade_pct_returns.len() >= 3 {
-                            crate::statistical_significance::compute_sharpe_significance(
-                                &br.trade_pct_returns, 0.0, 252.0,
-                            ).min_track_record_length
-                        } else {
-                            None
-                        };
-
-                        // Every GA candidate-evaluation call site on the
-                        // platform routes through the same caller-supplied
-                        // `FitnessFunction` so they all reward/penalize the
-                        // same things -- see `ValidationConfig::fitness_scorer`.
-                        let inputs = genetic::fitness::FitnessInputs {
-                            equity_curve: br.equity_curve.clone(),
-                            num_trades: trades,
-                            total_liquidations: 0, // Python strategies don't evolve leverage today
-                            net_pnl: br.total_pnl,
-                            initial_capital: init_cap,
-                            sharpe,
-                            sortino,
-                            profit_factor: pf,
-                            win_rate: wr,
-                            max_drawdown_frac: dd_frac,
-                            max_drawdown_abs: br.max_drawdown,
-                            fill_rate: fill,
-                            total_fees: br.transaction_costs.as_ref().map(|tc| tc.total_commission).unwrap_or(0.0),
-                            param_count,
-                            min_trl,
-                            data_span_days,
-                            max_drawdown_hard_cap: dd_hard_cap,
-                            leverage_evolved: false,
-                            ..Default::default()
-                        };
-                        scorer.compute(&inputs)
-                    }
-                    Err(e) => {
-                        log_warn!(BACKTEST_LOGGER, "[GA] Fitness evaluation failed: {}", e);
+                    let folds = evaluate_is_oos_folds(&data, &validation_config, oos_folds).await;
+                    if folds.is_empty() {
+                        // Not enough data for even one real fold -- fail
+                        // closed rather than silently falling back to an
+                        // in-sample-only score, which would defeat the
+                        // whole point of enabling this.
                         FitnessResult::failure()
+                    } else {
+                        let scored: Vec<(FitnessResult, FitnessResult)> = folds.iter()
+                            .map(|(is_br, oos_br)| (score_backtest_result(is_br), score_backtest_result(oos_br)))
+                            .collect();
+                        let n = scored.len() as f64;
+                        let mean_oos = scored.iter().map(|(_, oos)| oos.fitness).sum::<f64>() / n;
+                        let mean_gap_penalty = scored.iter()
+                            .map(|(is_f, oos_f)| (is_f.fitness - oos_f.fitness).max(0.0))
+                            .sum::<f64>() / n;
+                        let combined_fitness = mean_oos - embedded_oos_gap_penalty * mean_gap_penalty;
+                        // Reuse the last fold's OOS FitnessResult for the
+                        // rich display metrics (sharpe/trades/etc.) -- only
+                        // `.fitness` (what actually drives GA selection)
+                        // needs to reflect the real combined score.
+                        let mut result = scored.into_iter().last()
+                            .map(|(_, oos)| oos)
+                            .unwrap_or_else(FitnessResult::failure);
+                        result.fitness = combined_fitness;
+                        result
+                    }
+                } else {
+                    // === SINGLE FULL-RANGE EVALUATION (existing behavior) ===
+                    let result = {
+                        let sim_config = crate::PythonSimConfig {
+                            python_source: (*source).clone(),
+                            backtest_config: (*bc).clone(),
+                            fee_config: (*fc).clone(),
+                            supplementary_data: (*supp).clone(),
+                            parameters: param_values,
+                            progress_callback: None,
+                            risk_manager: None,
+                            max_trade_log_size: Some(500),
+                            orderbook_snapshots: None,
+                            multi_venue_data: None,
+                        };
+                        crate::python_simulation::run(eval_data, sim_config).await
+                            .map(|r| r.backtest_result)
+                    };
+                    match result {
+                        Ok(br) => score_backtest_result(&br),
+                        Err(e) => {
+                            log_warn!(BACKTEST_LOGGER, "[GA] Fitness evaluation failed: {}", e);
+                            FitnessResult::failure()
+                        }
                     }
                 };
                 // B1: cache a lightweight copy (equity_curve stripped — unused in this GA
@@ -1733,6 +1796,7 @@ pub async fn run_validation_pipeline(
         );
         optimizer.progress_callback = ga_progress_cb;
         optimizer.fitness_normalizer = fitness_normalizer_for_optimizer;
+        optimizer.sampling_config.oos_folds = ga_config.embedded_oos_folds;
 
         // --- Spawn process-pool workers for parallel Python evaluation (GIL bypass) ---
         optimizer.worker_pool = spawn_worker_pool_for_data(&market_data_for_pool, &config, "ga_initial");
@@ -1864,6 +1928,7 @@ pub async fn run_validation_pipeline(
                         fitness_fn.clone(),
                     );
                     optimizer_b.fitness_normalizer = config.fitness_normalizer.clone();
+                    optimizer_b.sampling_config.oos_folds = optimizer_b.config.embedded_oos_folds;
                     optimizer_b.worker_pool = spawn_worker_pool_for_data(&market_data_for_pool, &config, "ga_seed_stability");
 
                     let (best_chromosome_b, best_fitness_b) = optimizer_b.run().await;
@@ -2470,6 +2535,80 @@ async fn run_single_backtest(
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
+}
+
+/// Evaluate one FIXED parameter set (`config.parameters`) across `num_folds`
+/// purged in-sample/out-of-sample window pairs, reusing the same window-
+/// placement (`resolve_wf_window_offsets`, uniform placement -- no regime
+/// classification needed for this per-candidate use) and purge-gap
+/// (`resolve_wf_purge_gap_bars`) machinery `run_walk_forward` uses on
+/// default parameters. Unlike `run_walk_forward` and
+/// `run_walk_forward_with_ga`, this does NOT re-optimize anything per
+/// window -- a GA candidate's parameters are already fixed by construction,
+/// so each fold only needs `run_single_backtest` called twice (train slice,
+/// test slice), not a fresh search. This is the primitive the GA's own
+/// per-candidate fitness function uses to embed real OOS awareness into
+/// selection itself -- see `GeneticConfig::embedded_oos_folds`'s doc
+/// comment for why that matters.
+///
+/// Returns one `(is_result, oos_result)` pair per fold that could actually
+/// be produced -- fewer than `num_folds` if the data is too short for all
+/// of them, empty if the data is too short for even one (mirrors
+/// `run_walk_forward`'s own tolerance for a window whose backtest fails:
+/// skip it, don't abort the whole evaluation).
+#[cfg(feature = "python")]
+async fn evaluate_is_oos_folds(
+    data: &[MarketData],
+    config: &ValidationConfig,
+    num_folds: usize,
+) -> Vec<(BacktestResult, BacktestResult)> {
+    let n = data.len();
+    if num_folds == 0 || n < 100 {
+        return Vec::new();
+    }
+
+    let window_size = n / num_folds;
+    if window_size == 0 {
+        return Vec::new();
+    }
+    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+    let test_size = window_size - train_size;
+    if train_size == 0 || test_size == 0 {
+        return Vec::new();
+    }
+
+    let span_ms = match (data.first().map(market_data_timestamp), data.last().map(market_data_timestamp)) {
+        (Some(first), Some(last)) => (last - first).num_milliseconds(),
+        _ => 0,
+    };
+    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+
+    let offsets: Vec<usize> = resolve_wf_window_offsets(n, window_size, num_folds, test_size, None)
+        .into_iter()
+        .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+        .collect();
+
+    let mut results = Vec::with_capacity(num_folds);
+    for offset in offsets {
+        if results.len() >= num_folds {
+            break;
+        }
+        let train_start = offset;
+        let train_end = offset + train_size;
+        let test_start = train_end + purge_gap_bars;
+        let test_end = (test_start + test_size).min(n);
+
+        let is_result = match run_single_backtest(&data[train_start..train_end], config).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let oos_result = match run_single_backtest(&data[test_start..test_end], config).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        results.push((is_result, oos_result));
+    }
+    results
 }
 
 /// Result of a cheap, standalone signal-density dry run (see
@@ -3819,6 +3958,29 @@ mod tests {
         // ...but a plain indicator strategy is not (no extra run for it).
         let indicator = "signals = np.zeros(n)\nema = pd.Series(prices).ewm(span=20).mean()";
         assert!(!source_may_be_stochastic(indicator));
+    }
+
+    // ── evaluate_is_oos_folds (embedded IS/OOS folding, guard clauses) ──
+    // Only the early-return guard clauses are exercised here (no real
+    // PyO3 backtest fixture) -- num_folds=0 and too-little-data both
+    // return before ever touching Python, same degenerate-input caution
+    // style as resolve_wf_purge_gap_bars's own tests.
+
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn evaluate_is_oos_folds_returns_empty_for_zero_folds() {
+        let config = ValidationConfig::default();
+        let folds = evaluate_is_oos_folds(&[], &config, 0).await;
+        assert!(folds.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn evaluate_is_oos_folds_returns_empty_for_insufficient_data() {
+        // n < 100 -- the same floor run_walk_forward enforces.
+        let config = ValidationConfig::default();
+        let folds = evaluate_is_oos_folds(&[], &config, 3).await;
+        assert!(folds.is_empty());
     }
 
     #[test]

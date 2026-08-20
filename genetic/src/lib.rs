@@ -710,6 +710,11 @@ pub struct FitnessContext {
     pub sample_rate: usize,
     /// Whether this is full resolution (final generations)
     pub is_full_resolution: bool,
+    /// Number of purged in-sample/out-of-sample fold pairs the fitness
+    /// function should embed for this generation (0 = disabled -- evaluate
+    /// the full range once, today's behavior) -- see
+    /// `AdaptiveSamplingConfig::oos_folds_for_generation`'s doc comment.
+    pub oos_folds: usize,
 }
 
 impl FitnessContext {
@@ -717,21 +722,28 @@ impl FitnessContext {
     pub fn new(generation: usize, total_generations: usize, config: &AdaptiveSamplingConfig) -> Self {
         let sample_rate = config.sample_rate_for_generation(generation, total_generations);
         let is_full_resolution = sample_rate == 1;
+        let oos_folds = config.oos_folds_for_generation(generation, total_generations);
         Self {
             generation,
             total_generations,
             sample_rate,
             is_full_resolution,
+            oos_folds,
         }
     }
-    
-    /// Create a context that always uses full resolution
+
+    /// Create a context that always uses full resolution. `oos_folds` is
+    /// always 0 here -- this constructor is used by callers that don't have
+    /// an `AdaptiveSamplingConfig` in scope (e.g. Bayesian optimization's own
+    /// separate evaluation path, and non-generation-loop bookkeeping calls),
+    /// and embedded OOS folding is deliberately out of scope for those.
     pub fn full_resolution(generation: usize, total_generations: usize) -> Self {
         Self {
             generation,
             total_generations,
             sample_rate: 1,
             is_full_resolution: true,
+            oos_folds: 0,
         }
     }
 }

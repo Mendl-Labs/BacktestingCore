@@ -124,6 +124,7 @@ fn bench_genetic_optimizer_creation(c: &mut Criterion) {
                 random_seed: None,
                 check_seed_stability: false,
                 complexity_penalty_weight: 0.0,
+                ..Default::default()
             };
             black_box(GeneticOptimizer {
                 config,
@@ -231,6 +232,7 @@ fn bench_genetic_optimization_full(c: &mut Criterion) {
             random_seed: None,
             check_seed_stability: false,
             complexity_penalty_weight: 0.0,
+            ..Default::default()
         };
         
         group.bench_with_input(BenchmarkId::new("full_optimization", pop_size), &config, |b, config| {

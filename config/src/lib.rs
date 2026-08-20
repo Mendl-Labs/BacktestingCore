@@ -1687,6 +1687,40 @@ pub struct GeneticConfig {
     #[serde(default)]
     pub bayesian_optimization: bool,
 
+    /// Number of purged in-sample/out-of-sample fold pairs each fitness
+    /// evaluation embeds during the search's final, already-small
+    /// full-resolution generations (0 = disabled, the default -- every
+    /// candidate is scored on one full-range in-sample evaluation only,
+    /// same as before this field existed). Threaded into the optimizer's
+    /// `AdaptiveGeneticOptimizer::sampling_config.oos_folds` (see
+    /// `genetic::AdaptiveSamplingConfig::oos_folds_for_generation`'s doc
+    /// comment for the ramp/cost rationale).
+    ///
+    /// Exists because candidate selection during the main GA loop previously
+    /// had no out-of-sample awareness at all -- only in-sample fitness from
+    /// one backtest over the training range, with genuine OOS validation
+    /// happening once, after a winner was already locked in
+    /// (`run_walk_forward_with_ga`'s post-hoc diagnostic). A candidate that
+    /// got lucky on the training range looked exactly as good as one that
+    /// actually generalizes, and the search bred from that in-sample-only
+    /// signal. This embeds a real train/test check into selection itself.
+    #[serde(default)]
+    pub embedded_oos_folds: usize,
+
+    /// Weight applied to `mean(max(0, is_fitness - oos_fitness))` when
+    /// combining embedded OOS folds into one fitness score: `fitness =
+    /// mean(oos_fitness) - embedded_oos_gap_penalty * mean(max(0,
+    /// is_fitness - oos_fitness))`. `0.0` scores purely on mean OOS fitness
+    /// with no extra penalty for the IS-OOS gap (still a real OOS-only
+    /// score); higher values penalize a candidate that's strong in-sample
+    /// but weak out-of-sample more aggressively. Only meaningful when
+    /// `embedded_oos_folds > 0`. `1.0` by default -- penalize the gap
+    /// exactly as much as the OOS score itself counts; not yet tuned
+    /// against real data, a reasonable starting point rather than a
+    /// validated constant.
+    #[serde(default = "default_embedded_oos_gap_penalty")]
+    pub embedded_oos_gap_penalty: f64,
+
     /// Weight (0.0 = disabled, the default) for a parsimony/complexity
     /// penalty applied on top of the normal fitness score:
     /// `fitness -= chromosome.complexity() * complexity_penalty_weight`.
@@ -1705,6 +1739,7 @@ fn default_top_percentile() -> f64 { 0.10 }
 fn default_sharing_radius() -> f64 { 0.15 }
 fn default_crowding_weight() -> f64 { 0.3 }
 fn default_min_behavioral_distance() -> f64 { 0.3 }
+fn default_embedded_oos_gap_penalty() -> f64 { 1.0 }
 
 /// Configuration for order book reconstruction
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1967,6 +2002,8 @@ impl Default for GeneticConfig {
             check_seed_stability: false,        // Disabled by default (doubles GA cost)
             random_control: false,              // Disabled by default (guided search is normal behavior)
             bayesian_optimization: false,        // Disabled by default (GA is normal behavior)
+            embedded_oos_folds: 0,                // Disabled by default (no behavior change)
+            embedded_oos_gap_penalty: default_embedded_oos_gap_penalty(),
             complexity_penalty_weight: 0.0,      // Disabled by default (no behavior change)
         }
     }

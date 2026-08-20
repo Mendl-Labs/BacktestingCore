@@ -550,6 +550,8 @@ impl BacktestEngine {
             random_control: false,
             complexity_penalty_weight: 0.0,
             bayesian_optimization: false,
+            embedded_oos_folds: 0,
+            embedded_oos_gap_penalty: config::GeneticConfig::default().embedded_oos_gap_penalty,
         };
 
         // --- 2. Pre-compute candle arrays (shared across all candidates) ----------

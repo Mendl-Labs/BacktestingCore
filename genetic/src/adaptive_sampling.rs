@@ -20,6 +20,17 @@ pub struct AdaptiveSamplingConfig {
     pub max_sample_rate: usize,
     /// Whether adaptive sampling is enabled
     pub enabled: bool,
+    /// Number of purged in-sample/out-of-sample fold pairs each fitness
+    /// evaluation embeds during the `full_resolution_generations` window (0
+    /// = disabled, the default -- every candidate is scored on one
+    /// full-range in-sample evaluation only, today's behavior). When > 0,
+    /// candidates are scored primarily on OOS performance instead of raw
+    /// in-sample fitness, so a candidate that only looks good in-sample
+    /// scores worse than one that holds up on held-out data -- see
+    /// `oos_folds_for_generation`'s doc comment for the cost/ramp rationale,
+    /// and `GeneticConfig::embedded_oos_folds` (the `config` crate) for how
+    /// a real job sets this.
+    pub oos_folds: usize,
 }
 
 impl Default for AdaptiveSamplingConfig {
@@ -29,6 +40,7 @@ impl Default for AdaptiveSamplingConfig {
             min_sample_rate: 1,             // No sampling (full data)
             max_sample_rate: 5,             // Sample every 5th tick in early gens
             enabled: true,
+            oos_folds: 0,
         }
     }
 }
@@ -39,6 +51,30 @@ impl AdaptiveSamplingConfig {
         Self {
             enabled: false,
             ..Default::default()
+        }
+    }
+
+    /// Number of IS/OOS fold pairs to use for a given generation -- either 0
+    /// (evaluate the full range once, as `oos_folds_for_generation` returns
+    /// outside the full-resolution window) or the full configured
+    /// `oos_folds` count (inside it). Deliberately binary rather than a
+    /// gradual ramp like `sample_rate_for_generation`'s: a candidate's
+    /// selection either uses a real OOS check or it doesn't -- there's no
+    /// meaningful "half OOS-aware" middle ground the way there is for tick
+    /// sample density. This is what keeps the real, multiplicative cost of
+    /// embedded folding (each fold pair is ~2x a plain evaluation, times
+    /// `oos_folds`) affordable: it's paid only during the already-small
+    /// late-stage phase, same generations `sample_rate_for_generation`
+    /// already reserves for full-resolution tick data.
+    pub fn oos_folds_for_generation(&self, generation: usize, total_generations: usize) -> usize {
+        if self.oos_folds == 0 {
+            return 0;
+        }
+        let generations_remaining = total_generations.saturating_sub(generation + 1);
+        if generations_remaining < self.full_resolution_generations {
+            self.oos_folds
+        } else {
+            0
         }
     }
 
@@ -309,6 +345,42 @@ mod tests {
         let early_rate = config.sample_rate_for_generation(0, 15);
         let mid_rate = config.sample_rate_for_generation(6, 15);
         assert!(early_rate >= mid_rate);
+    }
+
+    #[test]
+    fn oos_folds_for_generation_disabled_by_default() {
+        // AdaptiveSamplingConfig::default() has oos_folds: 0 -- disabled
+        // regardless of generation, preserving today's behavior.
+        let config = AdaptiveSamplingConfig::default();
+        assert_eq!(config.oos_folds_for_generation(14, 15), 0);
+        assert_eq!(config.oos_folds_for_generation(0, 15), 0);
+    }
+
+    #[test]
+    fn oos_folds_for_generation_is_binary_not_ramped() {
+        // Same "last N generations" window sample_rate_for_generation uses,
+        // but oos_folds is either 0 or the full configured count -- no
+        // gradual ramp, unlike tick sample density.
+        let config = AdaptiveSamplingConfig { oos_folds: 3, ..Default::default() };
+        // Last 3 generations (12, 13, 14 of 15) get the full fold count.
+        assert_eq!(config.oos_folds_for_generation(14, 15), 3);
+        assert_eq!(config.oos_folds_for_generation(13, 15), 3);
+        assert_eq!(config.oos_folds_for_generation(12, 15), 3);
+        // Anything earlier gets 0, not a partial/ramped value.
+        assert_eq!(config.oos_folds_for_generation(11, 15), 0);
+        assert_eq!(config.oos_folds_for_generation(0, 15), 0);
+    }
+
+    #[test]
+    fn oos_folds_for_generation_respects_a_custom_full_resolution_window() {
+        let config = AdaptiveSamplingConfig {
+            oos_folds: 5,
+            full_resolution_generations: 1,
+            ..Default::default()
+        };
+        // Only the very last generation gets folding with a 1-generation window.
+        assert_eq!(config.oos_folds_for_generation(9, 10), 5);
+        assert_eq!(config.oos_folds_for_generation(8, 10), 0);
     }
 
     #[test]
