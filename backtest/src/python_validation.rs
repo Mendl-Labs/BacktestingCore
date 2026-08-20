@@ -881,8 +881,10 @@ pub struct WalkForwardResult {
     pub avg_oos_pnl: f64,
     /// Average in-sample (per-window training-slice) Sharpe ratio -- the fair
     /// apples-to-apples comparator for `avg_oos_sharpe`, since both are computed
-    /// by the SAME per-window process (whichever of `run_walk_forward` /
-    /// `run_walk_forward_with_ga` produced this result). Deliberately NOT the
+    /// by the SAME per-window process: `run_walk_forward` on either the
+    /// strategy's declared default parameters (Stage 2), or the GA winner's
+    /// own fixed parameters (Stage 2.5's post-GA report -- see
+    /// `ValidationConfig.parameters` at that call site). Deliberately NOT the
     /// separate global full-dataset GA's Sharpe (`optimized_backtest`/`in_sample_result`
     /// in worker.rs) -- that number is chosen from many more candidates over more
     /// data and isn't a meaningful "in-sample" baseline for this OOS estimate.
@@ -900,13 +902,18 @@ pub struct WalkForwardResult {
     /// This is the ground-truth OOS result and should be used as the primary result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oos_combined_result: Option<BacktestResult>,
-    /// Total real (uncached) GA fitness evaluations across all per-window
-    /// mini-GA reruns -- `Some` only for the GA-driven walk-forward path
-    /// (`run_walk_forward_with_ga`), which runs a genuinely independent
-    /// population x generations search per window with no fitness cache
-    /// (each evaluation is a fresh Python simulation). `None` for the plain
-    /// walk-forward path (`run_walk_forward`), which has no chromosome
-    /// search of its own to count. Feeds into `GAReport::total_fresh_evaluations`.
+    /// Total real (uncached) GA fitness evaluations this walk-forward pass
+    /// itself spent searching for parameters, distinct from evaluating a
+    /// fixed set. Always `None` today: both call sites of
+    /// `run_walk_forward` -- Stage 2 (default parameters) and the post-GA
+    /// report (the winner's own fixed parameters, replacing the old
+    /// per-window mini-GA re-optimization this field used to count) --
+    /// evaluate one already-known parameter set per window, with no
+    /// chromosome search of their own. Feeds into
+    /// `GAReport::total_fresh_evaluations`, which now only reflects the
+    /// main GA/NSGA-II run's own real evaluations (plus sensitivity/
+    /// landscape sweeps) -- correctly smaller than before, since the
+    /// removed mini-GA reruns no longer happen.
     #[serde(default)]
     pub ga_trial_count: Option<usize>,
     /// Which volatility regimes the OOS test windows actually covered, vs.
@@ -2074,12 +2081,43 @@ pub async fn run_validation_pipeline(
         }
 
         // Build GA report (convergence curve populated from optimizer tracking)
-        // Run per-window GA walk-forward for proper overfitting measurement.
-        // Each window re-optimises on its training slice, then tests on OOS —
-        // this is the gold-standard way to measure optimisation degradation.
+        // Evaluate the WINNER's own fixed params across real purged IS/OOS
+        // windows for overfitting measurement -- reusing run_walk_forward
+        // as-is (the same purge-gap-safe windowing Stage 2 already uses on
+        // default params), just with config.parameters overridden to the
+        // winner's own values instead of the strategy's declared defaults.
+        // This replaces the old per-window mini-GA re-optimization
+        // (run_walk_forward_with_ga's own independent search per window,
+        // which measured "does re-optimizing from scratch each window still
+        // work" rather than "does the winner this run actually found
+        // generalize") -- cheaper, more directly answers the question this
+        // report is for, and gets a real purge gap run_walk_forward_with_ga
+        // never had (its own doc comment: "No purge gap in this path").
         report_progress(3, "ga_walk_forward", 0, num_windows);
-        let ga_wf_result = run_walk_forward_with_ga(
-            market_data, &config, schema, &ga_config,
+        let winner_params: HashMap<String, ParameterValue> = best_chromosome.to_param_map()
+            .into_iter()
+            .map(|(k, v)| {
+                let pv = match v {
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() { ParameterValue::Int(i) }
+                        else { ParameterValue::Float(n.as_f64().unwrap_or(0.0)) }
+                    }
+                    serde_json::Value::Bool(b) => ParameterValue::Bool(b),
+                    _ => ParameterValue::Float(0.0),
+                };
+                (k, pv)
+            })
+            .collect();
+        let winner_config = ValidationConfig {
+            python_source: config.python_source.clone(),
+            backtest_config: config.backtest_config.clone(),
+            fee_config: config.fee_config.clone(),
+            supplementary_data: config.supplementary_data.clone(),
+            parameters: winner_params,
+            ..Default::default()
+        };
+        let ga_wf_result = run_walk_forward(
+            market_data, &winner_config,
             num_windows,
             |step, total| { report_progress(3, "ga_walk_forward", step, total); },
         ).await;
@@ -2151,10 +2189,12 @@ pub async fn run_validation_pipeline(
             // Real evaluation count: cache MISSES (genuine fresh Python
             // simulations) across the main GA/NSGA-II run + sensitivity +
             // landscape sweeps -- all share `fitness_cache`/`fitness_cache_misses`
-            // above, so this single counter already covers all three -- plus
-            // every per-window mini-GA rerun from GA-driven walk-forward
-            // (`ga_wf`, populated above; each window has its own real,
-            // uncached evaluations, see `run_walk_forward_with_ga`).
+            // above, so this single counter already covers all three.
+            // `ga_wf.ga_trial_count` (populated above) is always `None` now
+            // -- the post-GA walk-forward evaluates the winner's own
+            // already-known parameters, not a fresh search, so there's
+            // nothing extra to add here (see `WalkForwardResult.ga_trial_count`'s
+            // doc comment).
             total_fresh_evaluations: Some(
                 cache_misses_log.load(std::sync::atomic::Ordering::Relaxed)
                     .saturating_add(ga_wf.as_ref().and_then(|wf| wf.ga_trial_count).unwrap_or(0))
@@ -3071,466 +3111,6 @@ fn spawn_worker_pool_for_data(
             None
         }
     }
-}
-
-/// Walk-forward with per-window GA optimisation.
-///
-/// For each rolling window, a mini-GA is run on the **training** slice to discover
-/// the best parameters for that window, and then those parameters are evaluated on
-/// the **test** slice.  This is the correct way to measure out-of-sample degradation
-/// for an optimised strategy — it answers "if I re-optimise each month, does the
-/// strategy still work on unseen data?"
-///
-/// The mini-GA uses a reduced budget (fewer generations / smaller population) so
-/// that the total cost is acceptable (e.g. 8 windows × 15 gens × 30 pop ≈ 3 600 evals).
-#[cfg(feature = "python")]
-async fn run_walk_forward_with_ga(
-    data: &[MarketData],
-    config: &ValidationConfig,
-    schema: &Arc<ParameterSchema>,
-    ga_config_base: &GeneticConfig,
-    num_windows: usize,
-    on_window_complete: impl Fn(usize, usize),
-) -> Result<WalkForwardResult> {
-    let n = data.len();
-    if n < 100 {
-        anyhow::bail!("Insufficient data for per-window GA walk-forward (need >= 100 ticks, got {})", n);
-    }
-
-    // Window geometry — same as run_walk_forward
-    let window_size = n / num_windows.max(1);
-    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-    let test_size = window_size - train_size;
-
-    // Bar-based annualization factor derived from this dataset's OWN average
-    // bar spacing (2026-08 annualization fix, mirroring run_walk_forward's
-    // identical fix) -- every per-window OOS Sharpe below previously
-    // annualized with a flat 365 regardless of actual candle granularity.
-    let span_ms = match (data.first().map(market_data_timestamp), data.last().map(market_data_timestamp)) {
-        (Some(first), Some(last)) => (last - first).num_milliseconds(),
-        _ => 0,
-    };
-    let bars_per_year = metrics::significance::observations_per_year_from_span(n, Some(span_ms as f64 / 1000.0));
-
-    // Mini-GA config: halve population and generations to keep cost manageable
-    let mini_ga = GeneticConfig {
-        population_size: (ga_config_base.population_size / 2).max(10),
-        generations: (ga_config_base.generations / 2).max(5),
-        force_sequential: false, // WorkerPool handles parallelism
-        convergence_threshold: Some(5), // tighter early-stop for mini-GA
-        ..ga_config_base.clone()
-    };
-
-    let fitness_scorer = config.fitness_scorer.clone()
-        .expect("ValidationConfig.fitness_scorer must be set to run GA optimization");
-    let initial_capital = config.backtest_config.trading.initial_capital;
-
-    fn subsample_slice(slice: &[MarketData]) -> std::borrow::Cow<'_, [MarketData]> {
-        let step = (slice.len() / 500_000).max(1);
-        if step > 1 {
-            std::borrow::Cow::Owned(slice.iter().step_by(step).cloned().collect())
-        } else {
-            std::borrow::Cow::Borrowed(slice)
-        }
-    }
-
-    // Regime-coverage signal (2026-08) -- see run_walk_forward's identical fix.
-    let regimes = quant_diagnostics::volatility_tercile_regimes(&simple_returns(&close_prices_from_market_data(data)), REGIME_WINDOW);
-
-    // Window placement (2026-08 stratified-by-regime upgrade, Phase 2) -- see
-    // run_walk_forward's identical fix and resolve_wf_window_offsets' doc
-    // comment. No purge gap in this path (test_start = train_end directly),
-    // so window_size already matches what resolve_wf_window_offsets expects
-    // exactly, no extra bounds filtering needed.
-    let offsets = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes));
-
-    let mut windows: Vec<WalkForwardWindow> = Vec::new();
-    let mut oos_results: Vec<BacktestResult> = Vec::new();
-    // Each window below runs its own fresh, uncached AdaptiveGeneticOptimizer
-    // (mini_ga) -- a genuinely independent population x generations search
-    // against that window's training slice. Accumulate the REAL number of
-    // generations each one actually executed (respecting its own early-stop
-    // convergence, via convergence_history.len()) so this search effort is
-    // visible to the DSR trial count instead of vanishing entirely.
-    let mut total_mini_ga_trials: usize = 0;
-
-    for offset in offsets {
-        if windows.len() >= num_windows {
-            break;
-        }
-        let train_start = offset;
-        let train_end = offset + train_size;
-        let test_start = train_end;
-        let test_end = (train_end + test_size).min(n);
-
-        // --- Mini-GA on training slice ---
-        set_dynamic_schema((*schema).clone());
-        let train_slice: Vec<MarketData> = subsample_slice(&data[train_start..train_end]).into_owned();
-        let train_arc = Arc::new(train_slice);
-        let python_src = Arc::new(config.python_source.clone());
-        let bc = Arc::new(config.backtest_config.clone());
-        let fc = Arc::new(config.fee_config.clone());
-        let supp = Arc::new(config.supplementary_data.clone());
-        let scorer = fitness_scorer.clone();
-        let fitness_normalizer_for_opt = config.fitness_normalizer.clone();
-        let init_cap = initial_capital;
-        // Hard drawdown disqualification for GA candidates -- this per-window
-        // mini-GA previously had no drawdown gate of its own at all (it only
-        // got one indirectly whenever a worker pool spawned and delegated to
-        // ga_eval_worker.rs's Python path). Mirrors run_validation_pipeline's
-        // own dd_hard_cap so both Family-B sites gate identically.
-        let dd_hard_cap = config.max_drawdown_hard_cap.unwrap_or(0.40).clamp(0.05, 0.60);
-
-        let fitness_fn: AsyncContextFitnessFn<DynamicChromosome> = {
-            let train_arc = train_arc.clone();
-            let python_src = python_src.clone();
-            let bc = bc.clone();
-            let fc = fc.clone();
-            let supp = supp.clone();
-            let scorer = scorer.clone();
-            Arc::new(move |chromosome: &DynamicChromosome, ctx: FitnessContext| {
-                let data = train_arc.clone();
-                let source = python_src.clone();
-                let bc = bc.clone();
-                let fc = fc.clone();
-                let supp = supp.clone();
-                let scorer = scorer.clone();
-                let params = chromosome.to_param_map();
-                let sample_rate = ctx.sample_rate;
-                // Captured as an owned value here (not inside the async block
-                // below) so the params/trades gate doesn't hold a borrow of
-                // `chromosome` across the returned future's lifetime.
-                let param_count = chromosome.genes.len();
-
-                let param_values: HashMap<String, ParameterValue> = params
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let pv = match v {
-                            serde_json::Value::Number(n) => {
-                                if let Some(i) = n.as_i64() { ParameterValue::Int(i) }
-                                else { ParameterValue::Float(n.as_f64().unwrap_or(0.0)) }
-                            }
-                            serde_json::Value::Bool(b) => ParameterValue::Bool(b),
-                            _ => ParameterValue::Float(0.0),
-                        };
-                        (k, pv)
-                    })
-                    .collect();
-
-                Box::pin(async move {
-                    let sampled = genetic::adaptive_sampling::sample_market_data(&data, sample_rate);
-                    let eval_data = sampled.as_slice();
-                    let result = {
-                        let sim_config = crate::PythonSimConfig {
-                            python_source: (*source).clone(),
-                            backtest_config: (*bc).clone(),
-                            fee_config: (*fc).clone(),
-                            supplementary_data: (*supp).clone(),
-                            parameters: param_values,
-                            progress_callback: None,
-                            risk_manager: None,
-                            max_trade_log_size: Some(500),
-                            orderbook_snapshots: None,
-                            multi_venue_data: None,
-                        };
-                        crate::python_simulation::run(eval_data, sim_config).await.map(|r| r.backtest_result)
-                    };
-
-                    match result {
-                        Ok(br) => {
-                            let sharpe = br.sharpe_ratio.unwrap_or(0.0);
-                            let sortino = br.sortino_ratio.unwrap_or(sharpe);
-                            let trades = br.num_trades;
-                            let pf = br.profit_factor.unwrap_or(1.0);
-                            let wr = br.win_rate.unwrap_or(0.0);
-                            let net_profit_pct = br.net_profit.unwrap_or(0.0) / init_cap;
-                            let calmar = br.calmar_ratio.unwrap_or(0.0);
-                            let fill = br.execution_metrics.as_ref().map(|m| m.fill_rate).unwrap_or(0.0);
-                            let dd_frac = (br.max_drawdown / init_cap.max(1.0)).abs();
-
-                            // Generalization signal (inner-validation split): re-derive the two
-                            // dominant fitness drivers — Sharpe and net-profit — from the held-out
-                            // validation TAIL of this window's equity curve rather than the whole
-                            // in-sample slice. This makes the GA select parameters whose edge
-                            // persists into the most recent training sub-period (temporally adjacent
-                            // to the OOS test window) instead of ones that merely curve-fit the full
-                            // training window. Cost is unchanged: one simulation per evaluation.
-                            // Falls back to whole-window values when the window is too small for the
-                            // tail to carry a meaningful sample.
-                            //
-                            // `val_trades_proxy` additionally counts realized-PnL events (equity
-                            // steps) inside that same tail. A chromosome can pass the whole-window
-                            // `trades == 0` gate below by trading heavily early on and then going
-                            // completely quiet -- which is exactly the shape that then produces zero
-                            // trades on the true, later, held-out OOS test slice (the walk-forward
-                            // window's `oos_num_trades`, see quant council 2026-07-28 follow-up).
-                            // `None` means the window was too small to carry a meaningful tail, in
-                            // which case we don't gate on it at all (fall back to the plain
-                            // `trades == 0` check only).
-                            let (val_sharpe, val_net_pct, val_trades_proxy) = {
-                                const INNER_VAL_FRAC: f64 = 0.30;
-                                const MIN_VAL_BARS: usize = 30;
-                                let ec = &br.equity_curve;
-                                let base = ec.first().copied().unwrap_or(0.0);
-                                let warmup_end = ec.iter()
-                                    .position(|&v| (v - base).abs() > 1e-9)
-                                    .unwrap_or(0);
-                                let active: &[f64] = if warmup_end < ec.len() { &ec[warmup_end..] } else { &[] };
-                                if active.len() >= MIN_VAL_BARS * 2 {
-                                    let val_len = ((active.len() as f64 * INNER_VAL_FRAC) as usize).max(MIN_VAL_BARS);
-                                    let val = &active[active.len() - val_len..];
-                                    let val_trades = val.windows(2)
-                                        .filter(|w| (w[1] - w[0]).abs() > 1e-9)
-                                        .count();
-                                    if val.len() >= 3 && val[0] > 0.0 {
-                                        let rets: Vec<f64> = val.windows(2)
-                                            .filter_map(|w| if w[0] > 0.0 { Some((w[1] - w[0]) / w[0]) } else { None })
-                                            .collect();
-                                        let s = if rets.len() >= 2 {
-                                            let m = rets.iter().sum::<f64>() / rets.len() as f64;
-                                            let var = rets.iter().map(|r| (r - m).powi(2)).sum::<f64>()
-                                                / (rets.len() - 1) as f64;
-                                            let sd = var.sqrt();
-                                            if sd > 0.0 { ((m / sd) * bars_per_year.sqrt()).clamp(-20.0, 20.0) } else { 0.0 }
-                                        } else { sharpe };
-                                        let np = (val[val.len() - 1] - val[0]) / init_cap;
-                                        (s, np, Some(val_trades))
-                                    } else {
-                                        (sharpe, net_profit_pct, Some(val_trades))
-                                    }
-                                } else {
-                                    (sharpe, net_profit_pct, None)
-                                }
-                            };
-
-                            // val_trades_proxy == Some(0): traded overall, but went completely
-                            // silent in the most recent training sub-period -- a strong predictor
-                            // of zero OOS trades. Treated the same as a whole-window zero-trade
-                            // result by routing it through the same ZERO_TRADE_FITNESS sentinel
-                            // before falling into the shared gate ladder.
-                            if val_trades_proxy == Some(0) && trades != 0 {
-                                FitnessResult { fitness: genetic::ZERO_TRADE_FITNESS, hard_gated: true, ..FitnessResult::default() }
-                            } else {
-                                let min_trl = if br.trade_pct_returns.len() >= 3 {
-                                    crate::statistical_significance::compute_sharpe_significance(
-                                        &br.trade_pct_returns, 0.0, 252.0,
-                                    ).min_track_record_length
-                                } else {
-                                    None
-                                };
-                                let data_span_days = match (br.first_trade_timestamp, br.last_trade_timestamp) {
-                                    (Some(first), Some(last)) => ((last - first).num_seconds() as f64 / 86400.0).max(1.0),
-                                    _ => 1.0,
-                                };
-
-                                // Every GA candidate-evaluation call site on the platform routes
-                                // through this one gate ladder + weighted-sum formula -- see
-                                // genetic::fitness::compute_fitness's doc comment. Uses the
-                                // validation-tail (val_sharpe/val_net_pct) values instead of
-                                // whole-window ones, preserving this closure's deliberate
-                                // generalization-signal architecture (see comment above).
-                                let inputs = genetic::fitness::FitnessInputs {
-                                    equity_curve: br.equity_curve.clone(),
-                                    num_trades: trades,
-                                    total_liquidations: 0, // Python strategies don't evolve leverage today
-                                    net_pnl: val_net_pct * init_cap,
-                                    initial_capital: init_cap,
-                                    sharpe: val_sharpe,
-                                    sortino,
-                                    profit_factor: pf,
-                                    win_rate: wr,
-                                    max_drawdown_frac: dd_frac,
-                                    max_drawdown_abs: br.max_drawdown,
-                                    fill_rate: fill,
-                                    total_fees: br.transaction_costs.as_ref().map(|tc| tc.total_commission).unwrap_or(0.0),
-                                    param_count,
-                                    min_trl,
-                                    data_span_days,
-                                    max_drawdown_hard_cap: dd_hard_cap,
-                                    leverage_evolved: false,
-                                    ..Default::default()
-                                };
-                                scorer.compute(&inputs)
-                            }
-                        }
-                        Err(e) => {
-                            log_warn!(BACKTEST_LOGGER, "[GA-WF] Fitness evaluation failed: {}", e);
-                            FitnessResult::failure()
-                        }
-                    }
-                })
-            })
-        };
-
-        let mut optimizer = AdaptiveGeneticOptimizer::<DynamicChromosome>::new(
-            mini_ga.clone(),
-            fitness_fn,
-        );
-        optimizer.fitness_normalizer = fitness_normalizer_for_opt;
-        optimizer.worker_pool = spawn_worker_pool_for_data(
-            &train_arc, config, &format!("ga_wf_window_{}", windows.len()),
-        );
-        let (best_chromosome, _best_fitness) = optimizer.run().await;
-        // Real generations this window's mini-GA actually executed (respects
-        // its own early-stop convergence_threshold), same technique the main
-        // GA/NSGA-II run above uses for its own convergence_curve.
-        let window_gens = optimizer.convergence_history.lock()
-            .map(|h| h.len())
-            .unwrap_or(0)
-            .max(1);
-        total_mini_ga_trials = total_mini_ga_trials.saturating_add(mini_ga.population_size * window_gens);
-        let best_params = best_chromosome.to_param_map();
-        let opt_params: HashMap<String, ParameterValue> = best_params
-            .into_iter()
-            .map(|(k, v)| {
-                let pv = match v {
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() { ParameterValue::Int(i) }
-                        else { ParameterValue::Float(n.as_f64().unwrap_or(0.0)) }
-                    }
-                    serde_json::Value::Bool(b) => ParameterValue::Bool(b),
-                    _ => ParameterValue::Float(0.0),
-                };
-                (k, pv)
-            })
-            .collect();
-
-        // Build a config using the GA-optimized params for this window
-        let window_config = ValidationConfig {
-            parameters: opt_params.clone(),
-            python_source: config.python_source.clone(),
-            backtest_config: config.backtest_config.clone(),
-            fee_config: config.fee_config.clone(),
-            supplementary_data: config.supplementary_data.clone(),
-            ..Default::default()
-        };
-
-        // Evaluate GA-optimised params on training period (for train metrics)
-        let train_data = subsample_slice(&data[train_start..train_end]);
-        let train_result = match run_single_backtest(&train_data, &window_config).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_warn!(BACKTEST_LOGGER, "[WF-GA] Window {} train backtest failed, skipping: {}", windows.len() + 1, e);
-                continue;
-            }
-        };
-
-        // Evaluate GA-optimised params on test period (OOS)
-        let test_data = subsample_slice(&data[test_start..test_end]);
-        let test_result = match run_single_backtest(&test_data, &window_config).await {
-            Ok(r) => r,
-            Err(e) => {
-                log_warn!(BACKTEST_LOGGER, "[WF-GA] Window {} test backtest failed, skipping: {}", windows.len() + 1, e);
-                continue;
-            }
-        };
-
-        // Bug 4: skip flat warmup prefix in equity curve when computing OOS Sharpe (GA path)
-        let test_sharpe_ga = {
-            let ec = &test_result.equity_curve;
-            let base = ec.first().copied().unwrap_or(0.0);
-            let warmup_end = ec.iter().position(|&v| (v - base).abs() > 1e-9).unwrap_or(0);
-            let slice = if warmup_end > 0 { &ec[warmup_end..] } else { ec.as_slice() };
-            if slice.len() >= 3 {
-                let oos_ret: Vec<f64> = slice.windows(2)
-                    .filter_map(|w| if w[0] > 0.0 { Some((w[1] - w[0]) / w[0]) } else { None })
-                    .collect();
-                if oos_ret.len() >= 2 {
-                    let mean = oos_ret.iter().sum::<f64>() / oos_ret.len() as f64;
-                    let var = oos_ret.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
-                        / (oos_ret.len() - 1) as f64;
-                    let std = var.sqrt();
-                    if std > 0.0 { ((mean / std) * bars_per_year.sqrt()).clamp(-20.0, 20.0) } else { 0.0 }
-                } else { test_result.sharpe_ratio.unwrap_or(0.0).clamp(-20.0, 20.0) }
-            } else { test_result.sharpe_ratio.unwrap_or(0.0).clamp(-20.0, 20.0) }
-        };
-
-        windows.push(WalkForwardWindow {
-            train_start_idx: train_start,
-            train_end_idx: train_end,
-            test_start_idx: test_start,
-            test_end_idx: test_end,
-            train_start_date: data.get(train_start).map(market_data_timestamp),
-            train_end_date: data.get(train_end.saturating_sub(1)).map(market_data_timestamp),
-            test_start_date: data.get(test_start).map(market_data_timestamp),
-            test_end_date: data.get(test_end.saturating_sub(1)).map(market_data_timestamp),
-            train_pnl: train_result.total_pnl,
-            train_sharpe: train_result.sharpe_ratio.unwrap_or(0.0),
-            train_trades: train_result.num_trades,
-            test_pnl: test_result.total_pnl,
-            test_sharpe: test_sharpe_ga,
-            test_trades: test_result.num_trades,
-            test_win_rate: test_result.win_rate.unwrap_or(0.0),
-            test_max_drawdown: test_result.max_drawdown,
-            test_profit_factor: test_result.profit_factor.unwrap_or(0.0),
-            test_regime: window_regime_label(&regimes, test_start, test_end),
-        });
-
-        oos_results.push(test_result);
-        on_window_complete(windows.len(), num_windows);
-    }
-
-    if windows.is_empty() {
-        anyhow::bail!("Per-window GA walk-forward produced no windows");
-    }
-
-    let avg_oos_sharpe = windows.iter().map(|w| w.test_sharpe).sum::<f64>() / windows.len() as f64;
-    let avg_oos_pnl = windows.iter().map(|w| w.test_pnl).sum::<f64>() / windows.len() as f64;
-    let avg_train_sharpe = windows.iter().map(|w| w.train_sharpe).sum::<f64>() / windows.len() as f64;
-
-    // Bug #21 — emit the true signed degradation ratio (see comment above).
-    let overfitting_ratio = if avg_train_sharpe.abs() > 1e-9 {
-        (avg_train_sharpe - avg_oos_sharpe) / avg_train_sharpe.abs()
-    } else {
-        // IS Sharpe is undefined (strategy barely traded in-sample).
-        // Treat as worst-case: maximum degradation indicator.
-        1.0
-    };
-
-    let oos_profitability_rate2 = windows.iter()
-        .filter(|w| w.test_sharpe > 0.0)
-        .count() as f64
-        / windows.len() as f64;
-
-    // Consistency: 1 / (1 + σ_sharpe) — measures uniformity of OOS Sharpe across windows.
-    // Higher = more consistent (lower Sharpe spread). NOT % of profitable windows
-    // (see oos_profitability_rate2 for that).
-    let consistency_score2 = if windows.len() > 1 {
-        let sharpes: Vec<f64> = windows.iter().map(|w| w.test_sharpe).collect();
-        let variance = sharpes.iter()
-            .map(|s| (s - avg_oos_sharpe).powi(2))
-            .sum::<f64>() / (sharpes.len() - 1) as f64;
-        let std_dev = variance.sqrt();
-        (1.0 / (1.0 + std_dev)).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-
-    // Combine all OOS test results into a single aggregated result
-    let oos_combined = if !oos_results.is_empty() {
-        Some(combine_oos_results(&oos_results, initial_capital))
-    } else {
-        None
-    };
-
-    let num_win = windows.len();
-    let tested_regimes: Vec<Option<quant_diagnostics::VolatilityRegime>> = windows.iter().map(|w| w.test_regime).collect();
-    let regime_coverage_narrative = regime_coverage_narrative(&tested_regimes, &regimes);
-    let regime_coverage_incomplete = regime_coverage_incomplete(&tested_regimes, &regimes);
-    Ok(WalkForwardResult {
-        windows,
-        avg_oos_sharpe,
-        avg_oos_pnl,
-        avg_train_sharpe,
-        overfitting_ratio,
-        consistency_score: consistency_score2,
-        oos_profitability_rate: oos_profitability_rate2,
-        num_windows: num_win,
-        oos_combined_result: oos_combined,
-        ga_trial_count: Some(total_mini_ga_trials),
-        regime_coverage_narrative,
-        regime_coverage_incomplete,
-    })
 }
 
 /// Estimate ruin probability from Monte Carlo fan chart.
