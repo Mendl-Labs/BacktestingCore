@@ -52,7 +52,7 @@ metrics = { path = "../metrics" }
 genetic = { path = "../genetic" }
 walkforward = { path = "../walkforward" }
 smartrouter = { path = "../smartrouter" }
-databaseschema = { git = "https://github.com/Nwagbara-Group-LLC/databaseschema", tag = "v0.1.0", optional = true }
+databaseschema = { git = "https://github.com/Nwagbara-Group-LLC/databaseschema", tag = "v0.1.1", optional = true }
 quant-diagnostics = { path = "../quant-diagnostics" }
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
 
