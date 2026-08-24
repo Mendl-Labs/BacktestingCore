@@ -528,6 +528,10 @@ impl BacktestEngine {
         set_dynamic_schema(schema.clone());
 
         let (population_size, generations) = Self::ga_population_generations(self.analysis_config.mode);
+        // For each candidate's own DSR gate (genetic::dsr_gate_fitness) --
+        // same population*generations convention already used for the
+        // end-of-run DSR computed further down in this same function.
+        let dsr_n_trials = Some(population_size * generations);
 
         let config = GeneticConfig {
             population_size,
@@ -676,6 +680,9 @@ impl BacktestEngine {
                 } else {
                     None
                 };
+                let dsr = metrics::performance::deflated_sharpe_ratio(
+                    dsr_n_trials.unwrap_or(1) as u32, &result.trade_returns,
+                );
                 let data_span_days = match (candles.timestamps_ms.first(), candles.timestamps_ms.last()) {
                     (Some(first), Some(last)) => ((*last - *first) as f64 / 86_400_000.0).max(1.0),
                     _ => 1.0,
@@ -697,6 +704,7 @@ impl BacktestEngine {
                     total_fees,
                     param_count: param_map.len(),
                     min_trl,
+                    dsr,
                     data_span_days,
                     ..Default::default()
                 };
