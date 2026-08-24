@@ -247,10 +247,26 @@ pub fn deflated_sharpe_ratio(num_trials: u32, returns: &[f64]) -> Option<f64> {
 	let sr_star = (1.0 - EULER_GAMMA + EULER_GAMMA * n_trials_f.ln()) / (n_f - 1.0).sqrt();
 
 	// Variance of the Sharpe estimator (Bailey & López de Prado 2014, eq. 7).
-	let se_sq = (1.0 - skewness * sr + ((excess_kurtosis + 2.0) / 4.0) * sr * sr) / (n_f - 1.0);
-	if se_sq <= 0.0 {
-		return None;
-	}
+	// The kurtosis term can only ever ADD to this (excess kurtosis is bounded
+	// below by -2 for any real distribution, so (excess_kurtosis + 2.0) >= 0)
+	// -- moment corrections exist to account for EXTRA estimation uncertainty
+	// from non-normal returns, so they should only ever widen this variance,
+	// never shrink it below the plain-normal baseline of 1/(n-1). The
+	// skewness term is the one exception: `-skewness * sr` CAN go negative,
+	// and with only a few hundred trades, sample skewness is itself a noisy
+	// estimate of the true population skewness -- a single volatile estimate
+	// can push se_sq arbitrarily close to zero, and dividing by its near-zero
+	// square root then blows the whole statistic up to a meaningless extreme
+	// (observed in production: DSR collapsing to ~1e-70..1e-118 for ordinary,
+	// unremarkable Sharpe ratios, varying wildly job to job in exact lockstep
+	// with each job's own sample skewness/kurtosis noise -- not a real
+	// multiple-comparisons signal). Flooring at the normal-distribution
+	// baseline keeps the moment adjustment doing its intended job (widening
+	// the interval for fat-tailed/skewed returns) without letting sample
+	// noise narrow it below what plain normality would already imply.
+	let se_sq_normal_baseline = 1.0 / (n_f - 1.0);
+	let se_sq = ((1.0 - skewness * sr + ((excess_kurtosis + 2.0) / 4.0) * sr * sr) / (n_f - 1.0))
+		.max(se_sq_normal_baseline);
 
 	let z = (sr - sr_star) / se_sq.sqrt();
 	Some(normal_cdf(z))
@@ -412,6 +428,65 @@ mod tests {
 		let returns = vec![0.01, 0.02, 0.01]; // < 4 samples
 		assert!(deflated_sharpe_ratio(100, &returns).is_none());
 		assert!(deflated_sharpe_ratio(0, &[0.01; 50]).is_none());
+	}
+
+	/// Regression test for a real production bug: DSR collapsing to an
+	/// astronomically tiny value (~1e-70..1e-118 observed) for an ordinary,
+	/// unremarkable strategy purely because its sample skewness/kurtosis --
+	/// noisy estimates at a few hundred trades -- happened to narrow the
+	/// moment-adjusted Sharpe variance (se_sq) close to zero, blowing up the
+	/// z-statistic. A handful of large negative returns among many small
+	/// positive ones (occasional-crash pattern) produces strong negative
+	/// sample skewness alongside a small negative mean -- exactly the
+	/// same-sign combination that shrinks se_sq's numerator the most.
+	#[test]
+	fn deflated_sharpe_ratio_does_not_collapse_from_sample_skewness_noise() {
+		let mut returns = vec![0.005; 190];
+		returns.extend(vec![-0.15; 10]); // occasional large crashes
+		assert_eq!(returns.len(), 200);
+
+		let dsr = deflated_sharpe_ratio(200, &returns).expect("should compute");
+		assert!(
+			dsr > 1e-8,
+			"DSR collapsed to a near-zero value ({dsr:e}) driven by sample \
+			 skewness/kurtosis noise, not a real multiple-comparisons signal"
+		);
+		assert!((0.0..=1.0).contains(&dsr), "DSR must stay a valid probability, got {dsr}");
+	}
+
+	/// The moment adjustment should only ever WIDEN the Sharpe estimator's
+	/// variance relative to the plain-normal case, never narrow it --
+	/// confirms the se_sq floor is actually engaging by checking DSR for a
+	/// pathologically skewed sample is no more extreme than the DSR computed
+	/// as if returns were normally distributed (skew=kurt=0) with the same
+	/// mean/std/n/n_trials.
+	#[test]
+	fn deflated_sharpe_ratio_floor_matches_or_exceeds_normal_case() {
+		let mut skewed_returns = vec![0.005; 190];
+		skewed_returns.extend(vec![-0.15; 10]);
+		let dsr_skewed = deflated_sharpe_ratio(200, &skewed_returns).expect("should compute");
+
+		// A normal (symmetric, mesokurtic) sample with the same mean/std/n.
+		let mean = simd_mean(&skewed_returns).unwrap();
+		let std = simd_std_dev(&skewed_returns).unwrap();
+		let normal_returns: Vec<f64> = (0..200)
+			.map(|i| mean + std * if i % 2 == 0 { 1.0 } else { -1.0 })
+			.collect();
+		let dsr_normal = deflated_sharpe_ratio(200, &normal_returns).expect("should compute");
+
+		// Both samples share the same mean/std/n/n_trials, so sr and sr_star
+		// are identical between them -- the only difference is se_sq. The
+		// alternating +-std construction has skew=0 and the theoretical
+		// minimum excess kurtosis (-2), so its se_sq already sits exactly at
+		// the floor (flooring it is a no-op). Once the floor also applies to
+		// the pathologically-skewed sample, its se_sq can only be >= this
+		// normal-case value, which (for a below-median z, as here) can only
+		// pull its DSR up toward 0.5, never down past the normal baseline.
+		assert!(
+			dsr_skewed >= dsr_normal - 1e-12,
+			"skewed-sample DSR ({dsr_skewed:e}) fell below the normal-case \
+			 baseline ({dsr_normal:e}) -- the floor isn't engaging"
+		);
 	}
 
 	#[test]
