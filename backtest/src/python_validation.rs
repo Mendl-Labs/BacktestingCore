@@ -1638,6 +1638,10 @@ pub async fn run_validation_pipeline(
                 // extracted (unchanged from before) so the embedded-OOS-
                 // folding branch below can reuse the exact same scoring
                 // logic per fold instead of duplicating it.
+                // For each candidate's own DSR gate (genetic::dsr_gate_fitness) --
+                // same population*generations convention used elsewhere on
+                // the platform for this quantity.
+                let dsr_n_trials = ga_config.population_size * ga_config.generations;
                 let score_backtest_result = |br: &BacktestResult| -> FitnessResult {
                     let sharpe = br.sharpe_ratio.unwrap_or(0.0);
                     let sortino = br.sortino_ratio.unwrap_or(sharpe);
@@ -1673,6 +1677,9 @@ pub async fn run_validation_pipeline(
                     } else {
                         None
                     };
+                    let dsr = metrics::performance::deflated_sharpe_ratio(
+                        dsr_n_trials as u32, &br.trade_pct_returns,
+                    );
 
                     // Every GA candidate-evaluation call site on the
                     // platform routes through the same caller-supplied
@@ -1694,6 +1701,7 @@ pub async fn run_validation_pipeline(
                         total_fees: br.transaction_costs.as_ref().map(|tc| tc.total_commission).unwrap_or(0.0),
                         param_count,
                         min_trl,
+                        dsr,
                         data_span_days,
                         max_drawdown_hard_cap: dd_hard_cap,
                         leverage_evolved: false,
@@ -3083,6 +3091,12 @@ fn spawn_worker_pool_for_data(
         }
     };
 
+    // Total candidates this run will evaluate, for the DSR gate (see
+    // genetic::dsr_gate_fitness's doc comment) -- same population*generations
+    // convention already used at final-verdict time in engine.rs.
+    let dsr_n_trials = config.ga_config.as_ref()
+        .map(|g| g.population_size * g.generations);
+
     let worker_cfg = genetic::worker_pool::WorkerConfig {
         python_source: config.python_source.clone(),
         backtest_config: serde_json::to_value(&config.backtest_config).unwrap_or_default(),
@@ -3096,6 +3110,7 @@ fn spawn_worker_pool_for_data(
         strategy_type: None,
         precomputed_path: None,
         max_drawdown_hard_cap: config.max_drawdown_hard_cap.unwrap_or(0.40).clamp(0.05, 0.60),
+        dsr_n_trials,
     };
 
     match genetic::worker_pool::WorkerPool::spawn(num_workers, worker_cfg) {

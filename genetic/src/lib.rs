@@ -381,13 +381,13 @@ pub const PARAM_COMPLEXITY_GATE_FITNESS: f64 = -60.0;
 
 /// Fitness value for a candidate disqualified by a drawdown hard cap (a
 /// candidate whose max drawdown exceeded the job's configured tolerance).
-/// Ordered strictly between [`min_track_record_gate_fitness`]'s range and any
+/// Ordered strictly between [`dsr_gate_fitness`]'s range and any
 /// realistically-achievable weighted fitness (~-3..+3 for the current weight
 /// profiles) -- excessive drawdown is checked LAST among the hard gates
-/// (liquidation/zero-trade/low-trade-count/complexity/MinTRL all fire first
-/// when applicable) since it's evaluated only once a candidate's other metrics
-/// are already trustworthy enough to say its risk profile, not its sample
-/// size, is what disqualifies it.
+/// (liquidation/zero-trade/low-trade-count/complexity/MinTRL/DSR all fire
+/// first when applicable) since it's evaluated only once a candidate's other
+/// metrics are already trustworthy enough to say its risk profile, not its
+/// sample size or selection bias, is what disqualifies it.
 pub const DRAWDOWN_HARD_CAP_FITNESS: f64 = -5.0;
 
 /// Sign-aware soft penalty factor for trading less often than expected given
@@ -447,6 +447,47 @@ pub fn apply_sign_aware_penalty_factor(fitness: f64, factor: f64) -> f64 {
         fitness * factor
     } else {
         fitness / factor
+    }
+}
+
+/// Penalty fitness for a chromosome whose Deflated Sharpe Ratio (DSR --
+/// Bailey & López de Prado, 2014) falls below a neutral 0.5 ("no better than
+/// a coin flip that this Sharpe is genuine, given how many candidates this
+/// search will evaluate"). This is a DIFFERENT concern from
+/// [`min_track_record_gate_fitness`]: MinTRL asks whether THIS candidate's
+/// own sample size supports its own realized Sharpe; DSR asks whether this
+/// candidate's Sharpe is likely the accidental best-of-`n_trials` winner of
+/// the whole search, even when its own sample size is perfectly adequate by
+/// MinTRL's standard. A GA fitness function is exactly the multiple-testing
+/// setting DSR was built for -- without this gate, nothing in a per-candidate
+/// score corrects for how many candidates were tried, so a wide search can
+/// systematically prefer noise that happened to look good over a smaller,
+/// more modest, more genuine edge.
+///
+/// Deliberately lenient (0.5, not the platform's much stricter
+/// `VerdictThresholds::PROMISING_MIN_DSR = 0.95` used at final verdict time
+/// on the one already-selected candidate) -- this gate's job is to stop the
+/// GA from actively SELECTING a demonstrably-likely-overfit candidate over
+/// one with a more trustworthy edge, not to hold every surviving candidate
+/// to the bar a finished job's verdict does.
+///
+/// `dsr` is `None` when it isn't computable for this candidate (e.g. too few
+/// trades for a Sharpe standard error, or the caller's search has no
+/// `n_trials` concept) -- callers should fall through to their other gates
+/// rather than penalizing on a metric that doesn't apply. Returns
+/// `Some(penalty)` scaled by how far below 0.5 the DSR falls, staying
+/// strictly ABOVE [`min_track_record_gate_fitness`]'s range ((-50.0, -10.0])
+/// and strictly BELOW [`DRAWDOWN_HARD_CAP_FITNESS`] / any realistically-
+/// achievable weighted fitness (~-3..+3) -- a GA should never prefer a
+/// likely-overfit candidate over a proven one, but this is a milder signal
+/// than an outright unproven Sharpe.
+pub fn dsr_gate_fitness(dsr: Option<f64>) -> Option<f64> {
+    match dsr {
+        Some(d) if d < 0.5 => {
+            let progress = (d / 0.5).clamp(0.0, 1.0);
+            Some(-9.5 + progress * 4.0) // range: (-9.5, -5.5]
+        }
+        _ => None,
     }
 }
 
@@ -1664,6 +1705,28 @@ mod sentinel_fitness_tests {
         assert!(far > low_trade_count_fitness(MIN_TRADES_FOR_SIGNIFICANCE - 1));
         // Must stay strictly below the zero-trade floor's escape velocity.
         assert!(far > ZERO_TRADE_FITNESS);
+    }
+
+    #[test]
+    fn dsr_gate_fitness_is_ordered_correctly() {
+        // Not computable / DSR at or above the neutral 0.5 bar -> no gate.
+        assert_eq!(dsr_gate_fitness(None), None);
+        assert_eq!(dsr_gate_fitness(Some(0.5)), None);
+        assert_eq!(dsr_gate_fitness(Some(0.95)), None);
+
+        // Below 0.5 -> penalized, and strictly worse than any
+        // realistically-achievable weighted fitness.
+        let far = dsr_gate_fitness(Some(0.0)).expect("should gate");
+        let close = dsr_gate_fitness(Some(0.45)).expect("should gate");
+        assert!(far < -3.0 && close < -3.0);
+        // A DSR closer to the 0.5 bar must score no worse than one farther away.
+        assert!(close >= far);
+        // Must stay strictly above MinTRL's worst case (this gate is a
+        // milder signal than an outright unproven Sharpe).
+        assert!(far > min_track_record_gate_fitness(1, Some(1000)).unwrap());
+        // Must stay strictly below the drawdown hard cap / any realistic
+        // weighted fitness.
+        assert!(close < DRAWDOWN_HARD_CAP_FITNESS);
     }
 
     /// Regression test: the date-scaled trade-activity penalty must never

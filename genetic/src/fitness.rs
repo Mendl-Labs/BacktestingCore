@@ -35,6 +35,11 @@ pub struct FitnessInputs {
     /// candidate, if computable. `None` when it isn't applicable (e.g.
     /// Sharpe at or below the benchmark, or zero standard error).
     pub min_trl: Option<usize>,
+    /// This candidate's own Deflated Sharpe Ratio (Bailey & López de Prado,
+    /// 2014), corrected for how many candidates the caller's search will
+    /// evaluate in total. `None` when it isn't computable (e.g. too few
+    /// trades for a Sharpe standard error) -- see [`crate::dsr_gate_fitness`].
+    pub dsr: Option<f64>,
     pub data_span_days: f64,
     /// Hard drawdown-disqualification threshold, as a fraction of initial
     /// capital, sourced from the job/user's own configuration (not a
