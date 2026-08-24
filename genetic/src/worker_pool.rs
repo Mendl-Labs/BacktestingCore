@@ -81,6 +81,14 @@ pub struct WorkerConfig {
     /// existed.
     #[serde(default = "default_max_drawdown_hard_cap")]
     pub max_drawdown_hard_cap: f64,
+    /// Total candidates this GA run will evaluate (population_size *
+    /// generations), used to compute each candidate's Deflated Sharpe Ratio
+    /// (see `genetic::dsr_gate_fitness`). `None` for older configs
+    /// serialized before this field existed, or callers with no fixed
+    /// trial-count concept -- DSR is then left uncomputed rather than
+    /// guessed at.
+    #[serde(default)]
+    pub dsr_n_trials: Option<usize>,
 }
 
 fn default_max_drawdown_hard_cap() -> f64 {
