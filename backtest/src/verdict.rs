@@ -95,6 +95,12 @@ pub struct VerdictInputs {
     /// when the user picked "Not sure" or the run wasn't launched through
     /// LaunchForm at all.
     pub user_max_drawdown_tolerance: Option<f64>,
+
+    /// Tenant-level DSR promotion floor (`tenants.dsr_floor_override`,
+    /// DB-enforced `>= 0.95`). Only ever RAISES the effective bar above
+    /// `PROMISING_MIN_DSR` -- see `effective_min_dsr`. `None` for tenants
+    /// that haven't set one (the platform default applies).
+    pub dsr_floor_override: Option<f64>,
 }
 
 /// The drawdown ceiling actually enforced for this run: the platform's own
@@ -126,6 +132,19 @@ impl VerdictThresholds {
     pub const PROMISING_MIN_DSR: f64 = 0.95;
     /// Information Ratio threshold: strategy must beat the risk-free rate on OOS data.
     pub const PROMISING_MIN_IR: f64 = 0.0;
+}
+
+/// The DSR bar actually enforced for this run: the platform's own fixed
+/// floor, raised by a tenant-stated override when one is set. Never
+/// lowered -- a `dsr_floor_override` below the platform floor is clamped,
+/// not honored (the DB CHECK constraint should already prevent this, but
+/// the gate stays safe even if that invariant is ever violated some other
+/// way). Mirrors `effectiveMinDsr` in `verdict.ts`.
+fn effective_min_dsr(inputs: &VerdictInputs) -> f64 {
+    inputs
+        .dsr_floor_override
+        .map(|floor| floor.max(VerdictThresholds::PROMISING_MIN_DSR))
+        .unwrap_or(VerdictThresholds::PROMISING_MIN_DSR)
 }
 
 /// Single-leg catastrophic-failure floor for a diversified portfolio.
@@ -174,11 +193,12 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
 
     // Deflated Sharpe gate: corrects for GA multiple-comparisons selection bias.
     if let Some(dsr) = inputs.deflated_sharpe_ratio {
-        if dsr < VerdictThresholds::PROMISING_MIN_DSR {
+        let min_dsr = effective_min_dsr(inputs);
+        if dsr < min_dsr {
             return Some(format!(
                 "Deflated Sharpe Ratio {:.2} below {} — likely overfitting from parameter search",
                 dsr,
-                VerdictThresholds::PROMISING_MIN_DSR
+                min_dsr
             ));
         }
     }
@@ -358,7 +378,7 @@ const DSR_EXPLAIN_HIGH_SHARPE_STD_ERROR: f64 = 0.3;
 /// already does that). Mirrors `explainLowDsr`.
 pub fn explain_low_dsr(inputs: &VerdictInputs) -> Option<String> {
     let dsr = inputs.deflated_sharpe_ratio?;
-    if dsr >= VerdictThresholds::PROMISING_MIN_DSR {
+    if dsr >= effective_min_dsr(inputs) {
         return None;
     }
 
@@ -696,6 +716,56 @@ mod tests {
             ..promising_base()
         };
         assert!(promotion_block_reason(&only_n_obs).is_none());
+    }
+
+    // --- dsr_floor_override ---
+
+    #[test]
+    fn dsr_floor_override_blocks_promising_between_the_platform_floor_and_the_override() {
+        let inputs = VerdictInputs {
+            deflated_sharpe_ratio: Some(0.97),
+            dsr_floor_override: Some(1.2),
+            ..promising_base()
+        };
+        // Clears the platform's own 0.95 floor but not this tenant's 1.2 override.
+        assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
+        assert!(promotion_block_reason(&inputs).unwrap().contains("1.2"));
+    }
+
+    #[test]
+    fn dsr_floor_override_allows_promising_once_it_clears_the_raised_bar() {
+        let inputs = VerdictInputs {
+            deflated_sharpe_ratio: Some(1.25),
+            dsr_floor_override: Some(1.2),
+            ..promising_base()
+        };
+        assert_eq!(compute_verdict(&inputs), Verdict::Promising);
+        assert!(promotion_block_reason(&inputs).is_none());
+    }
+
+    #[test]
+    fn dsr_floor_override_below_the_platform_floor_is_clamped_not_loosened() {
+        // The DB CHECK constraint (`tenants_dsr_floor_override_min`) should
+        // already prevent this, but the gate stays safe even if that
+        // invariant is ever violated some other way.
+        let inputs = VerdictInputs {
+            deflated_sharpe_ratio: Some(0.6),
+            dsr_floor_override: Some(0.1),
+            ..promising_base()
+        };
+        assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
+        assert!(promotion_block_reason(&inputs).unwrap().contains("0.95"));
+    }
+
+    #[test]
+    fn absent_dsr_floor_override_behaves_exactly_as_before() {
+        let inputs = VerdictInputs {
+            deflated_sharpe_ratio: Some(0.96),
+            dsr_floor_override: None,
+            ..promising_base()
+        };
+        assert_eq!(compute_verdict(&inputs), Verdict::Promising);
+        assert!(promotion_block_reason(&inputs).is_none());
     }
 
     // --- explain_low_dsr ---
