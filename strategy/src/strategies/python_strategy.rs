@@ -192,9 +192,7 @@ del _name, _src, _sub, _k
 const SDK_NOT_STARTED: u8 = 0;
 const SDK_IN_PROGRESS: u8 = 1;
 const SDK_DONE_OK: u8 = 2;
-const SDK_DONE_ERR: u8 = 3;
 static SDK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SDK_NOT_STARTED);
-static SDK_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Helper: inject the SDK into a Python interpreter.
 /// Must be called after the sandbox is installed but before user code.
@@ -223,6 +221,18 @@ static SDK_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// wait, so the initializing thread can still be scheduled and finish --
 /// spin-waiting here without releasing the GIL would deadlock the two
 /// threads against each other.
+///
+/// A failed attempt resets the state back to `SDK_NOT_STARTED` rather than
+/// latching a permanent failure -- confirmed live 2026-08-26 that an earlier
+/// version which cached the failure (`SDK_DONE_ERR`, checked once via
+/// `compare_exchange` and never retried) let a single transient first-attempt
+/// failure (e.g. a numpy import hiccup during a concurrent cold start)
+/// permanently poison every subsequent `validate_strategy`/
+/// `submit_full_backtest` call for the rest of that worker process's life,
+/// recoverable only by restarting the process. Injection is a one-time setup
+/// step that should always eventually succeed; retrying on the next call is
+/// the correct tradeoff over caching a possibly-spurious one-off failure
+/// forever.
 pub fn inject_sdk(py: Python<'_>) -> Result<(), StrategyError> {
     loop {
         match SDK_STATE.compare_exchange(
@@ -245,21 +255,12 @@ pub fn inject_sdk(py: Python<'_>) -> Result<(), StrategyError> {
                     }
                     Err(e) => {
                         let msg = format!("SDK injection error: {}", e);
-                        let _ = SDK_ERROR.set(msg.clone());
-                        SDK_STATE.store(SDK_DONE_ERR, Ordering::Release);
+                        SDK_STATE.store(SDK_NOT_STARTED, Ordering::Release);
                         Err(StrategyError::ConfigurationError(msg))
                     }
                 };
             }
             Err(SDK_DONE_OK) => return Ok(()),
-            Err(SDK_DONE_ERR) => {
-                return Err(StrategyError::ConfigurationError(
-                    SDK_ERROR
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| "SDK injection failed previously".to_string()),
-                ));
-            }
             Err(_) => {
                 py.allow_threads(|| std::thread::sleep(std::time::Duration::from_micros(200)));
             }
