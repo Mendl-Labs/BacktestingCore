@@ -53,6 +53,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::{log_debug, log_warn};
 use crate::logging_facade::STRATEGY_LOGGER;
+use crate::log_error;
 
 /// Monotonic counter feeding `unique_module_name` -- see that function's doc
 /// comment for why every `PyModule::from_code_bound` call needs a name that
@@ -192,9 +193,7 @@ del _name, _src, _sub, _k
 const SDK_NOT_STARTED: u8 = 0;
 const SDK_IN_PROGRESS: u8 = 1;
 const SDK_DONE_OK: u8 = 2;
-const SDK_DONE_ERR: u8 = 3;
 static SDK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SDK_NOT_STARTED);
-static SDK_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Helper: inject the SDK into a Python interpreter.
 /// Must be called after the sandbox is installed but before user code.
@@ -223,6 +222,18 @@ static SDK_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// wait, so the initializing thread can still be scheduled and finish --
 /// spin-waiting here without releasing the GIL would deadlock the two
 /// threads against each other.
+///
+/// A failed attempt resets the state back to `SDK_NOT_STARTED` rather than
+/// latching a permanent failure -- confirmed live 2026-08-26 that an earlier
+/// version which cached the failure (`SDK_DONE_ERR`, checked once via
+/// `compare_exchange` and never retried) let a single transient first-attempt
+/// failure (e.g. a numpy import hiccup during a concurrent cold start)
+/// permanently poison every subsequent `validate_strategy`/
+/// `submit_full_backtest` call for the rest of that worker process's life,
+/// recoverable only by restarting the process. Injection is a one-time setup
+/// step that should always eventually succeed; retrying on the next call is
+/// the correct tradeoff over caching a possibly-spurious one-off failure
+/// forever.
 pub fn inject_sdk(py: Python<'_>) -> Result<(), StrategyError> {
     loop {
         match SDK_STATE.compare_exchange(
@@ -245,26 +256,59 @@ pub fn inject_sdk(py: Python<'_>) -> Result<(), StrategyError> {
                     }
                     Err(e) => {
                         let msg = format!("SDK injection error: {}", e);
-                        let _ = SDK_ERROR.set(msg.clone());
-                        SDK_STATE.store(SDK_DONE_ERR, Ordering::Release);
+                        log_sdk_injection_failure_diagnostics(py, &msg);
+                        SDK_STATE.store(SDK_NOT_STARTED, Ordering::Release);
                         Err(StrategyError::ConfigurationError(msg))
                     }
                 };
             }
             Err(SDK_DONE_OK) => return Ok(()),
-            Err(SDK_DONE_ERR) => {
-                return Err(StrategyError::ConfigurationError(
-                    SDK_ERROR
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| "SDK injection failed previously".to_string()),
-                ));
-            }
             Err(_) => {
                 py.allow_threads(|| std::thread::sleep(std::time::Duration::from_micros(200)));
             }
         }
     }
+}
+
+/// Best-effort diagnostic dump on an `inject_sdk` failure -- gathers exactly
+/// the state needed to distinguish the competing theories for why this
+/// intermittently fails in production despite passing reliably both
+/// single-threaded and under real concurrent load in isolated tests
+/// (confirmed 2026-08-26, see `inject_sdk`'s own doc comment): is `numpy`
+/// missing from `sys.path` entirely (a real environment problem), present
+/// in `sys.path` but not yet in `sys.modules` (a transient import-timing
+/// issue), or something else entirely (the error text alone doesn't say
+/// which). Every lookup here is independently best-effort (`Result`/
+/// `Option` swallowed to a placeholder string) so a failure while
+/// diagnosing a failure can never mask or replace the real error being
+/// reported -- this is purely additive log output.
+fn log_sdk_injection_failure_diagnostics(py: Python<'_>, original_error: &str) {
+    let sys_path = py
+        .import_bound("sys")
+        .and_then(|sys| sys.getattr("path"))
+        .map(|p| format!("{:?}", p))
+        .unwrap_or_else(|e| format!("<failed to read sys.path: {}>", e));
+    let numpy_in_sys_modules = py
+        .import_bound("sys")
+        .and_then(|sys| sys.getattr("modules"))
+        .and_then(|modules| modules.call_method1("__contains__", ("numpy",)))
+        .and_then(|v| v.extract::<bool>())
+        .map(|b| b.to_string())
+        .unwrap_or_else(|e| format!("<failed to check sys.modules: {}>", e));
+    let numpy_import_attempt = py
+        .import_bound("numpy")
+        .map(|m| m.getattr("__file__").map(|f| format!("{:?}", f)).unwrap_or_else(|_| "<no __file__>".to_string()))
+        .unwrap_or_else(|e| format!("<direct `import numpy` also failed: {}>", e));
+    log_error!(
+        STRATEGY_LOGGER,
+        "inject_sdk failure diagnostics -- thread={:?} pid={} original_error={} sys.path={} numpy_in_sys.modules={} direct_numpy_import={}",
+        std::thread::current().id(),
+        std::process::id(),
+        original_error,
+        sys_path,
+        numpy_in_sys_modules,
+        numpy_import_attempt
+    );
 }
 
 /// Global kill switch for the optional `compute_features()` diagnostic hook.
@@ -3193,6 +3237,18 @@ _thread.start_new_thread(_persistent_watchdog, ())
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_sdk_injection_failure_diagnostics_never_panics() {
+        // Smoke test: this only ever runs on inject_sdk's error path, so a
+        // panic inside it would replace a recoverable failure with a hard
+        // crash. Every lookup inside must degrade to a placeholder string
+        // instead, even called here with a healthy interpreter where the
+        // lookups should all genuinely succeed.
+        Python::with_gil(|py| {
+            log_sdk_injection_failure_diagnostics(py, "synthetic test error");
+        });
+    }
 
     const TEST_STRATEGY: &str = r#"
 import numpy as np
