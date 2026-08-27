@@ -679,7 +679,14 @@ impl MassiveDataProvider {
         let url = match market {
             "stocks" => format!("{}/v2/snapshot/locale/us/markets/stocks/tickers", self.base_url),
             "crypto" => format!("{}/v2/snapshot/locale/global/markets/crypto/tickers", self.base_url),
-            _ => return Ok(Vec::new()), // no snapshot coverage for forex/options/etc.
+            // Confirmed live 2026-08-27: real coverage, same day/prevDay
+            // shape as stocks/crypto, 1198 tickers in one call. Takes the
+            // caller's "forex" (not Polygon's own "fx" market-query
+            // shorthand used by list_tickers/TickerQuery -- a different,
+            // unrelated vocabulary for a different endpoint) since that's
+            // this endpoint's real URL path segment.
+            "forex" => format!("{}/v2/snapshot/locale/global/markets/forex/tickers", self.base_url),
+            _ => return Ok(Vec::new()), // no snapshot coverage for options/etc.
         };
 
         let resp = self.client.get(&url).send().await
@@ -938,6 +945,25 @@ mod market_snapshot_parsing_tests {
         assert_eq!(tickers[0].ticker.as_deref(), Some("X:SWEATUSD"));
         assert!((tickers[0].day.v - 2176983.5771599994).abs() < 0.01);
         assert!((tickers[0].day.vw - 0.0003413).abs() < 0.0000001);
+    }
+
+    const REAL_FOREX_SAMPLE: &str = r#"{
+        "status": "OK",
+        "tickers": [{
+            "ticker": "C:GBPKWD",
+            "day": {"o": 0.41856152280534, "h": 0.41856152280534, "l": 0.41797553666585, "c": 0.418162631109453, "v": 29, "vw": 0.4183},
+            "prevDay": {"o": 0.419929740882974, "h": 0.419957909505437, "l": 0.418365025001313, "c": 0.418581593374548, "v": 62, "vw": 0.4191}
+        }]
+    }"#;
+
+    #[test]
+    fn parses_real_forex_snapshot_shape() {
+        let parsed: MarketSnapshotResponse = serde_json::from_str(REAL_FOREX_SAMPLE).unwrap();
+        let tickers = parsed.tickers.unwrap();
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].ticker.as_deref(), Some("C:GBPKWD"));
+        assert!((tickers[0].day.v - 29.0).abs() < 0.01);
+        assert!((tickers[0].day.vw - 0.4183).abs() < 0.0001);
     }
 
     #[test]

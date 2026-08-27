@@ -144,7 +144,7 @@ pub trait MarketDataProvider: Send + Sync + std::fmt::Debug {
 
     /// Current (or, outside trading hours, most recent completed day's)
     /// volume/price snapshot for every actively-traded ticker in `market`
-    /// ("stocks" or "crypto") -- lets a caller rank ticker-discovery
+    /// ("stocks", "crypto", or "forex") -- lets a caller rank ticker-discovery
     /// candidates by real liquidity instead of a discovery endpoint's own
     /// arbitrary default ordering. Default returns an empty list, same
     /// rationale as `list_tickers`/`fetch_option_snapshot`: most providers
