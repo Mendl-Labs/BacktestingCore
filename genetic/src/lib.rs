@@ -1292,6 +1292,21 @@ pub struct AdaptiveGeneticOptimizer<C: Chromosome> {
     /// Tenant/user ID used when querying `strategy_registry`, so a tenant's
     /// own deployed strategies never count against themselves.
     pub tenant_id: Option<String>,
+    /// Count of chromosomes evaluated via `worker_pool.evaluate_batch()`
+    /// specifically -- every one is a genuine fresh Python simulation (the
+    /// pool has no cache of its own), but none of them touch `fitness_fn`,
+    /// so a caller tracking "real evaluations" via `fitness_fn`'s own
+    /// cache-miss counter (the pattern `backtest::python_validation` uses)
+    /// silently misses every single one whenever a worker pool is active --
+    /// which is the default whenever more than 1 CPU is available (see
+    /// `spawn_worker_pool_for_data`). Confirmed live (2026-08-27): a real
+    /// 30-generation x 50-chromosome run reported `total_fresh_evaluations`
+    /// as low as 1 (just the pre-loop baseline chromosome) despite running
+    /// ~1500 real simulations through the pool -- this field exists so a
+    /// caller can add the two counts together for the true total instead of
+    /// silently under-reporting by orders of magnitude. Read after `run()`
+    /// returns.
+    pub pool_evaluations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
@@ -1312,6 +1327,7 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
             final_population: Arc::new(std::sync::Mutex::new(Vec::new())),
             strategy_registry: None,
             tenant_id: None,
+            pool_evaluations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1394,7 +1410,13 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
                 if let Some(dyn_pop) = pop_any.downcast_ref::<Vec<DynamicChromosome>>() {
                     log_info!("{}Gen {}/{}: PARALLEL process-pool evaluation for {} chromosomes ({} workers)",
                         job_tag, generation + 1, self.config.generations, population.len(), pool.num_workers());
-                    pool.evaluate_batch(dyn_pop, &ctx, &job_tag)
+                    let results = pool.evaluate_batch(dyn_pop, &ctx, &job_tag);
+                    // See `pool_evaluations`'s doc comment -- every one of
+                    // these is a genuine fresh simulation the pool has no
+                    // cache to have served from memoization, but none of
+                    // them touch `fitness_fn`'s own cache-miss counter.
+                    self.pool_evaluations.fetch_add(results.len(), std::sync::atomic::Ordering::Relaxed);
+                    results
                 } else {
                     // Fallback: worker pool set but chromosome type isn't DynamicChromosome.
                     log_info!("{}Gen {}/{}: Worker pool set but chromosome type mismatch, falling back to sequential",

@@ -2195,16 +2195,39 @@ pub async fn run_validation_pipeline(
             pareto_objectives: nsga2_result.as_ref().map(|r| r.objectives.clone()),
             seed_stability: seed_stability_report,
             // Real evaluation count: cache MISSES (genuine fresh Python
-            // simulations) across the main GA/NSGA-II run + sensitivity +
-            // landscape sweeps -- all share `fitness_cache`/`fitness_cache_misses`
-            // above, so this single counter already covers all three.
+            // simulations) across the sensitivity + landscape sweeps --
+            // those share `fitness_cache`/`fitness_cache_misses` above --
+            // PLUS `optimizer.pool_evaluations`, the main GA/NSGA-II run's
+            // own population evaluations whenever a worker pool is active.
+            //
+            // FIX (2026-08-27): this comment used to claim `cache_misses_log`
+            // alone "already covers all three" (main run + sensitivity +
+            // landscape). That was only ever true when the main run
+            // evaluated fitness in-process. Once the worker-pool path was
+            // added (`pool.evaluate_batch()`, the default whenever more
+            // than 1 CPU is available -- see `spawn_worker_pool_for_data`),
+            // every population evaluation in the main run bypasses
+            // `fitness_fn`/`fitness_cache` entirely, and `cache_misses_log`
+            // silently fell back to counting only the pre-loop baseline
+            // chromosome (always 1) plus, for guided runs only, the
+            // sensitivity/landscape sweep (~24-40) -- random_control runs
+            // skip that sweep outright (see the `if ga_config.random_control`
+            // branch above), so their `total_fresh_evaluations` read a flat
+            // `1` regardless of how large the real search actually was.
+            // Confirmed live: a real 30-generation x 50-chromosome
+            // random_control run reported `1` despite ~1500 real
+            // simulations. `pool_evaluations` (added alongside this fix,
+            // see its doc comment in `genetic::AdaptiveGeneticOptimizer`)
+            // closes that gap by counting every pool-dispatched batch
+            // directly at the dispatch site, independent of which arm ran.
+            //
             // `ga_wf.ga_trial_count` (populated above) is always `None` now
             // -- the post-GA walk-forward evaluates the winner's own
             // already-known parameters, not a fresh search, so there's
-            // nothing extra to add here (see `WalkForwardResult.ga_trial_count`'s
-            // doc comment).
+            // nothing extra to add for it.
             total_fresh_evaluations: Some(
                 cache_misses_log.load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(optimizer.pool_evaluations.load(std::sync::atomic::Ordering::Relaxed))
                     .saturating_add(ga_wf.as_ref().and_then(|wf| wf.ga_trial_count).unwrap_or(0))
             ),
         });
@@ -3247,15 +3270,55 @@ pub fn extract_parameter_schema(
         };
 
         // Convert Python dict → HashMap<String, HashMap<String, serde_json::Value>>
+        //
+        // FIX (2026-08-27): every conversion step below used to end in a bare
+        // `?` inside this `Python::with_gil` closure -- since the closure
+        // itself returns `Option<Arc<ParameterSchema>>`, that silently
+        // short-circuited the WHOLE function to `None` on ANY parse failure,
+        // with zero logging anywhere. Confirmed live: a real strategy whose
+        // `parameter_space()` returned `{"param": [5, 8, 12]}` (a list of
+        // discrete choices -- a real, once-used convention, not a typo) hit
+        // the `value.downcast::<PyDict>()` failure on every single parameter
+        // and silently produced `has_ga = false` for the whole job. The job
+        // still ran and "completed" normally (default-parameter backtest,
+        // no error surfaced anywhere), so from the outside this was
+        // indistinguishable from "this strategy just doesn't define
+        // parameter_space()" -- diagnosing it took directly instrumenting
+        // this function, because every one of the several log_warn! calls
+        // elsewhere in this same function never fired. Explicit match arms
+        // now log exactly which parameter and which step failed.
         let mut raw_dict: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
 
         for (key, value) in ps_dict.iter() {
-            let param_name: String = key.extract().ok()?;
-            let param_dict = value.downcast::<PyDict>().ok()?;
+            let param_name: String = match key.extract() {
+                Ok(s) => s,
+                Err(e) => {
+                    log_warn!(BACKTEST_LOGGER, "[VALIDATION] extract_parameter_schema: a parameter_space() key wasn't a string: {}", e);
+                    return None;
+                }
+            };
+            let param_dict = match value.downcast::<PyDict>() {
+                Ok(d) => d,
+                Err(_) => {
+                    log_warn!(
+                        BACKTEST_LOGGER,
+                        "[VALIDATION] extract_parameter_schema: parameter_space()['{}'] isn't a dict (got {}) -- the expected shape is \
+                         {{\"type\": \"int\"|\"float\"|\"bool\", \"min\": ..., \"max\": ..., \"default\": ...}}, not a list of discrete choices",
+                        param_name, value.get_type().name().map(|n| n.to_string()).unwrap_or_else(|_| "<unknown type>".to_string())
+                    );
+                    return None;
+                }
+            };
 
             let mut entry: HashMap<String, serde_json::Value> = HashMap::new();
             for (k, v) in param_dict.iter() {
-                let k_str: String = k.extract().ok()?;
+                let k_str: String = match k.extract() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] extract_parameter_schema: a key inside parameter_space()['{}'] wasn't a string: {}", param_name, e);
+                        return None;
+                    }
+                };
                 let val = python_value_to_json(&v);
                 entry.insert(k_str, val);
             }
