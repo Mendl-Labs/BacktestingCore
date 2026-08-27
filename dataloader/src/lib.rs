@@ -19,7 +19,7 @@ pub use pool_state::{PoolSwapEvent, SwapDirection, PoolType};
 pub use pool_provider::{PoolDataProvider, PoolDataRequest};
 pub use models::{
     DataRequest, DataType, Exchange, ProviderConfig, CacheConfig, CacheStats, CandleGranularity,
-    TickerInfo, TickerQuery,
+    TickerInfo, TickerQuery, TickerSnapshot,
     OptionCandle, OptionChainSnapshot, OptionContractRef, OptionType,
 };
 pub use aggregation::aggregate_to_candles;

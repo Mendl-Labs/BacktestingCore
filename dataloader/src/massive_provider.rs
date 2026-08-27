@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::models::{
     CandleGranularity, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractRef,
-    OptionType, TickerInfo, TickerQuery,
+    OptionType, TickerInfo, TickerQuery, TickerSnapshot,
 };
 use crate::provider::{MarketDataProvider, ProviderError};
 use crate::{Candle, MarketData};
@@ -187,6 +187,43 @@ struct OptionSnapshotResult {
 #[derive(Debug, Deserialize)]
 struct OptionSnapshotResponse {
     results: Option<Vec<OptionSnapshotResult>>,
+    status: Option<String>,
+}
+
+/// The `day`/`prevDay` sub-object shape shared by both
+/// `/v2/snapshot/locale/us/markets/stocks/tickers` and
+/// `/v2/snapshot/locale/global/markets/crypto/tickers` -- confirmed live
+/// 2026-08-27 against both endpoints, same field names in each. `c`/`v`/`vw`
+/// are all `0.0` (not omitted) when there's no trade data for that period
+/// yet, e.g. `day` for a stock queried outside market hours -- never missing
+/// from the JSON, just zeroed, so plain (non-`Option`) `f64` with serde's
+/// default is the right shape here.
+#[derive(Debug, Deserialize, Default)]
+struct MarketSnapshotDay {
+    #[serde(default)]
+    c: f64,
+    #[serde(default)]
+    v: f64,
+    #[serde(default)]
+    vw: f64,
+}
+
+/// One ticker row from either market-wide snapshot endpoint.
+#[derive(Debug, Deserialize)]
+struct MarketSnapshotResult {
+    ticker: Option<String>,
+    #[serde(default)]
+    day: MarketSnapshotDay,
+    #[serde(rename = "prevDay", default)]
+    prev_day: MarketSnapshotDay,
+}
+
+/// Top-level response from either market-wide snapshot endpoint. `tickers`
+/// (not `results`) is the real field name Polygon uses here, unlike every
+/// other endpoint in this file -- confirmed live, not a guess.
+#[derive(Debug, Deserialize)]
+struct MarketSnapshotResponse {
+    tickers: Option<Vec<MarketSnapshotResult>>,
     status: Option<String>,
 }
 
@@ -629,6 +666,59 @@ impl MassiveDataProvider {
             })
             .collect())
     }
+
+    /// Query `/v2/snapshot/locale/{us|global}/markets/{stocks|crypto}/tickers`
+    /// for a market-wide current volume/price snapshot. Same "advisory,
+    /// never a hard failure" contract as `fetch_option_snapshot_impl`: a
+    /// non-success status just means no ranking signal is available this
+    /// call, not that the caller's whole request should fail.
+    async fn snapshot_market_impl(
+        &self,
+        market: &str,
+    ) -> Result<Vec<TickerSnapshot>, MassiveProviderError> {
+        let url = match market {
+            "stocks" => format!("{}/v2/snapshot/locale/us/markets/stocks/tickers", self.base_url),
+            "crypto" => format!("{}/v2/snapshot/locale/global/markets/crypto/tickers", self.base_url),
+            _ => return Ok(Vec::new()), // no snapshot coverage for forex/options/etc.
+        };
+
+        let resp = self.client.get(&url).send().await
+            .map_err(|e| MassiveProviderError::HttpError(e.to_string()))?;
+
+        let status = resp.status();
+        if status == 429 {
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(60);
+            return Err(MassiveProviderError::RateLimited { retry_after_secs: retry });
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MassiveProviderError::ApiError { status: status.as_u16(), message: body });
+        }
+
+        let parsed: MarketSnapshotResponse = resp.json().await
+            .map_err(|e| MassiveProviderError::ParseError(e.to_string()))?;
+
+        Ok(parsed.tickers.unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let ticker = r.ticker?;
+                Some(TickerSnapshot {
+                    ticker,
+                    price: r.day.c,
+                    day_volume: r.day.v,
+                    day_vwap: r.day.vw,
+                    prev_day_close: r.prev_day.c,
+                    prev_day_volume: r.prev_day.v,
+                    prev_day_vwap: r.prev_day.vw,
+                })
+            })
+            .collect())
+    }
 }
 
 // ============================================================================
@@ -797,6 +887,67 @@ impl MarketDataProvider for MassiveDataProvider {
         underlying: &str,
     ) -> Result<Vec<OptionChainSnapshot>, ProviderError> {
         self.fetch_option_snapshot_impl(underlying).await.map_err(ProviderError::from)
+    }
+
+    async fn snapshot_market(&self, market: &str) -> Result<Vec<TickerSnapshot>, ProviderError> {
+        self.snapshot_market_impl(market).await.map_err(ProviderError::from)
+    }
+}
+
+#[cfg(test)]
+mod market_snapshot_parsing_tests {
+    use super::MarketSnapshotResponse;
+
+    // Real response shapes confirmed live against the actual API 2026-08-27
+    // (both endpoints), not guessed from documentation.
+
+    const REAL_STOCKS_SAMPLE: &str = r#"{
+        "status": "OK",
+        "tickers": [{
+            "ticker": "ATI",
+            "day": {"o": 0, "h": 0, "l": 0, "c": 0, "v": 0, "vw": 0},
+            "prevDay": {"o": 217, "h": 217.84, "l": 211.66, "c": 212.86, "v": 1278324.008908, "vw": 213.9281}
+        }]
+    }"#;
+
+    const REAL_CRYPTO_SAMPLE: &str = r#"{
+        "status": "OK",
+        "tickers": [{
+            "ticker": "X:SWEATUSD",
+            "day": {"o": 0.000344, "h": 0.000345, "l": 0.00034, "c": 0.00034, "v": 2176983.5771599994, "vw": 0.0003413},
+            "prevDay": {"o": 0.000343, "h": 0.000348, "l": 0.000341, "c": 0.000345, "v": 5360790.16347, "vw": 0.0003442}
+        }]
+    }"#;
+
+    #[test]
+    fn parses_real_stocks_snapshot_shape_including_zeroed_day_outside_market_hours() {
+        let parsed: MarketSnapshotResponse = serde_json::from_str(REAL_STOCKS_SAMPLE).unwrap();
+        let tickers = parsed.tickers.unwrap();
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].ticker.as_deref(), Some("ATI"));
+        assert_eq!(tickers[0].day.c, 0.0);
+        assert!((tickers[0].prev_day.v - 1278324.008908).abs() < 0.01);
+        assert!((tickers[0].prev_day.vw - 213.9281).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parses_real_crypto_snapshot_shape_with_live_day_data() {
+        let parsed: MarketSnapshotResponse = serde_json::from_str(REAL_CRYPTO_SAMPLE).unwrap();
+        let tickers = parsed.tickers.unwrap();
+        assert_eq!(tickers.len(), 1);
+        assert_eq!(tickers[0].ticker.as_deref(), Some("X:SWEATUSD"));
+        assert!((tickers[0].day.v - 2176983.5771599994).abs() < 0.01);
+        assert!((tickers[0].day.vw - 0.0003413).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn tickers_field_not_results_is_the_real_key_name() {
+        // This endpoint uses "tickers" as its top-level key, unlike every
+        // other endpoint in this file ("results") -- a real, confirmed
+        // difference, not an inconsistency to "fix" by renaming.
+        let malformed = r#"{"status": "OK", "results": []}"#;
+        let parsed: MarketSnapshotResponse = serde_json::from_str(malformed).unwrap();
+        assert!(parsed.tickers.is_none(), "a response keyed \"results\" instead of \"tickers\" must parse to None, proving the field name matters");
     }
 }
 
