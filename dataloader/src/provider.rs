@@ -17,7 +17,7 @@ use chrono::NaiveDate;
 
 use crate::models::{
     CacheStats, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractRef, TickerInfo,
-    TickerQuery,
+    TickerQuery, TickerSnapshot,
 };
 use crate::massive_provider::MassiveDataProvider;
 use crate::sui_dex_provider::SuiDexDataProvider;
@@ -139,6 +139,20 @@ pub trait MarketDataProvider: Send + Sync + std::fmt::Debug {
         &self,
         _underlying: &str,
     ) -> Result<Vec<OptionChainSnapshot>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    /// Current (or, outside trading hours, most recent completed day's)
+    /// volume/price snapshot for every actively-traded ticker in `market`
+    /// ("stocks" or "crypto") -- lets a caller rank ticker-discovery
+    /// candidates by real liquidity instead of a discovery endpoint's own
+    /// arbitrary default ordering. Default returns an empty list, same
+    /// rationale as `list_tickers`/`fetch_option_snapshot`: most providers
+    /// have no such market-wide snapshot at all, or it requires a higher
+    /// account tier, and an empty result here should read as "no ranking
+    /// signal available" (caller falls back to unranked order) rather than
+    /// a hard error every unsupported/ungated caller has to special-case.
+    async fn snapshot_market(&self, _market: &str) -> Result<Vec<TickerSnapshot>, ProviderError> {
         Ok(Vec::new())
     }
 }

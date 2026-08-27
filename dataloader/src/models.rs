@@ -316,6 +316,73 @@ pub struct TickerInfo {
     pub delisted_utc: Option<String>,
 }
 
+/// One ticker's current-day trading activity, as returned by a provider's
+/// market-wide snapshot endpoint. Exists specifically to let a caller RANK
+/// candidates by real liquidity instead of accepting a ticker-discovery
+/// endpoint's own arbitrary default ordering (Polygon's `/v3/reference/
+/// tickers`, what `TickerInfo`/`list_tickers` are sourced from, returns
+/// results alphabetically by ticker symbol with no relevance signal at all
+/// -- confirmed live 2026-08-27 that this let an AI research agent's asset
+/// selection collapse onto only the handful of famous names it already knew
+/// from training, since an alphabetical page of obscure tickers gave it
+/// nothing useful to browse).
+#[derive(Debug, Clone)]
+pub struct TickerSnapshot {
+    pub ticker: String,
+    /// Last/close price for the current trading day, in the asset's own
+    /// quote currency. `0.0` if the provider had no trade yet today (e.g.
+    /// stocks queried outside market hours) -- callers should fall back to
+    /// `prev_day_notional_volume` in that case rather than treat a $0
+    /// notional volume as real.
+    pub price: f64,
+    /// Today's cumulative traded volume, in the asset's OWN base units --
+    /// NOT directly comparable across tickers with wildly different unit
+    /// prices (2,000,000 units of a $0.0003 token is a few hundred dollars
+    /// of real notional, not a sign of deep liquidity). Callers ranking by
+    /// liquidity should use `notional_volume()`/`prev_day_notional_volume()`
+    /// below, not this field directly.
+    pub day_volume: f64,
+    /// Volume-weighted average price for the current trading day -- paired
+    /// with `day_volume` to compute real notional (USD-equivalent) volume,
+    /// a fairer per-trade price estimate than the single last-trade `price`
+    /// for a volume-weighted calculation.
+    pub day_vwap: f64,
+    /// Same three fields for the PREVIOUS completed trading day -- the
+    /// fallback for stocks queried outside market hours, when `day_*` are
+    /// all zero because no trade has happened yet today.
+    pub prev_day_close: f64,
+    pub prev_day_volume: f64,
+    pub prev_day_vwap: f64,
+}
+
+impl TickerSnapshot {
+    /// Real (USD-equivalent) notional volume traded so far today --
+    /// `day_volume * day_vwap`, not raw `day_volume` alone. `0.0` when
+    /// today has no trade data yet (see `day_volume`'s doc comment); check
+    /// `prev_day_notional_volume()` in that case.
+    pub fn notional_volume(&self) -> f64 {
+        self.day_volume * self.day_vwap
+    }
+
+    /// Same computation for the previous completed trading day -- the
+    /// fallback ranking signal when today's own snapshot is empty.
+    pub fn prev_day_notional_volume(&self) -> f64 {
+        self.prev_day_volume * self.prev_day_vwap
+    }
+
+    /// Best available notional-volume estimate: today's if it's real
+    /// (non-zero), otherwise the previous day's. This is the value callers
+    /// ranking candidates by liquidity should actually sort on.
+    pub fn best_notional_volume(&self) -> f64 {
+        let today = self.notional_volume();
+        if today > 0.0 {
+            today
+        } else {
+            self.prev_day_notional_volume()
+        }
+    }
+}
+
 // ============================================================================
 // Options-chain data (Phase 0 of stock-options support)
 // ============================================================================
@@ -421,6 +488,45 @@ impl Default for ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── TickerSnapshot ──
+
+    fn snapshot(price: f64, day_volume: f64, day_vwap: f64, prev_close: f64, prev_volume: f64, prev_vwap: f64) -> TickerSnapshot {
+        TickerSnapshot {
+            ticker: "TEST".to_string(),
+            price,
+            day_volume,
+            day_vwap,
+            prev_day_close: prev_close,
+            prev_day_volume: prev_volume,
+            prev_day_vwap: prev_vwap,
+        }
+    }
+
+    #[test]
+    fn notional_volume_multiplies_volume_by_vwap_not_raw_volume() {
+        // The exact confusion this type exists to prevent: a huge raw
+        // volume of a cheap token isn't real liquidity on its own.
+        let cheap_high_volume = snapshot(0.00034, 2_176_983.0, 0.0003413, 0.0, 0.0, 0.0);
+        assert!((cheap_high_volume.notional_volume() - 743.03).abs() < 1.0);
+    }
+
+    #[test]
+    fn best_notional_volume_falls_back_to_prev_day_when_today_is_zero() {
+        // Stocks queried outside market hours: day.* is all zero, not
+        // omitted -- must fall back to prevDay rather than report $0.
+        let outside_market_hours = snapshot(0.0, 0.0, 0.0, 212.86, 1_278_324.0, 213.9281);
+        assert_eq!(outside_market_hours.notional_volume(), 0.0);
+        assert!(outside_market_hours.best_notional_volume() > 0.0);
+        assert_eq!(outside_market_hours.best_notional_volume(), outside_market_hours.prev_day_notional_volume());
+    }
+
+    #[test]
+    fn best_notional_volume_prefers_today_when_both_are_real() {
+        let active = snapshot(100.0, 1000.0, 99.5, 95.0, 2000.0, 94.0);
+        assert_eq!(active.best_notional_volume(), active.notional_volume());
+        assert_ne!(active.best_notional_volume(), active.prev_day_notional_volume());
+    }
 
     // ── Exchange ──
 
