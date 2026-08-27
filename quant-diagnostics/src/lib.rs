@@ -25,7 +25,7 @@ pub use seasonality::{seasonality_by_bucket, SeasonalityBucket};
 pub use multiple_testing::benjamini_hochberg;
 pub use cross_sectional::{
     cross_sectional_rank_spread, cross_sectional_rank_spread_by_class, cross_sectional_volatility_rank_spread,
-    effective_breadth, CrossSectionalRankResult, RebalancePeriod,
+    effective_breadth, pearson_correlation, CrossSectionalRankResult, RebalancePeriod,
 };
 pub use cointegration::{
     adf_test, engle_granger_test, half_life, ols_simple, spread_zscore, AdfResult,

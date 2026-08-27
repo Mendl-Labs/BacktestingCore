@@ -376,7 +376,12 @@ pub fn effective_breadth(returns: &[Vec<f64>]) -> f64 {
     effective.clamp(1.0, n_f)
 }
 
-fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+/// Pearson correlation between two equal-length-truncated series. Public so
+/// callers outside this module (e.g. `strategy_ensemble_service` blending
+/// multiple completed jobs' return series into one portfolio) can reuse the
+/// same primitive `effective_breadth` is built on, instead of a second,
+/// independently-drifting implementation.
+pub fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
     let len = a.len().min(b.len());
     if len < 2 {
         return None;
