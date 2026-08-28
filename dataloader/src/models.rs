@@ -464,6 +464,18 @@ pub struct OptionChainSnapshot {
     pub theta: Option<f64>,
     pub vega: Option<f64>,
     pub open_interest: Option<i64>,
+    /// From the snapshot row's own `details` sub-object when present,
+    /// falling back to parsing the OCC contract ticker otherwise -- a
+    /// consumer should never need a second call to `list_option_contracts`
+    /// just to learn a row's own strike/expiration/type.
+    pub strike: Option<f64>,
+    pub expiration: Option<NaiveDate>,
+    pub contract_type: Option<OptionType>,
+    /// The underlying's own current price, as carried in this same row's
+    /// `underlying_asset.price` -- same reading for every row of one
+    /// `fetch_option_snapshot` call, exposed per-row since Polygon nests it
+    /// there rather than once at the top level.
+    pub underlying_price: Option<f64>,
 }
 
 // ============================================================================

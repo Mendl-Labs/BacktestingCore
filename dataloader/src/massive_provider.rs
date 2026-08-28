@@ -158,9 +158,15 @@ struct OptionContractListResponse {
 }
 
 /// The `details` sub-object of one row from `/v3/snapshot/options/{underlying}`.
+/// `strike_price`/`expiration_date`/`contract_type` are all real fields
+/// Polygon sends here (confirmed live 2026-08-28) -- previously only
+/// `ticker` was mapped, silently discarding the rest.
 #[derive(Debug, Deserialize)]
 struct OptionSnapshotDetails {
     ticker: Option<String>,
+    strike_price: Option<f64>,
+    expiration_date: Option<String>,
+    contract_type: Option<String>,
 }
 
 /// The `greeks` sub-object of one row from `/v3/snapshot/options/{underlying}`.
@@ -174,6 +180,15 @@ struct OptionSnapshotGreeks {
     vega: Option<f64>,
 }
 
+/// The `underlying_asset` sub-object of one row -- the underlying's own
+/// current price as of this same snapshot cycle. Polygon repeats it on
+/// every row for the same underlying rather than sending it once at the
+/// top level.
+#[derive(Debug, Deserialize, Default)]
+struct OptionSnapshotUnderlyingAsset {
+    price: Option<f64>,
+}
+
 /// One contract row from `/v3/snapshot/options/{underlying}`.
 #[derive(Debug, Deserialize)]
 struct OptionSnapshotResult {
@@ -181,12 +196,17 @@ struct OptionSnapshotResult {
     greeks: Option<OptionSnapshotGreeks>,
     implied_volatility: Option<f64>,
     open_interest: Option<i64>,
+    underlying_asset: Option<OptionSnapshotUnderlyingAsset>,
 }
 
-/// Top-level response from `/v3/snapshot/options/{underlying}`.
+/// Top-level response from `/v3/snapshot/options/{underlying}`. `next_url`
+/// was missing here until now, which is why `fetch_option_snapshot_impl`
+/// silently truncated to page 1 -- Polygon does paginate this endpoint for
+/// underlyings with many listed contracts (confirmed live against SPY).
 #[derive(Debug, Deserialize)]
 struct OptionSnapshotResponse {
     results: Option<Vec<OptionSnapshotResult>>,
+    next_url: Option<String>,
     status: Option<String>,
 }
 
@@ -624,56 +644,165 @@ impl MassiveDataProvider {
             .collect())
     }
 
+    /// Fetch a single options-snapshot page, retrying transient failures
+    /// (request timeouts, connection errors, and 5xx responses) with
+    /// exponential backoff -- same shape as `fetch_page_with_retry`, kept as
+    /// its own method rather than a shared generic since every fetch method
+    /// in this file already hand-rolls its own status handling. A diagnostic
+    /// tool built on this may fire several snapshot calls per search
+    /// iteration; one transient 5xx must not sink the whole result the way
+    /// it silently could before.
+    async fn fetch_option_snapshot_page_with_retry(
+        &self,
+        url: &str,
+    ) -> Result<OptionSnapshotResponse, MassiveProviderError> {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+
+            let send_result = self.client.get(url).send().await;
+
+            let resp = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                    if transient && attempt < MAX_ATTEMPTS {
+                        let backoff = Self::retry_backoff(attempt);
+                        log::warn!(
+                            "Massive options snapshot request failed transiently (attempt {}/{}, retrying in {}s): {}",
+                            attempt, MAX_ATTEMPTS, backoff.as_secs(), e
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(MassiveProviderError::HttpError(e.to_string()));
+                }
+            };
+
+            let status = resp.status();
+            if status == 429 {
+                let retry = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(60);
+                return Err(MassiveProviderError::RateLimited { retry_after_secs: retry });
+            }
+            // Best-effort endpoint: this commonly requires a higher Polygon
+            // account tier than the base contracts/aggregates endpoints, so
+            // a 403 here means "not on this plan," not a bug -- still
+            // surfaced as a normal ApiError (not retried) for the caller to
+            // treat as advisory data that isn't available.
+            if status.is_server_error() && attempt < MAX_ATTEMPTS {
+                let backoff = Self::retry_backoff(attempt);
+                log::warn!(
+                    "Massive options snapshot page returned server error {} (attempt {}/{}, retrying in {}s)",
+                    status.as_u16(), attempt, MAX_ATTEMPTS, backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(MassiveProviderError::ApiError { status: status.as_u16(), message: body });
+            }
+
+            return resp.json::<OptionSnapshotResponse>().await
+                .map_err(|e| MassiveProviderError::ParseError(e.to_string()));
+        }
+    }
+
     /// Query `/v3/snapshot/options/{underlying}` for a point-in-time
-    /// greeks/IV/open-interest snapshot of every listed contract. Best-effort:
-    /// this endpoint commonly requires a higher Polygon account tier than
-    /// the base contracts/aggregates endpoints, so a 403 here means "not on
-    /// this plan," not a bug -- surfaced as a normal `ApiError` like any
-    /// other non-success status, for the caller to treat as advisory data
-    /// that just isn't available rather than a hard failure.
+    /// greeks/IV/open-interest snapshot of every listed contract expiring on
+    /// or before `expiration_lte` (when set) -- bounding the window
+    /// server-side matters for a liquid underlying like SPY, which has
+    /// dozens of expiration cycles. Strike bounds are deliberately NOT a
+    /// server-side filter: spot price is only known from this same
+    /// response, so moneyness filtering has to happen client-side once spot
+    /// is known.
+    ///
+    /// Follows `next_url` pagination, capped at `MAX_SNAPSHOT_PAGES` so a
+    /// very liquid chain can't loop unbounded -- past the cap this returns
+    /// what it has so far rather than erroring, since a partial current-state
+    /// snapshot is still useful; a caller that cares should treat the result
+    /// as expiration/page-bounded, not an exhaustive chain walk.
     async fn fetch_option_snapshot_impl(
         &self,
         underlying: &str,
+        expiration_lte: Option<NaiveDate>,
     ) -> Result<Vec<OptionChainSnapshot>, MassiveProviderError> {
-        let url = format!("{}/v3/snapshot/options/{}", self.base_url, underlying.to_uppercase());
+        const MAX_SNAPSHOT_PAGES: usize = 5;
 
-        let resp = self.client.get(&url).send().await
-            .map_err(|e| MassiveProviderError::HttpError(e.to_string()))?;
-
-        let status = resp.status();
-        if status == 429 {
-            let retry = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(60);
-            return Err(MassiveProviderError::RateLimited { retry_after_secs: retry });
+        let mut params: Vec<(&str, String)> = vec![("limit", "250".to_string())];
+        if let Some(exp) = expiration_lte {
+            params.push(("expiration_date.lte", exp.format("%Y-%m-%d").to_string()));
         }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MassiveProviderError::ApiError { status: status.as_u16(), message: body });
+        let initial_url = format!(
+            "{}/v3/snapshot/options/{}?{}",
+            self.base_url,
+            underlying.to_uppercase(),
+            params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&"),
+        );
+
+        let mut url = initial_url;
+        let mut all_rows: Vec<OptionSnapshotResult> = Vec::new();
+
+        for page in 0..MAX_SNAPSHOT_PAGES {
+            let parsed = self.fetch_option_snapshot_page_with_retry(&url).await?;
+            if let Some(rows) = parsed.results {
+                all_rows.extend(rows);
+            }
+            match parsed.next_url {
+                Some(next) if !next.is_empty() => url = next,
+                _ => break,
+            }
+            if page == MAX_SNAPSHOT_PAGES - 1 {
+                log::warn!(
+                    "Massive options snapshot for {} hit the {}-page cap -- result is expiration/page-bounded, not an exhaustive chain",
+                    underlying, MAX_SNAPSHOT_PAGES
+                );
+            }
         }
 
-        let parsed: OptionSnapshotResponse = resp.json().await
-            .map_err(|e| MassiveProviderError::ParseError(e.to_string()))?;
+        Ok(all_rows.into_iter().filter_map(Self::map_snapshot_row).collect())
+    }
 
-        Ok(parsed.results.unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                let contract_ticker = r.details?.ticker?;
-                let greeks = r.greeks.unwrap_or_default();
-                Some(OptionChainSnapshot {
-                    contract_ticker,
-                    implied_volatility: r.implied_volatility,
-                    delta: greeks.delta,
-                    gamma: greeks.gamma,
-                    theta: greeks.theta,
-                    vega: greeks.vega,
-                    open_interest: r.open_interest,
-                })
-            })
-            .collect())
+    /// Map one `/v3/snapshot/options/{underlying}` row into the public
+    /// `OptionChainSnapshot` shape. Split out from `fetch_option_snapshot_impl`
+    /// as its own function purely so this parsing/fallback logic is directly
+    /// unit-testable without a live HTTP call.
+    fn map_snapshot_row(r: OptionSnapshotResult) -> Option<OptionChainSnapshot> {
+        let details = r.details?;
+        let contract_ticker = details.ticker?;
+        let greeks = r.greeks.unwrap_or_default();
+        let occ_fallback = Self::parse_occ_ticker(&contract_ticker);
+        let strike = details.strike_price
+            .or_else(|| occ_fallback.as_ref().map(|(_, s, _, _)| *s));
+        let expiration = details.expiration_date
+            .as_deref()
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .or_else(|| occ_fallback.as_ref().map(|(_, _, e, _)| *e));
+        let contract_type = details.contract_type
+            .as_deref()
+            .and_then(Self::parse_contract_type)
+            .or_else(|| occ_fallback.as_ref().map(|(_, _, _, t)| *t));
+        let underlying_price = r.underlying_asset.and_then(|u| u.price);
+        Some(OptionChainSnapshot {
+            contract_ticker,
+            implied_volatility: r.implied_volatility,
+            delta: greeks.delta,
+            gamma: greeks.gamma,
+            theta: greeks.theta,
+            vega: greeks.vega,
+            open_interest: r.open_interest,
+            strike,
+            expiration,
+            contract_type,
+            underlying_price,
+        })
     }
 
     /// Query `/v2/snapshot/locale/{us|global}/markets/{stocks|crypto}/tickers`
@@ -901,8 +1030,9 @@ impl MarketDataProvider for MassiveDataProvider {
     async fn fetch_option_snapshot(
         &self,
         underlying: &str,
+        expiration_lte: Option<NaiveDate>,
     ) -> Result<Vec<OptionChainSnapshot>, ProviderError> {
-        self.fetch_option_snapshot_impl(underlying).await.map_err(ProviderError::from)
+        self.fetch_option_snapshot_impl(underlying, expiration_lte).await.map_err(ProviderError::from)
     }
 
     async fn snapshot_market(&self, market: &str) -> Result<Vec<TickerSnapshot>, ProviderError> {
@@ -983,6 +1113,114 @@ mod market_snapshot_parsing_tests {
         let malformed = r#"{"status": "OK", "results": []}"#;
         let parsed: MarketSnapshotResponse = serde_json::from_str(malformed).unwrap();
         assert!(parsed.tickers.is_none(), "a response keyed \"results\" instead of \"tickers\" must parse to None, proving the field name matters");
+    }
+}
+
+#[cfg(test)]
+mod option_snapshot_parsing_tests {
+    use super::{MassiveDataProvider, OptionSnapshotResponse};
+    use crate::models::OptionType;
+
+    // Real response rows captured live against /v3/snapshot/options/SPY
+    // 2026-08-28 (Options Starter tier, post-subscription-upgrade), not
+    // guessed from documentation.
+
+    const REAL_LIQUID_CONTRACT_SAMPLE: &str = r#"{
+        "status": "OK",
+        "next_url": "https://api.polygon.io/v3/snapshot/options/SPY?cursor=abc123",
+        "results": [{
+            "break_even_price": 778.555,
+            "day": {"close": 8.6, "high": 12.18, "low": 8.16, "open": 10, "volume": 3956, "vwap": 10.1744},
+            "details": {
+                "contract_type": "call",
+                "exercise_style": "american",
+                "expiration_date": "2026-09-18",
+                "shares_per_contract": 100,
+                "strike_price": 770,
+                "ticker": "O:SPY260918C00770000"
+            },
+            "greeks": {"delta": 0.5191875827233503, "gamma": 0.019742916226081285, "theta": -0.22580477065518073, "vega": 0.7333845071036914},
+            "implied_volatility": 0.11105555156680261,
+            "open_interest": 17358,
+            "underlying_asset": {"price": 769.55, "ticker": "SPY", "timeframe": "DELAYED"}
+        }]
+    }"#;
+
+    // A same-day-expiring (0DTE) contract with no fresh quote for Polygon's
+    // model to price off of -- confirmed live, `greeks` comes back as a
+    // genuinely empty object and `implied_volatility` is absent entirely.
+    // Not a parse failure; the row is still real and usable for
+    // strike/expiration/type/open-interest purposes.
+    const REAL_0DTE_EMPTY_GREEKS_SAMPLE: &str = r#"{
+        "status": "OK",
+        "results": [{
+            "break_even_price": 769.61,
+            "day": {"close": 269.29, "high": 269.29, "low": 269.29, "open": 269.29, "volume": 6, "vwap": 269.29},
+            "details": {
+                "contract_type": "call",
+                "exercise_style": "american",
+                "expiration_date": "2026-08-28",
+                "shares_per_contract": 100,
+                "strike_price": 500,
+                "ticker": "O:SPY260828C00500000"
+            },
+            "greeks": {},
+            "open_interest": 378,
+            "underlying_asset": {"price": 769.6101, "ticker": "SPY", "timeframe": "DELAYED"}
+        }]
+    }"#;
+
+    #[test]
+    fn parses_a_real_liquid_contract_row_including_the_new_fields() {
+        let parsed: OptionSnapshotResponse = serde_json::from_str(REAL_LIQUID_CONTRACT_SAMPLE).unwrap();
+        assert_eq!(parsed.next_url.as_deref(), Some("https://api.polygon.io/v3/snapshot/options/SPY?cursor=abc123"));
+        let row = parsed.results.unwrap().into_iter().next().unwrap();
+        let snap = MassiveDataProvider::map_snapshot_row(row).expect("a fully-populated row must map");
+        assert_eq!(snap.contract_ticker, "O:SPY260918C00770000");
+        assert_eq!(snap.strike, Some(770.0));
+        assert_eq!(snap.expiration, Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()));
+        assert_eq!(snap.contract_type, Some(OptionType::Call));
+        assert_eq!(snap.underlying_price, Some(769.55));
+        assert!((snap.implied_volatility.unwrap() - 0.11105555156680261).abs() < 1e-12);
+        assert!((snap.delta.unwrap() - 0.5191875827233503).abs() < 1e-12);
+        assert_eq!(snap.open_interest, Some(17358));
+    }
+
+    #[test]
+    fn a_0dte_row_with_empty_greeks_still_parses_with_iv_and_greeks_none() {
+        let parsed: OptionSnapshotResponse = serde_json::from_str(REAL_0DTE_EMPTY_GREEKS_SAMPLE).unwrap();
+        let row = parsed.results.unwrap().into_iter().next().unwrap();
+        let snap = MassiveDataProvider::map_snapshot_row(row).expect("an empty greeks object is not a parse failure");
+        assert_eq!(snap.strike, Some(500.0));
+        assert_eq!(snap.contract_type, Some(OptionType::Call));
+        assert_eq!(snap.open_interest, Some(378));
+        assert_eq!(snap.implied_volatility, None);
+        assert_eq!(snap.delta, None);
+    }
+
+    #[test]
+    fn falls_back_to_the_occ_ticker_when_details_omits_strike_expiration_and_type() {
+        let minimal = r#"{
+            "status": "OK",
+            "results": [{
+                "details": {"ticker": "O:SPY250620C00450000"},
+                "open_interest": 5
+            }]
+        }"#;
+        let parsed: OptionSnapshotResponse = serde_json::from_str(minimal).unwrap();
+        let row = parsed.results.unwrap().into_iter().next().unwrap();
+        let snap = MassiveDataProvider::map_snapshot_row(row).expect("OCC-ticker fallback must still populate the row");
+        assert_eq!(snap.strike, Some(450.0));
+        assert_eq!(snap.expiration, Some(chrono::NaiveDate::from_ymd_opt(2025, 6, 20).unwrap()));
+        assert_eq!(snap.contract_type, Some(OptionType::Call));
+    }
+
+    #[test]
+    fn a_row_missing_details_entirely_is_skipped_not_a_panic() {
+        let no_details = r#"{"status": "OK", "results": [{"open_interest": 5}]}"#;
+        let parsed: OptionSnapshotResponse = serde_json::from_str(no_details).unwrap();
+        let row = parsed.results.unwrap().into_iter().next().unwrap();
+        assert!(MassiveDataProvider::map_snapshot_row(row).is_none());
     }
 }
 

@@ -130,14 +130,17 @@ pub trait MarketDataProvider: Send + Sync + std::fmt::Debug {
     }
 
     /// Fetch a point-in-time greeks/IV/open-interest snapshot for every
-    /// listed contract on `underlying`. Default returns an empty list --
-    /// snapshot/greeks data commonly requires a higher account tier than
-    /// base contracts/aggregates, so an empty result here means either "not
+    /// listed contract on `underlying` expiring on or before
+    /// `expiration_lte` (when set -- `None` means no server-side expiration
+    /// bound). Default returns an empty list -- snapshot/greeks data
+    /// commonly requires a higher account tier than base
+    /// contracts/aggregates, so an empty result here means either "not
     /// supported by this provider" or "not included in this account's plan,"
     /// and callers must treat both the same way (advisory, never blocking).
     async fn fetch_option_snapshot(
         &self,
         _underlying: &str,
+        _expiration_lte: Option<NaiveDate>,
     ) -> Result<Vec<OptionChainSnapshot>, ProviderError> {
         Ok(Vec::new())
     }
