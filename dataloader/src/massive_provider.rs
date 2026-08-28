@@ -459,6 +459,12 @@ impl MassiveDataProvider {
     /// `next_url` following, unlike `fetch_bars` -- since this is a discovery
     /// aid (the caller wants "some real options," not an exhaustive catalog
     /// walk of possibly tens of thousands of tickers).
+    ///
+    /// `query.as_of`, when set, is forwarded as Polygon's `date` param --
+    /// confirmed live 2026-08-28 against Polygon/Massive's own docs, this
+    /// reconstructs the universe as it existed on that historical date
+    /// rather than today's live catalog (see `TickerQuery::as_of`'s doc
+    /// comment for the survivorship-bias rationale).
     async fn list_tickers_impl(
         &self,
         query: &TickerQuery,
@@ -473,6 +479,9 @@ impl MassiveDataProvider {
         }
         if let Some(active) = query.active {
             params.push(("active", active.to_string()));
+        }
+        if let Some(as_of) = query.as_of {
+            params.push(("date", as_of.format("%Y-%m-%d").to_string()));
         }
 
         // reqwest's .query() builds a correctly percent-encoded query string

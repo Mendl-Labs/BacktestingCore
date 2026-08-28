@@ -293,6 +293,21 @@ pub struct TickerQuery {
     /// Filter by active trading status. `None` = provider default (usually
     /// active-only).
     pub active: Option<bool>,
+    /// Reconstruct the universe as it existed on this historical date,
+    /// instead of the provider's live/current catalog. `None` = today
+    /// (the provider's default). Confirmed live 2026-08-28 against
+    /// Polygon/Massive's own docs: `/v3/reference/tickers` accepts a `date`
+    /// param that returns tickers active as of that date, distinct from
+    /// today's live listing -- e.g. a symbol delisted in 2020 will show up
+    /// for `as_of = 2018-01-01` but not for `as_of = None`, and a symbol
+    /// that IPO'd in 2022 will NOT show up for `as_of = 2018-01-01`. Exists
+    /// to close the exact survivorship-bias gap `get_available_assets`'s
+    /// own doc comment used to call out: discovery previously only ever
+    /// surfaced currently-active tickers, so any basket built from it could
+    /// only ever contain names that survive to today, regardless of how
+    /// carefully downstream candle-fetch code checked `delisted_utc` for
+    /// mid-window drops.
+    pub as_of: Option<NaiveDate>,
     /// Max results to return. Providers may cap this lower than requested.
     pub limit: u32,
 }
