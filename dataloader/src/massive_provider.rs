@@ -27,8 +27,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::models::{
-    CandleGranularity, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractRef,
-    OptionType, TickerInfo, TickerQuery, TickerSnapshot,
+    CandleGranularity, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractQuery,
+    OptionContractRef, OptionType, TickerInfo, TickerQuery, TickerSnapshot,
 };
 use crate::provider::{MarketDataProvider, ProviderError};
 use crate::{Candle, MarketData};
@@ -595,13 +595,32 @@ impl MassiveDataProvider {
         &self,
         underlying: &str,
         as_of: NaiveDate,
+        query: &OptionContractQuery,
     ) -> Result<Vec<OptionContractRef>, MassiveProviderError> {
         let url = format!("{}/v3/reference/options/contracts", self.base_url);
-        let params: Vec<(&str, String)> = vec![
+        let mut params: Vec<(&str, String)> = vec![
             ("underlying_ticker", underlying.to_uppercase()),
             ("as_of", as_of.format("%Y-%m-%d").to_string()),
             ("limit", "1000".to_string()),
         ];
+        // Confirmed live 2026-08-29: unfiltered, this endpoint's 1000-row
+        // cap is entirely consumed by the nearest few expirations' full
+        // strike ladder on a liquid underlying -- these range filters
+        // (confirmed accepted the same day) are what makes a targeted
+        // "expirations 30-45 days out, strikes near spot" query return an
+        // exact, unpaginated result instead.
+        if let Some(gte) = query.expiration_gte {
+            params.push(("expiration_date.gte", gte.format("%Y-%m-%d").to_string()));
+        }
+        if let Some(lte) = query.expiration_lte {
+            params.push(("expiration_date.lte", lte.format("%Y-%m-%d").to_string()));
+        }
+        if let Some(gte) = query.strike_gte {
+            params.push(("strike_price.gte", gte.to_string()));
+        }
+        if let Some(lte) = query.strike_lte {
+            params.push(("strike_price.lte", lte.to_string()));
+        }
 
         let resp = self.client.get(&url).query(&params).send().await
             .map_err(|e| MassiveProviderError::HttpError(e.to_string()))?;
@@ -970,8 +989,9 @@ impl MarketDataProvider for MassiveDataProvider {
         &self,
         underlying: &str,
         as_of: NaiveDate,
+        query: &OptionContractQuery,
     ) -> Result<Vec<OptionContractRef>, ProviderError> {
-        self.list_option_contracts_impl(underlying, as_of).await.map_err(ProviderError::from)
+        self.list_option_contracts_impl(underlying, as_of, query).await.map_err(ProviderError::from)
     }
 
     async fn fetch_option_aggregates(

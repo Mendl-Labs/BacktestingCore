@@ -16,7 +16,7 @@ use std::fmt;
 use chrono::NaiveDate;
 
 use crate::models::{
-    CacheStats, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractRef, TickerInfo,
+    CacheStats, DataRequest, OptionCandle, OptionChainSnapshot, OptionContractQuery, OptionContractRef, TickerInfo,
     TickerQuery, TickerSnapshot,
 };
 use crate::massive_provider::MassiveDataProvider;
@@ -105,15 +105,19 @@ pub trait MarketDataProvider: Send + Sync + std::fmt::Debug {
     }
 
     /// List option contracts for `underlying` as of `as_of` (the reference
-    /// date used to determine which contracts existed/were listed). Default
-    /// returns an empty list, same rationale as `list_tickers`: most
-    /// providers have no options catalog at all, and "unsupported" should
-    /// read the same as "no matches" rather than requiring callers to
-    /// special-case it.
+    /// date used to determine which contracts existed/were listed), narrowed
+    /// by `query`'s optional expiration/strike range filters -- see
+    /// `OptionContractQuery`'s own doc comment for why an unfiltered call is
+    /// often useless for anything but the nearest few expirations on a
+    /// liquid underlying. Default returns an empty list, same rationale as
+    /// `list_tickers`: most providers have no options catalog at all, and
+    /// "unsupported" should read the same as "no matches" rather than
+    /// requiring callers to special-case it.
     async fn list_option_contracts(
         &self,
         _underlying: &str,
         _as_of: NaiveDate,
+        _query: &OptionContractQuery,
     ) -> Result<Vec<OptionContractRef>, ProviderError> {
         Ok(Vec::new())
     }

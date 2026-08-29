@@ -413,6 +413,25 @@ pub enum OptionType {
     Put,
 }
 
+/// Optional range filters for `list_option_contracts`. All `None` by
+/// default (unfiltered -- the provider's own default page, which for a
+/// liquid underlying can be entirely consumed by the nearest few
+/// expirations' full strike ladder, confirmed live 2026-08-29 against
+/// Polygon: 1000 unfiltered rows for SPY covered only 4 near-term
+/// expirations, none anywhere near a 30-45 DTE target). Setting
+/// `expiration_gte`/`expiration_lte`/`strike_gte`/`strike_lte` narrows the
+/// server-side result to what's actually needed -- confirmed live the same
+/// day that Polygon's `/v3/reference/options/contracts` accepts all four as
+/// `field.gte`/`field.lte` query params, returning an exact, unpaginated
+/// match (496 rows, no `next_url`) for a combined expiration+strike window.
+#[derive(Debug, Clone, Default)]
+pub struct OptionContractQuery {
+    pub expiration_gte: Option<NaiveDate>,
+    pub expiration_lte: Option<NaiveDate>,
+    pub strike_gte: Option<f64>,
+    pub strike_lte: Option<f64>,
+}
+
 /// One contract row as returned by a provider's options-contracts reference
 /// endpoint (e.g. Polygon's `/v3/reference/options/contracts`) — narrow, like
 /// `TickerInfo`, since this is a discovery/catalog shape, not a full
