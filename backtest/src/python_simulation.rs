@@ -356,9 +356,12 @@ async fn run_with_input(
         supplementary_data.len() + 64, // room for state + indicator keys
     );
 
-    // Stable region detector: skip Python strategy call when price hasn't moved significantly
+    // Stable region detector: skip Python strategy call when price hasn't moved significantly.
+    // Disabled unconditionally for strategies that define generate_signals() -- they read
+    // context (e.g. context.iv_surface) that can change independently of price, so skipping
+    // ticks on a stable price would silently starve them of that context.
     let opt = &config.backtest_config.trading.optimization;
-    let mut stable_detector = if opt.stable_region_skipping {
+    let mut stable_detector = if opt.stable_region_skipping && !executor.defines_generate_signals() {
         StableRegionDetector::new(opt.stable_region_threshold, opt.max_skip_ticks)
     } else {
         StableRegionDetector::disabled()
@@ -437,12 +440,19 @@ async fn run_with_input(
         // `input`/`total_ticks` must be the PRIMARY venue's own aligned series
         // in this mode (the caller's responsibility) so the signal index
         // returned here still lines up 1:1 with the tick loop below.
-        let raw_signals_result: (Option<Vec<i8>>, Option<String>) = match &config.multi_venue_data {
-            Some(venues) if executor.accepts_multi_venue() => {
-                executor.compute_all_signals_multi_venue(venues).await
-            }
-            _ => {
-                executor.compute_all_signals(&prices_arr, &volumes_arr, &timestamps_arr, &opens_arr, &highs_arr, &lows_arr).await
+        let raw_signals_result: (Option<Vec<i8>>, Option<String>) = if executor.defines_generate_signals() {
+            // Strategy defines generate_signals() -- skip the vectorized bulk path
+            // entirely so the per-tick loop below dispatches to it with the full
+            // StrategyContext instead of ever using precomputed array signals.
+            (None, None)
+        } else {
+            match &config.multi_venue_data {
+                Some(venues) if executor.accepts_multi_venue() => {
+                    executor.compute_all_signals_multi_venue(venues).await
+                }
+                _ => {
+                    executor.compute_all_signals(&prices_arr, &volumes_arr, &timestamps_arr, &opens_arr, &highs_arr, &lows_arr).await
+                }
             }
         };
 

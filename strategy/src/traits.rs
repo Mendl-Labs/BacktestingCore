@@ -736,6 +736,15 @@ pub trait Strategy: Send + Sync + Debug {
         false
     }
 
+    /// Whether this strategy implements `generate_signals`. Default `false`
+    /// — the engine then always uses the vectorized `compute_signals()` bulk
+    /// path and never calls this per-tick, context-carrying method. Python
+    /// strategies override this after a simple `hasattr` check during
+    /// initialization, mirroring `accepts_position_sizes`'s exact pattern.
+    fn defines_generate_signals(&self) -> bool {
+        false
+    }
+
     /// Optional bulk-vectorized feature computation, alongside
     /// `compute_all_signals`. Returns `Ok(Some(features))` mapping a feature
     /// name to a value per tick (aligned with `prices`) when the strategy

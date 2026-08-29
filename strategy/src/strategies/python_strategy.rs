@@ -500,6 +500,13 @@ pub struct PythonStrategy {
     /// extra Python call and every strategy without this method behaves
     /// exactly as before (falls back to the flat `position_size_pct`).
     accepts_position_sizes: bool,
+    /// Whether the user's Python class defines `generate_signals`. Detected
+    /// once at initialization via a simple `hasattr` check, mirroring
+    /// `accepts_position_sizes` exactly. When true, the executor dispatches
+    /// per-tick to this context-carrying method instead of the vectorized
+    /// `compute_signals` bulk path, so strategies that need `context.iv_surface`
+    /// (or `portfolio_greeks`, `orderbook_snapshot`, `custom_data`) can read it.
+    defines_generate_signals: bool,
     /// Pairs-trading support: the user's `pair_spec()` return value, parsed
     /// once at initialization if the method exists. `None` for every
     /// ordinary (non-pairs) strategy -- mirrors `accepts_multi_venue`'s
@@ -562,6 +569,7 @@ impl PythonStrategy {
             compute_signals_accepts_ohlc: false,
             accepts_multi_venue: false,
             accepts_position_sizes: false,
+            defines_generate_signals: false,
             pair_spec: None,
             pair_spec_error: None,
             basket_spec: None,
@@ -1885,6 +1893,16 @@ impl Strategy for PythonStrategy {
                 strat.hasattr("compute_position_sizes").unwrap_or(false)
             };
 
+            // Does the user's class define generate_signals? Simple presence
+            // check, same reasoning as accepts_multi_venue/accepts_position_sizes
+            // above -- when true, the executor dispatches per-tick to this
+            // context-carrying method instead of the vectorized compute_signals
+            // bulk path.
+            self.defines_generate_signals = {
+                let strat = py_obj.bind(py);
+                strat.hasattr("generate_signals").unwrap_or(false)
+            };
+
             // Pairs-trading support: does the user's class define pair_spec()?
             // If so, call it once (not per-tick) to extract the declaration --
             // this method's return value must actually be read, unlike the
@@ -2531,6 +2549,10 @@ _thread.start_new_thread(_persistent_watchdog, ())
 
     fn accepts_position_sizes(&self) -> bool {
         self.accepts_position_sizes
+    }
+
+    fn defines_generate_signals(&self) -> bool {
+        self.defines_generate_signals
     }
 
     fn compute_signals_accepts_ohlc(&self) -> bool {
@@ -3578,6 +3600,48 @@ class Strategy(BaseStrategy):
         let mut without_sizing = PythonStrategy::new(WITHOUT_SIZING.to_string());
         without_sizing.initialize(std::collections::HashMap::new()).await.unwrap();
         assert!(!without_sizing.accepts_position_sizes(), "should stay false when compute_position_sizes is absent");
+    }
+
+    // ── generate_signals() / defines_generate_signals() ─────────
+
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn defines_generate_signals_reflects_method_presence() {
+        use crate::Strategy;
+
+        const WITH_GENERATE_SIGNALS: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "WithGenerateSignals"
+
+    def compute_signals(self, prices, volumes, timestamps):
+        return np.zeros(len(prices), dtype=np.int8)
+
+    def generate_signals(self, data, context):
+        return []
+"#;
+        const WITHOUT_GENERATE_SIGNALS: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "WithoutGenerateSignals"
+
+    def compute_signals(self, prices, volumes, timestamps):
+        return np.zeros(len(prices), dtype=np.int8)
+"#;
+
+        let mut with_generate = PythonStrategy::new(WITH_GENERATE_SIGNALS.to_string());
+        with_generate.initialize(std::collections::HashMap::new()).await.unwrap();
+        assert!(with_generate.defines_generate_signals(), "should detect generate_signals when defined");
+
+        let mut without_generate = PythonStrategy::new(WITHOUT_GENERATE_SIGNALS.to_string());
+        without_generate.initialize(std::collections::HashMap::new()).await.unwrap();
+        assert!(!without_generate.defines_generate_signals(), "should stay false when generate_signals is absent");
     }
 
     #[cfg(feature = "python")]

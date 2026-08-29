@@ -188,6 +188,13 @@ pub trait StrategyExecutor: Send + Sync {
         false
     }
 
+    /// Whether the underlying strategy defines `generate_signals` and should
+    /// be dispatched per-tick with the full `StrategyContext` instead of via
+    /// the vectorized `compute_all_signals` bulk path.
+    fn defines_generate_signals(&self) -> bool {
+        false
+    }
+
     /// Optional bulk-vectorized feature computation, alongside `compute_all_signals`.
     ///
     /// Returns `(Some(features), None)` on success, where `features` maps a
@@ -758,6 +765,10 @@ impl StrategyExecutor for HybridExecutor {
         }
         self.pre_enriched = false;
 
+        if self.py_strategy.defines_generate_signals() {
+            return self.py_strategy.generate_signals(data, context).await;
+        }
+
         // Delegate to the same compute_all_signals API used by the vectorized path,
         // passing a single-element slice so the Python strategy receives a 1-tick batch.
         let ts = context.timestamp.timestamp_millis();
@@ -846,6 +857,10 @@ impl StrategyExecutor for HybridExecutor {
         self.py_strategy.accepts_position_sizes()
     }
 
+    fn defines_generate_signals(&self) -> bool {
+        self.py_strategy.defines_generate_signals()
+    }
+
     async fn compute_all_features(
         &mut self,
         prices: &[f64],
@@ -927,6 +942,10 @@ impl StrategyExecutor for PythonExecutor {
             }
         }
         self.pre_enriched = false;
+
+        if self.py_strategy.defines_generate_signals() {
+            return self.py_strategy.generate_signals(data, context).await;
+        }
 
         let ts = context.timestamp.timestamp_millis();
         match self.py_strategy.compute_all_signals(&[price], &[volume], &[ts], &[price], &[price], &[price]).await {
@@ -1012,6 +1031,10 @@ impl StrategyExecutor for PythonExecutor {
 
     fn accepts_position_sizes(&self) -> bool {
         self.py_strategy.accepts_position_sizes()
+    }
+
+    fn defines_generate_signals(&self) -> bool {
+        self.py_strategy.defines_generate_signals()
     }
 
     async fn compute_all_features(
