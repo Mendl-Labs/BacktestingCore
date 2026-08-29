@@ -94,6 +94,7 @@ async fn python_strategy_produces_trades_and_metrics() {
         risk_manager: None,
         max_trade_log_size: None,
         orderbook_snapshots: None,
+        historical_iv_surfaces: None,
         multi_venue_data: None,
     };
 
@@ -292,6 +293,7 @@ fn run_sizing_config(python_source: String) -> PythonSimConfig {
         risk_manager: None,
         max_trade_log_size: None,
         orderbook_snapshots: None,
+        historical_iv_surfaces: None,
         multi_venue_data: None,
     }
 }

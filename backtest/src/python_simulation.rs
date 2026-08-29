@@ -126,6 +126,34 @@ pub struct PythonSimConfig {
     /// normal single-venue path otherwise. `None` (the default) is the existing,
     /// unaffected single-venue behavior.
     pub multi_venue_data: Option<HashMap<(String, String), strategy::traits::VenueSeries>>,
+    /// Pre-computed historical options-derived IV overlay, sorted by
+    /// `IvSurface.timestamp` -- populated into `StrategyContext.iv_surface`
+    /// at each tick via a nearest-at-or-before lookup (mirrors
+    /// `find_nearest_snapshot`'s binary-search shape). `None` (the default,
+    /// used at every existing call site) keeps `iv_surface` `None` for
+    /// every tick exactly as before -- zero behavior change for any
+    /// strategy that doesn't opt in via `data_requirements().needs_iv_surface`.
+    pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
+}
+
+/// Binary-search the pre-sorted historical IV series for the entry whose
+/// `timestamp` is closest to (but not after) the given tick timestamp --
+/// same shape as `find_nearest_snapshot` above, applied to
+/// `IvSurface.timestamp` instead of `BookSnapshot.timestamp_us`.
+fn find_nearest_iv_surface<'a>(
+    surfaces: &'a [derivatives::IvSurface],
+    timestamp: &chrono::DateTime<chrono::Utc>,
+) -> Option<&'a derivatives::IvSurface> {
+    if surfaces.is_empty() {
+        return None;
+    }
+    let idx = surfaces.partition_point(|s| s.timestamp <= *timestamp);
+    if idx == 0 {
+        // Every surface is after this tick -- no historical coverage yet.
+        None
+    } else {
+        Some(&surfaces[idx - 1])
+    }
 }
 
 /// Run a directional Python strategy simulation.
@@ -585,7 +613,10 @@ async fn run_with_input(
         executor.pre_enrich(data, &mut custom_data_buf);
         
         let ob_snap = ob_snapshots.as_deref().and_then(|s| find_nearest_snapshot(s, &timestamp));
-        
+        let iv_surface_for_tick = config.historical_iv_surfaces.as_deref()
+            .and_then(|s| find_nearest_iv_surface(s, &timestamp))
+            .cloned();
+
         let context = StrategyContext {
             timestamp,
             portfolio_state: PortfolioSnapshot::from(&portfolio),
@@ -601,19 +632,17 @@ async fn run_with_input(
             orderbook_snapshot: ob_snap,
             custom_data: std::mem::take(&mut custom_data_buf),
             assets: HashMap::new(),
-            // iv_surface is always None here, not a placeholder oversight:
-            // Phase 0's fetch_option_snapshot is a LIVE/current snapshot
-            // (Polygon's options-snapshot endpoint), not a historical time
-            // series -- there is no real "what was the IV on this simulated
-            // bar's date" to attach without either a genuine historical-IV
-            // vendor or backing IV out of the option contract's own traded
-            // premium via greeks::bs_implied_vol (which itself needs the
-            // UNDERLYING's spot price, not carried by this single-contract
-            // candle loop -- see worker.rs's execute_python_portfolio_validation
-            // doc comment for the same "needs the underlying tracked
-            // alongside each contract" gap). Wiring either up is a real
-            // follow-up, not something to fake with wrong-date data here.
-            iv_surface: None,
+            // Historical IV overlay (2026-08-29): populated from
+            // `config.historical_iv_surfaces` when the caller pre-computed
+            // one (self-computed via Black-Scholes inversion of historical
+            // option-contract trade prices against the underlying's own
+            // historical spot -- no vendor supplies historical IV/quotes
+            // directly, confirmed this session). `find_nearest_iv_surface`
+            // deliberately returns `None` rather than the nearest FOLLOWING
+            // point when every surface is after this tick, to avoid leaking
+            // future information into the backtest. `None` (the default,
+            // every existing call site) is unchanged prior behavior.
+            iv_surface: iv_surface_for_tick,
             futures_curve: None,
             funding_rates: None,
             // portfolio_greeks IS real -- get_portfolio_greeks() aggregates
@@ -2729,6 +2758,7 @@ mod tests {
             risk_manager: None,
             max_trade_log_size: Some(500),
             orderbook_snapshots: None,
+            historical_iv_surfaces: None,
             multi_venue_data: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
@@ -2748,6 +2778,7 @@ mod tests {
             risk_manager: None,
             max_trade_log_size: None,
             orderbook_snapshots: None,
+            historical_iv_surfaces: None,
             multi_venue_data: None,
         };
         assert!(config.max_trade_log_size.is_none());

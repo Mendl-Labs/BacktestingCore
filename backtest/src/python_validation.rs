@@ -798,6 +798,17 @@ pub struct ValidationConfig {
     /// Sharpe, mirroring the built-in engine's hard gate. Sourced from the
     /// user's stated drawdown tolerance; None applies the platform-wide 40%.
     pub max_drawdown_hard_cap: Option<f64>,
+    /// Pre-computed historical options-derived IV overlay, sorted by
+    /// `IvSurface.timestamp`, forwarded verbatim into every
+    /// `run_single_backtest` call this config drives -- computed by the
+    /// caller (self-computed from historical option-contract trade prices
+    /// via Black-Scholes inversion; no vendor supplies historical IV
+    /// directly, confirmed 2026-08-29), never by `backtest` itself, which
+    /// has no data-provider access. `None` (the default) is the existing,
+    /// unaffected behavior for every strategy that doesn't need this --
+    /// gated by the caller on `data_requirements().needs_iv_surface`, not
+    /// unconditionally computed for every job.
+    pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
 }
 
 impl Default for ValidationConfig {
@@ -821,6 +832,7 @@ impl Default for ValidationConfig {
             mc_min_trades: 30,
             mc_confidence_level: 0.95,
             max_drawdown_hard_cap: None,
+            historical_iv_surfaces: None,
         }
     }
 }
@@ -1769,6 +1781,7 @@ pub async fn run_validation_pipeline(
                             risk_manager: None,
                             max_trade_log_size: Some(500),
                             orderbook_snapshots: None,
+                            historical_iv_surfaces: None,
                             multi_venue_data: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
@@ -2603,6 +2616,7 @@ async fn run_single_backtest(
             max_trade_log_size: None,
             orderbook_snapshots: None,
             multi_venue_data: None,
+            historical_iv_surfaces: config.historical_iv_surfaces.clone(),
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -3419,6 +3433,7 @@ pub async fn detect_lookahead_bias(
         risk_manager: None,
         max_trade_log_size: None,
         orderbook_snapshots: None,
+        historical_iv_surfaces: None,
         multi_venue_data: None,
     };
 
@@ -4555,6 +4570,7 @@ mod tests {
             mc_min_trades: 50,
             mc_confidence_level: 0.99,
             max_drawdown_hard_cap: None,
+            historical_iv_surfaces: None,
         };
         assert_eq!(config.wf_windows, 5);
         assert_eq!(config.mc_runs, 500);
