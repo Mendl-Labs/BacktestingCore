@@ -329,6 +329,17 @@ pub struct TickerInfo {
     /// the requested backtest end date was not actually tradeable for that
     /// whole window the way a naive "it has data" check would suggest.
     pub delisted_utc: Option<String>,
+    /// Polygon's own security-type code (e.g. "CS" common stock, "ADRC"
+    /// foreign common-stock ADR, "WARRANT", "RIGHTS", "UNIT", "ETF", "PFD").
+    /// `None` for markets whose reference endpoint doesn't carry this field
+    /// (crypto/forex) or when the provider omitted it. Exists so a
+    /// liquidity-ranked browse can exclude speculative/non-primary-share
+    /// paper (warrants, rights, SPAC units) -- those trade thinnest by
+    /// construction, so an unfiltered least-liquid sort of the whole stocks
+    /// catalog surfaces them before any genuine under-covered common stock
+    /// (confirmed live 2026-08-29: an unsteered stocks search's least_liquid
+    /// batch came back almost entirely SPAC warrants/rights).
+    pub security_type: Option<String>,
 }
 
 /// One ticker's current-day trading activity, as returned by a provider's

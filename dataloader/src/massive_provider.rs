@@ -129,6 +129,11 @@ struct TickerResult {
     active: Option<bool>,
     primary_exchange: Option<String>,
     delisted_utc: Option<String>,
+    /// Security-type code ("CS", "ADRC", "WARRANT", "RIGHTS", "UNIT", "ETF",
+    /// "PFD", ...). Polygon calls this field `type` -- renamed here since
+    /// that's a Rust keyword.
+    #[serde(rename = "type")]
+    security_type: Option<String>,
 }
 
 /// Top-level response from `/v3/reference/tickers`.
@@ -539,6 +544,7 @@ impl MassiveDataProvider {
                 active: r.active,
                 primary_exchange: r.primary_exchange,
                 delisted_utc: r.delisted_utc,
+                security_type: r.security_type,
             }))
             .collect())
     }
