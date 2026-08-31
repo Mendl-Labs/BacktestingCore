@@ -169,6 +169,30 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
     if inputs.is_statistically_significant == Some(false) {
         return Some("results are not statistically significant".to_string());
     }
+
+    // Minimum track record length gate (Bailey & López de Prado): checked
+    // BEFORE the crude trade-count floor below on purpose (design council,
+    // 2026-08-31) -- when it has data, it gives a mechanism-adaptive answer
+    // derived from THIS result's own Sharpe standard error ("needs ~N more
+    // OOS observations to trust this Sharpe") instead of a flat "too few
+    // trades" that's identical regardless of what was actually tested or how
+    // close the sample is to sufficient. Even a run that clears DSR can
+    // still have too short an OOS sample to trust the Sharpe estimate at
+    // all -- DSR corrects for how much was searched, this corrects for how
+    // little data backs the number being reported. Falls through to the
+    // crude floor below when this data isn't available (no walk-forward
+    // ran, or a portfolio path without per-asset OOS stats).
+    if let (Some(min_trl), Some(n_obs)) =
+        (inputs.oos_min_track_record_length, inputs.oos_n_observations)
+    {
+        if n_obs < min_trl {
+            return Some(format!(
+                "only {} OOS observations — minimum track record length for this Sharpe estimate is {}",
+                n_obs, min_trl
+            ));
+        }
+    }
+
     let quality = inputs.result_quality.as_deref();
     if matches!(quality, Some("insufficient") | Some("limited")) {
         return Some("too few trades for statistical confidence".to_string());
@@ -239,21 +263,6 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
             return Some(format!(
                 "only {:.0}% of walk-forward windows were profitable — strategy did not beat zero return in most periods",
                 pr * 100.0
-            ));
-        }
-    }
-
-    // Minimum track record length gate (Bailey & López de Prado): even a run
-    // that clears DSR can still have too short an OOS sample to trust the
-    // Sharpe estimate at all -- DSR corrects for how much was searched, this
-    // corrects for how little data backs the number being reported.
-    if let (Some(min_trl), Some(n_obs)) =
-        (inputs.oos_min_track_record_length, inputs.oos_n_observations)
-    {
-        if n_obs < min_trl {
-            return Some(format!(
-                "only {} OOS observations — minimum track record length for this Sharpe estimate is {}",
-                n_obs, min_trl
             ));
         }
     }
@@ -716,6 +725,37 @@ mod tests {
             ..promising_base()
         };
         assert!(promotion_block_reason(&only_n_obs).is_none());
+    }
+
+    // Design council 2026-08-31: when a thin-sample result has BOTH a crude
+    // "insufficient trades" quality tag AND the more specific min-track-record
+    // data, the mechanism-adaptive reason must win -- it derives the required
+    // observation count from THIS result's own Sharpe standard error instead
+    // of citing the same flat trade-count floor regardless of what was tested.
+    #[test]
+    fn prefers_the_adaptive_min_track_record_reason_over_the_crude_too_few_trades_floor_when_both_apply() {
+        let inputs = VerdictInputs {
+            result_quality: Some("insufficient".to_string()),
+            total_trades: Some(3),
+            oos_min_track_record_length: Some(45),
+            oos_n_observations: Some(3),
+            ..promising_base()
+        };
+        let reason = promotion_block_reason(&inputs).unwrap();
+        assert!(reason.contains("minimum track record length"));
+        assert!(!reason.contains("too few trades"));
+    }
+
+    #[test]
+    fn falls_back_to_the_too_few_trades_floor_when_min_track_record_data_is_absent() {
+        let inputs = VerdictInputs {
+            result_quality: Some("insufficient".to_string()),
+            total_trades: Some(3),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs)
+            .unwrap()
+            .contains("too few trades"));
     }
 
     // --- dsr_floor_override ---
