@@ -160,6 +160,16 @@ pub struct PythonSimConfig {
     /// `Some`, `option_spread` takes precedence. `None` (the default) is
     /// the existing, unaffected behavior.
     pub option_spread: Option<Vec<OptionSpreadLeg>>,
+    /// The underlying's own spot price at each tick, aligned index-for-index
+    /// with `market_data`/`input` -- required to price Greeks at all when
+    /// `option_instrument`/`option_spread` is set, since in that mode
+    /// `current_price` in the tick loop is the OPTION CONTRACT's own price,
+    /// not the underlying's (see `option_instrument`'s doc comment: the
+    /// whole point of that field is trading the contract's own OHLCV
+    /// series). `None` (the default) leaves Greeks unpopulated exactly as
+    /// before this field existed -- `update_position_greeks` is simply never
+    /// called, matching every existing call site.
+    pub underlying_series: Option<Vec<f64>>,
 }
 
 /// Binary-search the pre-sorted historical IV series for the entry whose
@@ -180,6 +190,48 @@ fn find_nearest_iv_surface<'a>(
     } else {
         Some(&surfaces[idx - 1])
     }
+}
+
+/// Annualized trailing realized-vol series for `update_position_greeks`'s
+/// fallback vol source (see that call site's doc comment for when the
+/// fallback is actually used vs. the real IV surface). `series` is the
+/// underlying's own spot price at each tick (`PythonSimConfig.underlying_series`);
+/// `timestamps_ms` its aligned tick timestamps, used only to derive the real
+/// bars-per-year annualization factor from the data's own actual cadence
+/// (`metrics::significance::observations_per_year_from_span`) rather than a
+/// hardcoded 252/365. Empty when `series` has fewer than 2 points.
+fn annualized_underlying_realized_vol(series: &[f64], timestamps_ms: &[i64], lookback: usize) -> Vec<Option<f64>> {
+    if series.len() < 2 {
+        return Vec::new();
+    }
+    let annualization = if timestamps_ms.len() >= 2 {
+        let span_secs = (timestamps_ms[timestamps_ms.len() - 1] - timestamps_ms[0]) as f64 / 1000.0;
+        significance::observations_per_year_from_span(timestamps_ms.len(), Some(span_secs))
+    } else {
+        365.0
+    };
+    portfoliomanager::margin::trailing_realized_vol_series(series, lookback)
+        .into_iter()
+        .map(|v| v.map(|std| std * annualization.sqrt()))
+        .collect()
+}
+
+/// Pick the vol to price `instrument`'s Greeks with at this tick: the real
+/// historical IV surface's nearest point for this exact strike/expiry when
+/// available, falling back to `fallback_vol` (the precomputed annualized
+/// realized-vol reading for this tick, from `annualized_underlying_realized_vol`)
+/// otherwise. `None` when neither source has a usable (finite, positive)
+/// reading -- callers must skip `update_position_greeks` entirely in that
+/// case rather than pricing off a zero/garbage vol.
+fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &DerivativeMetadata, fallback_vol: Option<f64>) -> Option<f64> {
+    iv_surface
+        .and_then(|surf| {
+            let strike = instrument.instrument_kind.strike()?;
+            let expiry = instrument.instrument_kind.expiry()?;
+            surf.nearest_iv(strike, expiry).map(|p| p.iv)
+        })
+        .or(fallback_vol)
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// Run a directional Python strategy simulation.
@@ -422,6 +474,20 @@ async fn run_with_input(
     // never looks at a bar's own close), and `None` end-to-end when
     // `vol_target_cfg` is `None`.
     let mut precomputed_trailing_vol: Option<Vec<Option<f64>>> = None;
+    // Greeks/mark-to-market wiring (2026-09-02): fallback realized-vol
+    // series, used per-tick to price an option position's Greeks whenever
+    // no historical IV surface point is available for that tick/strike
+    // (see the tick loop's `update_position_greeks` call below). `20` bars
+    // is a conventional realized-vol lookback (roughly a trading month at
+    // daily granularity); annualized by the data's own ACTUAL bar cadence
+    // (`observations_per_year_from_span`, populated just below once
+    // `timestamps_arr` is built) rather than a hardcoded 252/365, matching
+    // how Sharpe/DSR annualization already works elsewhere in this
+    // pipeline. Empty (the default) whenever no option instrument/spread is
+    // configured, or no `underlying_series` was supplied -- `None` end to
+    // end, `update_position_greeks` is simply never called.
+    const GREEKS_REALIZED_VOL_LOOKBACK: usize = 20;
+    let mut underlying_realized_vol: Vec<Option<f64>> = Vec::new();
     let (precomputed_signals, compute_signals_error): (Option<Vec<i8>>, Option<String>) = {
         let mut prices_arr: Vec<f64>    = Vec::with_capacity(total_ticks);
         let mut volumes_arr: Vec<f64>   = Vec::with_capacity(total_ticks);
@@ -446,6 +512,11 @@ async fn run_with_input(
                 prices_arr.push(p);
                 volumes_arr.push(v);
                 timestamps_arr.push(ts.timestamp_millis());
+            }
+        }
+        if let Some(series) = config.underlying_series.as_ref() {
+            if config.option_instrument.is_some() || config.option_spread.is_some() {
+                underlying_realized_vol = annualized_underlying_realized_vol(series, &timestamps_arr, GREEKS_REALIZED_VOL_LOOKBACK);
             }
         }
         let (features, features_error) = executor.compute_all_features(&prices_arr, &volumes_arr, &timestamps_arr).await;
@@ -562,6 +633,7 @@ async fn run_with_input(
     // the per-tick `generate_signals` path counts via `diag_*` and we merge those
     // into a `SignalCounts` after the dispatch loop completes (see below).
     let mut signal_counts = signal_counts;
+    let risk_free_rate = config.backtest_config.trading.risk_free_rate;
 
     for (tick_idx, data_cow) in input.iter().enumerate() {
         let data = &*data_cow;
@@ -653,6 +725,36 @@ async fn run_with_input(
             .and_then(|s| find_nearest_iv_surface(s, &timestamp))
             .cloned();
 
+        // Greeks/mark-to-market wiring (2026-09-02): needs the underlying's
+        // OWN spot at this tick (`config.underlying_series`, NOT
+        // `current_price` -- see that field's doc comment for why those
+        // differ whenever an option instrument/spread is configured) and a
+        // vol reading -- prefer the real historical IV surface for this
+        // exact strike/expiry when available, falling back to the
+        // precomputed annualized realized-vol estimate otherwise. Updates
+        // `position.greeks`/`mark_price`/`unrealized_pnl` for every open
+        // position on that symbol via `apply_derivative_fill`'s own bounds
+        // (a no-op if nothing is open on it yet, e.g. before entry). A
+        // no-op end to end whenever `underlying_series` wasn't supplied.
+        if let Some(spot) = config.underlying_series.as_ref()
+            .and_then(|s| s.get(tick_idx).copied())
+            .filter(|s| s.is_finite() && *s > 0.0)
+        {
+            let fallback_vol = underlying_realized_vol.get(tick_idx).copied().flatten();
+            if let Some(instr) = config.option_instrument.as_ref() {
+                if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), instr, fallback_vol) {
+                    portfolio.update_position_greeks(&instr.symbol, spot, risk_free_rate, vol, timestamp);
+                }
+            }
+            if let Some(legs) = config.option_spread.as_ref() {
+                for leg in legs {
+                    if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), &leg.instrument, fallback_vol) {
+                        portfolio.update_position_greeks(&leg.instrument.symbol, spot, risk_free_rate, vol, timestamp);
+                    }
+                }
+            }
+        }
+
         let context = StrategyContext {
             timestamp,
             portfolio_state: PortfolioSnapshot::from(&portfolio),
@@ -681,12 +783,11 @@ async fn run_with_input(
             iv_surface: iv_surface_for_tick,
             futures_curve: None,
             funding_rates: None,
-            // portfolio_greeks IS real -- get_portfolio_greeks() aggregates
-            // whatever positions already have `.greeks` populated via
-            // apply_derivative_fill/update_position_greeks (Phase 1). It's
-            // simply empty/zero until update_position_greeks is actually
-            // called with a real (spot, vol) pair, which needs the same
-            // underlying-spot data the iv_surface gap above describes.
+            // portfolio_greeks aggregates whatever positions already have
+            // `.greeks` populated -- real per-tick Greeks (2026-09-02) once
+            // `update_position_greeks` was called just above for this tick
+            // (needs `config.underlying_series` to be set); otherwise still
+            // empty/zero exactly as before that wiring existed.
             portfolio_greeks: Some(portfolio.get_portfolio_greeks()),
             tick_number: tick_idx as u64,
             elapsed_seconds: 0.0,
@@ -2935,6 +3036,7 @@ mod tests {
             multi_venue_data: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
         assert_eq!(config.max_trade_log_size, Some(500));
@@ -2957,6 +3059,7 @@ mod tests {
             multi_venue_data: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         };
         assert!(config.max_trade_log_size.is_none());
     }
@@ -3045,6 +3148,89 @@ mod tests {
             "USD",
             "test",
         )
+    }
+
+    // -- greeks wiring (select_greeks_vol / annualized_underlying_realized_vol) --
+
+    #[test]
+    fn select_greeks_vol_prefers_the_real_iv_surface_when_available() {
+        let instrument = test_call_instrument();
+        let strike = instrument.instrument_kind.strike().unwrap();
+        let expiry = instrument.instrument_kind.expiry().unwrap();
+        let surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: vec![derivatives::IvPoint { strike, expiry, iv: 0.42, bid_iv: 0.41, ask_iv: 0.43 }],
+        };
+        let vol = select_greeks_vol(Some(&surface), &instrument, Some(0.99));
+        assert_eq!(vol, Some(0.42), "the real IV surface reading must win over the fallback");
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_to_realized_vol_without_a_surface() {
+        let instrument = test_call_instrument();
+        let vol = select_greeks_vol(None, &instrument, Some(0.35));
+        assert_eq!(vol, Some(0.35));
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_when_the_surface_has_no_points() {
+        let instrument = test_call_instrument();
+        let empty_surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: Vec::new(),
+        };
+        let vol = select_greeks_vol(Some(&empty_surface), &instrument, Some(0.28));
+        assert_eq!(vol, Some(0.28));
+    }
+
+    #[test]
+    fn select_greeks_vol_returns_none_when_no_usable_source_exists() {
+        let instrument = test_call_instrument();
+        assert_eq!(select_greeks_vol(None, &instrument, None), None);
+        // A non-finite or non-positive fallback must not be treated as usable.
+        assert_eq!(select_greeks_vol(None, &instrument, Some(f64::NAN)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(-0.1)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(0.0)), None);
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_is_empty_for_too_short_a_series() {
+        assert!(annualized_underlying_realized_vol(&[100.0], &[0], 20).is_empty());
+        assert!(annualized_underlying_realized_vol(&[], &[], 20).is_empty());
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_scales_by_the_real_bars_per_year_annualization() {
+        // A varying price series long enough for `lookback=3` to produce
+        // real readings.
+        let series = vec![100.0, 102.0, 99.0, 103.0, 98.0, 105.0, 97.0, 104.0, 101.0, 103.0];
+        let n = series.len();
+        // One year of daily bars -> annualization factor near `n` itself
+        // (observations_per_year_from_span(n, one_year_secs) ~= n).
+        let one_year_ms: i64 = (365.25 * 86_400.0 * 1000.0) as i64;
+        let timestamps: Vec<i64> = (0..n as i64).map(|i| i * (one_year_ms / n as i64)).collect();
+
+        let annualized = annualized_underlying_realized_vol(&series, &timestamps, 3);
+        let raw = portfoliomanager::margin::trailing_realized_vol_series(&series, 3);
+        assert_eq!(annualized.len(), raw.len());
+
+        // Every populated entry must be the raw per-bar std scaled by the
+        // SAME annualization factor (not an arbitrary/hardcoded one) --
+        // confirm the ratio is constant across every populated index.
+        let ratios: Vec<f64> = annualized.iter().zip(raw.iter())
+            .filter_map(|(a, r)| match (a, r) {
+                (Some(a), Some(r)) if *r > 0.0 => Some(a / r),
+                _ => None,
+            })
+            .collect();
+        assert!(!ratios.is_empty(), "expected at least one populated reading from this fixture");
+        let first = ratios[0];
+        for ratio in &ratios {
+            assert!((ratio - first).abs() < 1e-6, "annualization factor must be identical across ticks: {:?}", ratios);
+        }
+        assert!(first > 1.0, "annualizing ~daily bars over a year should scale vol up materially, got factor {}", first);
     }
 
     fn vertical_spread_legs() -> Vec<OptionSpreadLeg> {
