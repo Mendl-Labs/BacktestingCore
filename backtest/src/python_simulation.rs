@@ -234,6 +234,21 @@ fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &D
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+/// Whether `position` is exempt from the engine's leveraged-futures-style
+/// margin-call check (`portfoliomanager::margin::is_liquidated`, applied at
+/// this function's call site in the tick loop). `true` for an already-closed
+/// position, or an option (long or short) -- see that call site's own doc
+/// comment for the full reasoning on why options are exempt in BOTH
+/// directions despite a short option's real unbounded loss potential
+/// (no real option margin-call formula exists in this platform; the
+/// account-level `risk_manager` drawdown gate is the applicable backstop
+/// instead). `false` for futures/perps (2026-09-02 fix): unlike options,
+/// they use the exact leveraged-margin accounting `is_liquidated` models.
+fn is_exempt_from_leverage_liquidation_check(position: &portfoliomanager::Position) -> bool {
+    position.close_time.is_some()
+        || position.instrument.as_ref().map(|i| i.instrument_kind.is_option()).unwrap_or(false)
+}
+
 /// Run a directional Python strategy simulation.
 ///
 /// Creates a `PythonStrategy`, iterates through market data tick-by-tick,
@@ -869,13 +884,35 @@ async fn run_with_input(
         // through the trigger within a single bar -- mirrors how this
         // engine's stop-loss/take-profit logic already uses intrabar
         // extremes rather than just the close. No-op at leverage=1.0
-        // (`margin::is_liquidated` always returns false) and for option
-        // positions (leverage doesn't apply to them -- see
-        // `portfoliomanager::margin`'s module docs).
+        // (`margin::is_liquidated` always returns false).
+        //
+        // Exemption scope (2026-09-02, narrowed from "any derivative"):
+        // ONLY options are exempt here, long or short -- `is_liquidated`
+        // models a leveraged-futures-style margin call (a fixed % adverse
+        // move against `entry_price`, scaled by `leverage`/
+        // `maintenance_margin_ratio`), which doesn't correspond to how a
+        // real broker's option margin requirement actually works (a
+        // function of the option's own current value plus a percentage of
+        // the underlying -- this platform has no such model, and applying
+        // the leveraged-futures formula to an option's PREMIUM would
+        // produce an economically meaningless trigger price unrelated to
+        // real risk). A long option's max loss is bounded by the premium
+        // paid regardless, so no circuit breaker is needed there either
+        // way. A short/written option's loss is genuinely unbounded and
+        // DOES need one -- that's now the account-level `risk_manager`
+        // drawdown gate (`equity_at`/`get_current_drawdown`, both fixed to
+        // correctly reflect option P&L without an artificial 100% cap
+        // earlier this session), not this per-position intrabar check.
+        // Futures/perps were PREVIOUSLY also swept into this exemption via
+        // the old blanket `instrument.is_some()` condition -- that was a
+        // real bug: unlike options, futures/perps DO use the exact
+        // leveraged-margin accounting `is_liquidated` models (real
+        // `margin_posted`, same `entry_price`/`leverage` semantics as a
+        // plain leveraged spot position), so they're no longer exempt.
         if leverage > 1.0 {
             let ohlc = extract_candle_ohlcv(data);
             let triggered = portfolio.positions.iter().any(|p| {
-                if p.close_time.is_some() || p.instrument.is_some() {
+                if is_exempt_from_leverage_liquidation_check(p) {
                     return false;
                 }
                 let intrabar_extreme = match (p.side, ohlc) {
@@ -3148,6 +3185,70 @@ mod tests {
             "USD",
             "test",
         )
+    }
+
+    fn test_position(side: portfoliomanager::PositionSide, instrument: Option<DerivativeMetadata>, closed: bool) -> portfoliomanager::Position {
+        let now = chrono::Utc::now();
+        portfoliomanager::Position {
+            symbol: instrument.as_ref().map(|i| i.symbol.clone()).unwrap_or_else(|| "TEST".to_string()),
+            side,
+            quantity: 1.0,
+            entry_price: 100.0,
+            mark_price: None,
+            realized_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            open_time: now,
+            close_time: if closed { Some(now) } else { None },
+            instrument,
+            greeks: None,
+            margin_posted: 0.0,
+        }
+    }
+
+    // -- leverage liquidation exemption (is_exempt_from_leverage_liquidation_check) --
+
+    #[test]
+    fn liquidation_exemption_a_closed_position_is_exempt_regardless_of_instrument() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, true);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_plain_leveraged_position_is_not_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_long_option_is_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_short_written_option_is_also_exempt() {
+        // Deliberate: a short option's unbounded loss potential is real, but
+        // this specific leveraged-futures-style formula still doesn't model
+        // real option margin-call mechanics for it -- see this function's
+        // doc comment for why the account-level drawdown gate is the
+        // applicable backstop instead, not this per-position check.
+        let pos = test_position(portfoliomanager::PositionSide::Short, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_future_position_is_not_exempt() {
+        // Regression test for the 2026-09-02 fix: futures/perps were
+        // previously (incorrectly) swept into a blanket "any derivative"
+        // exemption -- they use the exact leveraged-margin accounting this
+        // check models, so they must NOT be exempt.
+        let future = DerivativeMetadata::new(
+            "BTC-PERP", "BTC",
+            derivatives::InstrumentKind::Perpetual,
+            1.0, "USD", "test",
+        );
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(future), false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
     }
 
     // -- greeks wiring (select_greeks_vol / annualized_underlying_realized_vol) --
