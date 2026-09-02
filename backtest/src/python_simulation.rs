@@ -1646,6 +1646,30 @@ fn extract_instrument(signal_type: &SignalType) -> Option<DerivativeMetadata> {
     }
 }
 
+/// Commission for one fill. An option instrument (`is_option()`) uses the
+/// real per-contract Alpaca fee schedule (`config::OptionsFeeConfig`) --
+/// flat regulatory pass-throughs, not a percentage of premium -- rather
+/// than `generic_fee_rate` (this platform's only other broker integration
+/// for the same underlying asset class; see `OptionsFeeConfig::alpaca`'s
+/// doc comment for why). Any other instrument (a future, say) still applies
+/// `generic_fee_rate` but against the correctly-scaled notional (`price *
+/// qty * contract_multiplier`) -- fixes a second, compounding bug this fee
+/// model shared with options: `fill_value` was previously computed as
+/// `price * qty` with no multiplier at all, understating notional by
+/// exactly the multiplier factor for every derivative instrument, not just
+/// options. A plain (non-derivative) fill keeps the pre-existing `price *
+/// qty * generic_fee_rate` behavior exactly, since its implicit multiplier
+/// is 1.
+fn compute_commission(price: f64, qty: f64, is_buy: bool, instrument: Option<&DerivativeMetadata>, generic_fee_rate: f64) -> f64 {
+    match instrument {
+        Some(instr) if instr.instrument_kind.is_option() => {
+            config::OptionsFeeConfig::alpaca().commission_for_fill(price, qty, instr.contract_multiplier, is_buy)
+        }
+        Some(instr) => price * qty * instr.contract_multiplier * generic_fee_rate,
+        None => price * qty * generic_fee_rate,
+    }
+}
+
 /// Execute a taker (market) fill immediately, applying slippage.
 /// Tracks round-trip trades: Buy/ScaleIn opens a position, Sell/ScaleOut closes it.
 fn execute_taker_fill(
@@ -1727,7 +1751,8 @@ fn execute_taker_fill(
     let fill_qty = executed_qty;
 
     let fill_value = adjusted_price * fill_qty;
-    let commission = fill_value * taker_fee;
+    let is_buy = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
+    let commission = compute_commission(adjusted_price, fill_qty, is_buy, instrument, taker_fee);
     *total_commission += commission;
     *num_trades += 1;
     portfolio.fees_paid += commission;
@@ -1923,8 +1948,8 @@ fn fill_pending_limits(
 
             if executed_qty >= 1e-10 {
                 let exec_fill_qty = executed_qty;
-                let fill_value = order.price * exec_fill_qty;
-                let commission = fill_value * maker_fee;
+                let is_buy = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
+                let commission = compute_commission(order.price, exec_fill_qty, is_buy, order.instrument.as_ref(), maker_fee);
                 *total_commission += commission;
                 *num_trades += 1;
                 portfolio.fees_paid += commission;
@@ -2847,5 +2872,54 @@ mod tests {
         assert_eq!(extract_instrument(&buy), Some(instrument.clone()));
         assert_eq!(extract_instrument(&sell), Some(instrument.clone()));
         assert_eq!(extract_instrument(&exercise), Some(instrument));
+    }
+
+    // ---- compute_commission: real per-contract options fees, not a % of premium ----
+
+    #[test]
+    fn compute_commission_option_buy_ignores_the_generic_percentage_fee_rate() {
+        let instrument = test_call_instrument();
+        // A generic_fee_rate of 10% would dominate a percentage-based calc
+        // (0.10 * $5 * 1 contract = $0.50) -- for an option this must be
+        // completely ignored in favor of the flat per-contract schedule.
+        let commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.10);
+        let expected = config::OptionsFeeConfig::alpaca().commission_for_fill(5.0, 1.0, 100.0, true);
+        assert!((commission - expected).abs() < 1e-9, "commission={commission}, expected={expected}");
+        assert!(commission < 0.10, "must not be anywhere near the 10% generic rate: {commission}");
+    }
+
+    #[test]
+    fn compute_commission_option_sell_includes_sec_fee_and_taf() {
+        let instrument = test_call_instrument();
+        let buy_commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.001);
+        let sell_commission = compute_commission(5.0, 1.0, false, Some(&instrument), 0.001);
+        assert!(sell_commission > buy_commission, "sell must add SEC fee + TAF on top of the both-ways fees");
+    }
+
+    #[test]
+    fn compute_commission_non_derivative_fill_uses_the_generic_rate_unscaled() {
+        // No instrument at all (a plain equity/crypto/forex fill) -- must
+        // keep the pre-existing price * qty * generic_fee_rate behavior
+        // exactly, with no multiplier applied.
+        let commission = compute_commission(100.0, 2.0, true, None, 0.001);
+        assert!((commission - 100.0 * 2.0 * 0.001).abs() < 1e-9, "commission={commission}");
+    }
+
+    #[test]
+    fn compute_commission_non_option_derivative_still_scales_by_contract_multiplier() {
+        // A future (not an option) with a real multiplier still applies the
+        // generic percentage fee, but against the correctly-scaled notional
+        // -- fixes the second bug this fee model shared with options
+        // (fill_value previously had no multiplier applied at all).
+        let future = DerivativeMetadata::new(
+            "TEST-FUT",
+            "BTC-USD",
+            derivatives::InstrumentKind::Future { expiry: chrono::Utc::now() + chrono::Duration::days(30) },
+            5.0, // e.g. a micro future's contract multiplier
+            "USD",
+            "test",
+        );
+        let commission = compute_commission(100.0, 2.0, true, Some(&future), 0.001);
+        assert!((commission - 100.0 * 2.0 * 5.0 * 0.001).abs() < 1e-9, "commission={commission}");
     }
 }
