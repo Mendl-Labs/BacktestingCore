@@ -418,9 +418,19 @@ impl PortfolioState {
     ///
     /// Two valuation models coexist, matched per-position by whether it's an
     /// option:
-    /// - Options (untouched by leverage -- see module docs): the pre-existing
-    ///   credit-premium model, `+price*qty` for a long holding, `-price*qty`
-    ///   for a short (written) position.
+    /// - Options (untouched by leverage -- see module docs): `apply_derivative_fill`
+    ///   already debited/credited the full premium (`x contract_multiplier`)
+    ///   from `balance` at fill time, so what this position still
+    ///   contributes ON TOP of that is its unrealized P&L since entry --
+    ///   `position.unrealized_pnl`, the same value `update_position_greeks`
+    ///   computes from the real Black-Scholes mark (sign already handled
+    ///   per side there). NOT `mark_price * quantity` (a real, pre-existing
+    ///   bug fixed 2026-09-02: that formula omits `contract_multiplier`
+    ///   entirely, which doesn't cancel against the multiplier-scaled
+    ///   premium debit already reflected in `balance` -- dormant only
+    ///   because `mark_price` was always `None` before `update_position_greeks`
+    ///   had any callers, at which point it silently fell back to
+    ///   `entry_price`, itself still wrong for any multiplier != 1.0).
     /// - Everything else (spot and futures/perps, with or without leverage):
     ///   `margin_posted + unrealized_pnl`. At `leverage = 1.0` this is
     ///   algebraically identical to the old `mark_price * quantity` formula
@@ -438,11 +448,7 @@ impl PortfolioState {
                     .map(|i| i.instrument_kind.is_option())
                     .unwrap_or(false);
                 if is_option {
-                    let price = position.mark_price.unwrap_or(position.entry_price);
-                    match position.side {
-                        PositionSide::Long => position_value += price * position.quantity,
-                        PositionSide::Short => position_value -= price * position.quantity,
-                    }
+                    position_value += position.unrealized_pnl;
                 } else {
                     position_value += position.margin_posted + position.unrealized_pnl;
                 }
@@ -452,14 +458,35 @@ impl PortfolioState {
         self.balance + position_value
     }
 
-    /// Update unrealized P&L for all open positions based on current market price
+    /// Update unrealized P&L for all open positions based on current market
+    /// price. Skips option positions entirely (2026-09-02): when Greeks
+    /// wiring is active, `update_position_greeks` already marked them this
+    /// same tick from the real Black-Scholes theoretical price -- `current_price`
+    /// here is frequently the WRONG series for an option anyway (the
+    /// option's own tick price in the single-leg engine, not the
+    /// underlying's -- see `PythonSimConfig.underlying_series`'s doc
+    /// comment), and even when it happened to be the underlying's price,
+    /// the plain `(current_price - entry) * quantity` formula is simply
+    /// wrong for option economics. Overwriting a fresher, correct mark with
+    /// this formula would silently clobber it. An option position not yet
+    /// marked by `update_position_greeks` this run keeps its default
+    /// `unrealized_pnl` (`0.0`), which still folds into `total_unrealized`
+    /// below exactly like every other position.
     pub fn update_unrealized_pnl(&mut self, current_price: f64) {
         let mut total_unrealized = 0.0;
-        
+
         for position in &mut self.positions {
             if position.close_time.is_none() && position.quantity > 0.0 {
+                let is_option = position.instrument.as_ref()
+                    .map(|i| i.instrument_kind.is_option())
+                    .unwrap_or(false);
+                if is_option {
+                    total_unrealized += position.unrealized_pnl;
+                    continue;
+                }
+
                 position.mark_price = Some(current_price);
-                
+
                 let pnl = match position.side {
                     PositionSide::Long => {
                         (current_price - position.entry_price) * position.quantity
@@ -468,7 +495,7 @@ impl PortfolioState {
                         (position.entry_price - current_price) * position.quantity
                     }
                 };
-                
+
                 position.unrealized_pnl = pnl;
                 total_unrealized += pnl;
             }
@@ -494,26 +521,52 @@ impl PortfolioState {
             .sum()
     }
 
-    /// Unrealized P&L across all open, non-option positions if marked at
-    /// `current_price`. Read-only sibling to [`update_unrealized_pnl`], for
-    /// use mid-tick when a fresh mark-to-market equity figure is needed
-    /// without waiting for the once-per-tick `update_unrealized_pnl` call
-    /// (or mutating position state).
+    /// Unrealized P&L across all open positions if marked at `current_price`
+    /// -- plain (non-derivative) positions using that price directly; option
+    /// positions using their own `unrealized_pnl` (already freshly computed
+    /// from a real Black-Scholes mark by `update_position_greeks`, when
+    /// Greeks wiring is active for this run -- see `get_total_value`'s doc
+    /// comment for why `current_price` can't be used for an option the same
+    /// way, and why this must match its formula). Read-only sibling to
+    /// [`update_unrealized_pnl`], for use mid-tick when a fresh mark-to-
+    /// market equity figure is needed without waiting for the once-per-tick
+    /// `update_unrealized_pnl` call (or mutating position state).
+    ///
+    /// Futures/perps (a derivative position that isn't an option) still
+    /// contribute `0.0` here, unchanged from before this option fix
+    /// (2026-09-02) -- no per-tick mark-to-market wiring exists for them
+    /// yet (`update_position_greeks` only prices options via Black-Scholes),
+    /// and applying the plain formula to them would be wrong in the same
+    /// multiplier-omitting way `get_total_value`'s old option formula was.
+    /// A real, separate follow-up, not fixed here.
     pub fn unrealized_pnl_at(&self, current_price: f64) -> f64 {
         self.positions.iter()
-            .filter(|p| p.close_time.is_none() && p.quantity > 0.0 && p.instrument.is_none())
-            .map(|p| match p.side {
-                PositionSide::Long => (current_price - p.entry_price) * p.quantity,
-                PositionSide::Short => (p.entry_price - current_price) * p.quantity,
+            .filter(|p| p.close_time.is_none() && p.quantity > 0.0)
+            .map(|p| {
+                let is_option = p.instrument.as_ref()
+                    .map(|i| i.instrument_kind.is_option())
+                    .unwrap_or(false);
+                if is_option {
+                    p.unrealized_pnl
+                } else if p.instrument.is_none() {
+                    match p.side {
+                        PositionSide::Long => (current_price - p.entry_price) * p.quantity,
+                        PositionSide::Short => (p.entry_price - current_price) * p.quantity,
+                    }
+                } else {
+                    0.0
+                }
             })
             .sum()
     }
 
     /// Mark-to-market equity at `current_price`: free cash + margin currently
-    /// posted for open positions + unrealized P&L. This is the leverage-
-    /// correct successor to the naive `balance + net_position * current_price`
-    /// formula, which overstates equity once a position is only margin-backed
-    /// rather than fully owned (see `portfoliomanager::margin`'s module docs).
+    /// posted for open positions + unrealized P&L (options included via
+    /// their own Greeks-derived mark, see `unrealized_pnl_at`'s doc comment
+    /// -- 2026-09-02). This is the leverage-correct successor to the naive
+    /// `balance + net_position * current_price` formula, which overstates
+    /// equity once a position is only margin-backed rather than fully owned
+    /// (see `portfoliomanager::margin`'s module docs).
     pub fn equity_at(&self, current_price: f64) -> f64 {
         self.balance + self.margin_used() + self.unrealized_pnl_at(current_price)
     }
@@ -1391,6 +1444,79 @@ mod tests {
         let equity_at = portfolio.equity_at(52_000.0);
         assert!((total_value - equity_at).abs() < 1e-6,
             "get_total_value and equity_at should agree: {total_value} vs {equity_at}");
+    }
+
+    #[test]
+    fn get_total_value_matches_equity_at_for_a_marked_long_option() {
+        // Regression test for the 2026-09-02 fix: get_total_value's old
+        // option formula (`mark_price * quantity`, no contract_multiplier)
+        // disagreed with the economically correct value the moment
+        // mark_price stopped being None -- confirm both now agree AND both
+        // equal the textbook value (uninvested cash + current P&L).
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = Fill { fee_amount: 0.0, ..create_fill(BookSide::Bid, 5.0, 10.0) }; // $5 premium, 10 contracts, no fee
+        let executed = portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        assert_eq!(executed, 10.0);
+
+        let balance_after_open = portfolio.balance;
+        assert!((balance_after_open - (100_000.0 - 5.0 * 10.0 * 100.0)).abs() < 1e-6);
+
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+        let position = portfolio.positions.iter().find(|p| p.symbol == instrument.symbol).unwrap();
+        let mark = position.mark_price.expect("update_position_greeks should have set a mark price");
+        let expected_pnl = (mark - 5.0) * 10.0 * 100.0;
+        assert!((position.unrealized_pnl - expected_pnl).abs() < 1e-6);
+
+        let total_value = portfolio.get_total_value();
+        let equity_at = portfolio.equity_at(999_999.0); // deliberately nonsensical for an option -- must be ignored
+        assert!((total_value - equity_at).abs() < 1e-6,
+            "get_total_value and equity_at should agree: {total_value} vs {equity_at}");
+
+        let expected_equity = balance_after_open + expected_pnl;
+        assert!((equity_at - expected_equity).abs() < 1e-6,
+            "expected equity {expected_equity} (uninvested cash + current option P&L), got {equity_at}");
+    }
+
+    #[test]
+    fn update_unrealized_pnl_does_not_clobber_an_option_positions_greeks_derived_mark() {
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = create_fill(BookSide::Bid, 5.0, 1.0);
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+        let mark_before = portfolio.positions[0].mark_price;
+        let pnl_before = portfolio.positions[0].unrealized_pnl;
+        assert!(mark_before.is_some());
+
+        // A wildly different "current_price" -- if this were applied via the
+        // plain formula it would produce a completely different mark/pnl.
+        portfolio.update_unrealized_pnl(1.0);
+
+        assert_eq!(portfolio.positions[0].mark_price, mark_before,
+            "an option's Greeks-derived mark must not be overwritten by the plain mark-to-market formula");
+        assert_eq!(portfolio.positions[0].unrealized_pnl, pnl_before);
+        // Still folds into the aggregate.
+        assert!((portfolio.unrealized_pnl - pnl_before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unrealized_pnl_at_uses_the_options_own_greeks_derived_pnl_not_current_price() {
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = create_fill(BookSide::Bid, 5.0, 1.0);
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+
+        let expected_pnl = portfolio.positions[0].unrealized_pnl;
+        // current_price is irrelevant for an option leg -- confirm two very
+        // different values produce the identical result.
+        assert_eq!(portfolio.unrealized_pnl_at(1.0), expected_pnl);
+        assert_eq!(portfolio.unrealized_pnl_at(999_999.0), expected_pnl);
     }
 
     #[test]

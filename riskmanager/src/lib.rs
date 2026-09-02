@@ -282,12 +282,33 @@ impl RiskManager {
         }
     }
     
-    /// Get current drawdown from peak
+    /// Get current drawdown from peak, as a fraction of peak equity.
+    ///
+    /// Floored at `0.0` (drawdown can't be negative -- `update_equity`
+    /// always advances `peak_equity` before a tick's own equity could
+    /// exceed it, so a negative raw ratio here would only ever be
+    /// floating-point noise), but deliberately UNCAPPED above `1.0`
+    /// (2026-09-02, fixing a real live-gate bug: this used to `.clamp(0.0,
+    /// 1.0)`, silently capping the reported drawdown at exactly 100% no
+    /// matter how far equity actually fell below zero). A short/written
+    /// option position carries genuinely unbounded loss potential and is
+    /// deliberately exempt from margin-call liquidation (see
+    /// `python_simulation.rs`'s liquidation-check doc note) -- nothing else
+    /// stops equity from crashing well past a 100% loss of peak once
+    /// `equity_at` correctly includes option P&L (see `portfoliomanager`'s
+    /// 2026-09-02 option-equity fix). A caller with `RiskLimits.max_drawdown`
+    /// configured above `1.0` (a deliberately loose tolerance) would have
+    /// found this gate could NEVER fire, regardless of how catastrophic the
+    /// real loss became, since the clamped value could never exceed `1.0`
+    /// to begin with. Matches `python_simulation.rs::compute_max_drawdown`'s
+    /// existing unclamped convention for the final-reported max drawdown --
+    /// this was the one remaining clamped outlier between the live gate and
+    /// the final report.
     pub fn get_current_drawdown(&self, current_equity: f64) -> f64 {
         if self.peak_equity <= 0.0 {
             return 0.0;
         }
-        ((self.peak_equity - current_equity) / self.peak_equity).clamp(0.0, 1.0)
+        ((self.peak_equity - current_equity) / self.peak_equity).max(0.0)
     }
     
     /// Check if a proposed order should be allowed
@@ -813,6 +834,37 @@ mod tests {
     fn get_current_drawdown_zero_peak() {
         let rm = RiskManager::new();
         assert_eq!(rm.get_current_drawdown(100.0), 0.0);
+    }
+
+    #[test]
+    fn get_current_drawdown_is_not_capped_at_100_percent() {
+        // A short/written option's genuinely unbounded loss (see this
+        // function's own doc comment) can crash equity well below zero --
+        // the reported drawdown must reflect that, not silently cap at 1.0.
+        let mut rm = RiskManager::new();
+        rm.initialize(10_000.0);
+        // Equity crashes to -8,000 against a 10,000 peak: (10,000 - (-8,000))
+        // / 10,000 = 1.8 (180% drawdown).
+        let dd = rm.get_current_drawdown(-8_000.0);
+        assert!((dd - 1.8).abs() < 1e-9, "expected an uncapped 1.8, got {dd}");
+    }
+
+    #[test]
+    fn get_current_drawdown_a_max_drawdown_limit_above_one_can_still_fire() {
+        // Regression guard for the pre-fix bug: a caller configuring
+        // `max_drawdown` above 1.0 (a deliberately loose tolerance) must
+        // still be able to have the gate fire once a real loss exceeds it --
+        // with the old `.clamp(0.0, 1.0)`, this gate could NEVER fire
+        // regardless of how catastrophic the real loss became.
+        let mut limits = RiskLimits::default();
+        limits.max_drawdown = Some(1.2);
+        let mut rm = RiskManager::with_limits(limits);
+        rm.initialize(10_000.0);
+        let metrics = RiskMetrics {
+            current_drawdown: rm.get_current_drawdown(-3_000.0), // (10000-(-3000))/10000 = 1.3
+            ..RiskMetrics::default()
+        };
+        assert!(rm.check(&metrics).is_err(), "a 130% drawdown must trip a 120% limit");
     }
 
     // ── check_order ──

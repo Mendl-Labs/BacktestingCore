@@ -160,6 +160,16 @@ pub struct PythonSimConfig {
     /// `Some`, `option_spread` takes precedence. `None` (the default) is
     /// the existing, unaffected behavior.
     pub option_spread: Option<Vec<OptionSpreadLeg>>,
+    /// The underlying's own spot price at each tick, aligned index-for-index
+    /// with `market_data`/`input` -- required to price Greeks at all when
+    /// `option_instrument`/`option_spread` is set, since in that mode
+    /// `current_price` in the tick loop is the OPTION CONTRACT's own price,
+    /// not the underlying's (see `option_instrument`'s doc comment: the
+    /// whole point of that field is trading the contract's own OHLCV
+    /// series). `None` (the default) leaves Greeks unpopulated exactly as
+    /// before this field existed -- `update_position_greeks` is simply never
+    /// called, matching every existing call site.
+    pub underlying_series: Option<Vec<f64>>,
 }
 
 /// Binary-search the pre-sorted historical IV series for the entry whose
@@ -180,6 +190,63 @@ fn find_nearest_iv_surface<'a>(
     } else {
         Some(&surfaces[idx - 1])
     }
+}
+
+/// Annualized trailing realized-vol series for `update_position_greeks`'s
+/// fallback vol source (see that call site's doc comment for when the
+/// fallback is actually used vs. the real IV surface). `series` is the
+/// underlying's own spot price at each tick (`PythonSimConfig.underlying_series`);
+/// `timestamps_ms` its aligned tick timestamps, used only to derive the real
+/// bars-per-year annualization factor from the data's own actual cadence
+/// (`metrics::significance::observations_per_year_from_span`) rather than a
+/// hardcoded 252/365. Empty when `series` has fewer than 2 points.
+fn annualized_underlying_realized_vol(series: &[f64], timestamps_ms: &[i64], lookback: usize) -> Vec<Option<f64>> {
+    if series.len() < 2 {
+        return Vec::new();
+    }
+    let annualization = if timestamps_ms.len() >= 2 {
+        let span_secs = (timestamps_ms[timestamps_ms.len() - 1] - timestamps_ms[0]) as f64 / 1000.0;
+        significance::observations_per_year_from_span(timestamps_ms.len(), Some(span_secs))
+    } else {
+        365.0
+    };
+    portfoliomanager::margin::trailing_realized_vol_series(series, lookback)
+        .into_iter()
+        .map(|v| v.map(|std| std * annualization.sqrt()))
+        .collect()
+}
+
+/// Pick the vol to price `instrument`'s Greeks with at this tick: the real
+/// historical IV surface's nearest point for this exact strike/expiry when
+/// available, falling back to `fallback_vol` (the precomputed annualized
+/// realized-vol reading for this tick, from `annualized_underlying_realized_vol`)
+/// otherwise. `None` when neither source has a usable (finite, positive)
+/// reading -- callers must skip `update_position_greeks` entirely in that
+/// case rather than pricing off a zero/garbage vol.
+fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &DerivativeMetadata, fallback_vol: Option<f64>) -> Option<f64> {
+    iv_surface
+        .and_then(|surf| {
+            let strike = instrument.instrument_kind.strike()?;
+            let expiry = instrument.instrument_kind.expiry()?;
+            surf.nearest_iv(strike, expiry).map(|p| p.iv)
+        })
+        .or(fallback_vol)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Whether `position` is exempt from the engine's leveraged-futures-style
+/// margin-call check (`portfoliomanager::margin::is_liquidated`, applied at
+/// this function's call site in the tick loop). `true` for an already-closed
+/// position, or an option (long or short) -- see that call site's own doc
+/// comment for the full reasoning on why options are exempt in BOTH
+/// directions despite a short option's real unbounded loss potential
+/// (no real option margin-call formula exists in this platform; the
+/// account-level `risk_manager` drawdown gate is the applicable backstop
+/// instead). `false` for futures/perps (2026-09-02 fix): unlike options,
+/// they use the exact leveraged-margin accounting `is_liquidated` models.
+fn is_exempt_from_leverage_liquidation_check(position: &portfoliomanager::Position) -> bool {
+    position.close_time.is_some()
+        || position.instrument.as_ref().map(|i| i.instrument_kind.is_option()).unwrap_or(false)
 }
 
 /// Run a directional Python strategy simulation.
@@ -422,6 +489,20 @@ async fn run_with_input(
     // never looks at a bar's own close), and `None` end-to-end when
     // `vol_target_cfg` is `None`.
     let mut precomputed_trailing_vol: Option<Vec<Option<f64>>> = None;
+    // Greeks/mark-to-market wiring (2026-09-02): fallback realized-vol
+    // series, used per-tick to price an option position's Greeks whenever
+    // no historical IV surface point is available for that tick/strike
+    // (see the tick loop's `update_position_greeks` call below). `20` bars
+    // is a conventional realized-vol lookback (roughly a trading month at
+    // daily granularity); annualized by the data's own ACTUAL bar cadence
+    // (`observations_per_year_from_span`, populated just below once
+    // `timestamps_arr` is built) rather than a hardcoded 252/365, matching
+    // how Sharpe/DSR annualization already works elsewhere in this
+    // pipeline. Empty (the default) whenever no option instrument/spread is
+    // configured, or no `underlying_series` was supplied -- `None` end to
+    // end, `update_position_greeks` is simply never called.
+    const GREEKS_REALIZED_VOL_LOOKBACK: usize = 20;
+    let mut underlying_realized_vol: Vec<Option<f64>> = Vec::new();
     let (precomputed_signals, compute_signals_error): (Option<Vec<i8>>, Option<String>) = {
         let mut prices_arr: Vec<f64>    = Vec::with_capacity(total_ticks);
         let mut volumes_arr: Vec<f64>   = Vec::with_capacity(total_ticks);
@@ -446,6 +527,11 @@ async fn run_with_input(
                 prices_arr.push(p);
                 volumes_arr.push(v);
                 timestamps_arr.push(ts.timestamp_millis());
+            }
+        }
+        if let Some(series) = config.underlying_series.as_ref() {
+            if config.option_instrument.is_some() || config.option_spread.is_some() {
+                underlying_realized_vol = annualized_underlying_realized_vol(series, &timestamps_arr, GREEKS_REALIZED_VOL_LOOKBACK);
             }
         }
         let (features, features_error) = executor.compute_all_features(&prices_arr, &volumes_arr, &timestamps_arr).await;
@@ -562,6 +648,7 @@ async fn run_with_input(
     // the per-tick `generate_signals` path counts via `diag_*` and we merge those
     // into a `SignalCounts` after the dispatch loop completes (see below).
     let mut signal_counts = signal_counts;
+    let risk_free_rate = config.backtest_config.trading.risk_free_rate;
 
     for (tick_idx, data_cow) in input.iter().enumerate() {
         let data = &*data_cow;
@@ -653,6 +740,36 @@ async fn run_with_input(
             .and_then(|s| find_nearest_iv_surface(s, &timestamp))
             .cloned();
 
+        // Greeks/mark-to-market wiring (2026-09-02): needs the underlying's
+        // OWN spot at this tick (`config.underlying_series`, NOT
+        // `current_price` -- see that field's doc comment for why those
+        // differ whenever an option instrument/spread is configured) and a
+        // vol reading -- prefer the real historical IV surface for this
+        // exact strike/expiry when available, falling back to the
+        // precomputed annualized realized-vol estimate otherwise. Updates
+        // `position.greeks`/`mark_price`/`unrealized_pnl` for every open
+        // position on that symbol via `apply_derivative_fill`'s own bounds
+        // (a no-op if nothing is open on it yet, e.g. before entry). A
+        // no-op end to end whenever `underlying_series` wasn't supplied.
+        if let Some(spot) = config.underlying_series.as_ref()
+            .and_then(|s| s.get(tick_idx).copied())
+            .filter(|s| s.is_finite() && *s > 0.0)
+        {
+            let fallback_vol = underlying_realized_vol.get(tick_idx).copied().flatten();
+            if let Some(instr) = config.option_instrument.as_ref() {
+                if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), instr, fallback_vol) {
+                    portfolio.update_position_greeks(&instr.symbol, spot, risk_free_rate, vol, timestamp);
+                }
+            }
+            if let Some(legs) = config.option_spread.as_ref() {
+                for leg in legs {
+                    if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), &leg.instrument, fallback_vol) {
+                        portfolio.update_position_greeks(&leg.instrument.symbol, spot, risk_free_rate, vol, timestamp);
+                    }
+                }
+            }
+        }
+
         let context = StrategyContext {
             timestamp,
             portfolio_state: PortfolioSnapshot::from(&portfolio),
@@ -681,12 +798,11 @@ async fn run_with_input(
             iv_surface: iv_surface_for_tick,
             futures_curve: None,
             funding_rates: None,
-            // portfolio_greeks IS real -- get_portfolio_greeks() aggregates
-            // whatever positions already have `.greeks` populated via
-            // apply_derivative_fill/update_position_greeks (Phase 1). It's
-            // simply empty/zero until update_position_greeks is actually
-            // called with a real (spot, vol) pair, which needs the same
-            // underlying-spot data the iv_surface gap above describes.
+            // portfolio_greeks aggregates whatever positions already have
+            // `.greeks` populated -- real per-tick Greeks (2026-09-02) once
+            // `update_position_greeks` was called just above for this tick
+            // (needs `config.underlying_series` to be set); otherwise still
+            // empty/zero exactly as before that wiring existed.
             portfolio_greeks: Some(portfolio.get_portfolio_greeks()),
             tick_number: tick_idx as u64,
             elapsed_seconds: 0.0,
@@ -768,13 +884,35 @@ async fn run_with_input(
         // through the trigger within a single bar -- mirrors how this
         // engine's stop-loss/take-profit logic already uses intrabar
         // extremes rather than just the close. No-op at leverage=1.0
-        // (`margin::is_liquidated` always returns false) and for option
-        // positions (leverage doesn't apply to them -- see
-        // `portfoliomanager::margin`'s module docs).
+        // (`margin::is_liquidated` always returns false).
+        //
+        // Exemption scope (2026-09-02, narrowed from "any derivative"):
+        // ONLY options are exempt here, long or short -- `is_liquidated`
+        // models a leveraged-futures-style margin call (a fixed % adverse
+        // move against `entry_price`, scaled by `leverage`/
+        // `maintenance_margin_ratio`), which doesn't correspond to how a
+        // real broker's option margin requirement actually works (a
+        // function of the option's own current value plus a percentage of
+        // the underlying -- this platform has no such model, and applying
+        // the leveraged-futures formula to an option's PREMIUM would
+        // produce an economically meaningless trigger price unrelated to
+        // real risk). A long option's max loss is bounded by the premium
+        // paid regardless, so no circuit breaker is needed there either
+        // way. A short/written option's loss is genuinely unbounded and
+        // DOES need one -- that's now the account-level `risk_manager`
+        // drawdown gate (`equity_at`/`get_current_drawdown`, both fixed to
+        // correctly reflect option P&L without an artificial 100% cap
+        // earlier this session), not this per-position intrabar check.
+        // Futures/perps were PREVIOUSLY also swept into this exemption via
+        // the old blanket `instrument.is_some()` condition -- that was a
+        // real bug: unlike options, futures/perps DO use the exact
+        // leveraged-margin accounting `is_liquidated` models (real
+        // `margin_posted`, same `entry_price`/`leverage` semantics as a
+        // plain leveraged spot position), so they're no longer exempt.
         if leverage > 1.0 {
             let ohlc = extract_candle_ohlcv(data);
             let triggered = portfolio.positions.iter().any(|p| {
-                if p.close_time.is_some() || p.instrument.is_some() {
+                if is_exempt_from_leverage_liquidation_check(p) {
                     return false;
                 }
                 let intrabar_extreme = match (p.side, ohlc) {
@@ -1416,6 +1554,8 @@ async fn run_with_input(
             captured_prices_for_features,
             captured_timestamps_for_features,
             volume_constrained_fills,
+            config.option_instrument.as_ref(),
+            config.option_spread.as_deref(),
         ),
         total_commission,
         pending_limits_at_end: pending_limits.len(),
@@ -2336,6 +2476,8 @@ fn build_backtest_result(
     captured_prices_for_features: Vec<f64>,
     captured_timestamps_for_features: Vec<i64>,
     volume_constrained_fills: usize,
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
 ) -> BacktestResult {
     // Use actual round-trip percentage returns from trade_log instead of per-fill
     // pseudo-returns in trade_returns (which are just cash flow proportions, not real P&L).
@@ -2651,7 +2793,45 @@ fn build_backtest_result(
         } else {
             None
         },
+        option_summary: build_option_summary(option_instrument, option_spread, portfolio),
         ..Default::default()
+    }
+}
+
+/// Build the `BacktestResult.option_summary` field: contract identity for
+/// every leg this run traded (single instrument or spread), plus the
+/// portfolio's final aggregated Greeks snapshot. `None` when this run
+/// wasn't an options run at all (neither `option_instrument` nor
+/// `option_spread` set) -- unchanged, existing behavior.
+fn build_option_summary(
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+    portfolio: &PortfolioState,
+) -> Option<crate::types::OptionResultSummary> {
+    let contracts: Vec<crate::types::OptionContractInfo> = if let Some(legs) = option_spread {
+        legs.iter().map(|leg| option_contract_info(&leg.instrument, leg.ratio)).collect()
+    } else {
+        vec![option_contract_info(option_instrument?, 1)]
+    };
+    let greeks = portfolio.get_portfolio_greeks();
+    let final_greeks = if greeks == derivatives::Greeks::default() { None } else { Some(greeks) };
+    Some(crate::types::OptionResultSummary { contracts, final_greeks })
+}
+
+fn option_contract_info(instrument: &DerivativeMetadata, ratio: i32) -> crate::types::OptionContractInfo {
+    let contract_type = match instrument.instrument_kind {
+        derivatives::InstrumentKind::Call { .. } => "call",
+        derivatives::InstrumentKind::Put { .. } => "put",
+        _ => "other",
+    }.to_string();
+    crate::types::OptionContractInfo {
+        symbol: instrument.symbol.clone(),
+        underlying: instrument.underlying.clone(),
+        strike: instrument.instrument_kind.strike(),
+        expiry: instrument.instrument_kind.expiry(),
+        contract_type,
+        contract_multiplier: instrument.contract_multiplier,
+        ratio,
     }
 }
 
@@ -2935,6 +3115,7 @@ mod tests {
             multi_venue_data: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
         assert_eq!(config.max_trade_log_size, Some(500));
@@ -2957,6 +3138,7 @@ mod tests {
             multi_venue_data: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         };
         assert!(config.max_trade_log_size.is_none());
     }
@@ -2969,12 +3151,92 @@ mod tests {
             "SPY",
             derivatives::InstrumentKind::Call {
                 strike: 450.0,
-                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+                // Fixed, not `Utc::now() + ...`: several tests build this
+                // twice (once via a shared fixture helper, once directly for
+                // an equality assertion) and compare the two `DerivativeMetadata`
+                // values for exact equality -- a `Utc::now()`-based expiry
+                // makes the two calls' timestamps differ by whatever wall-clock
+                // time elapsed between them (even a few microseconds), which
+                // fails `PartialEq` on the embedded `DateTime<Utc>`. Confirmed
+                // as a real, live flake once these `python`-feature tests were
+                // actually run (not just compile-checked) for the first time,
+                // 2026-09-02.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
             },
             100.0,
             "USD",
             "test",
         )
+    }
+
+    // -- BacktestResult.option_summary (build_option_summary / option_contract_info) --
+
+    #[test]
+    fn build_option_summary_is_none_for_a_non_option_run() {
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        assert!(build_option_summary(None, None, &portfolio).is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_the_single_leg_contract_identity() {
+        let instrument = test_call_instrument();
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(Some(&instrument), None, &portfolio)
+            .expect("a single-leg option run should produce a summary");
+        assert_eq!(summary.contracts.len(), 1);
+        let contract = &summary.contracts[0];
+        assert_eq!(contract.symbol, "O:SPY-TEST-C");
+        assert_eq!(contract.underlying, "SPY");
+        assert_eq!(contract.strike, Some(450.0));
+        assert_eq!(contract.contract_type, "call");
+        assert_eq!(contract.contract_multiplier, 100.0);
+        assert_eq!(contract.ratio, 1);
+        // No Greeks were ever computed for this portfolio (no fill, no
+        // update_position_greeks call) -- must stay None, not a spurious
+        // all-zero Greeks value.
+        assert!(summary.final_greeks.is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_both_legs_of_a_spread_with_their_own_ratios() {
+        let call = test_call_instrument();
+        let put = test_put_instrument();
+        let legs = vec![
+            OptionSpreadLeg { instrument: call, ratio: 1, prices: vec![5.0] },
+            OptionSpreadLeg { instrument: put, ratio: -1, prices: vec![2.0] },
+        ];
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(None, Some(&legs), &portfolio)
+            .expect("a spread run should produce a summary");
+        assert_eq!(summary.contracts.len(), 2);
+        assert_eq!(summary.contracts[0].contract_type, "call");
+        assert_eq!(summary.contracts[0].ratio, 1);
+        assert_eq!(summary.contracts[1].contract_type, "put");
+        assert_eq!(summary.contracts[1].ratio, -1);
+    }
+
+    #[test]
+    fn build_option_summary_prefers_a_nonzero_final_greeks_snapshot_when_available() {
+        let instrument = test_call_instrument();
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let fill = orderbook::Fill {
+            order_id: std::sync::Arc::from("test"),
+            side: orderbook::BookSide::Bid,
+            price: 5.0,
+            base_price: None,
+            quantity: 1.0,
+            liquidity_type: orderbook::LiquidityType::Taker,
+            fee_rate: 0.0,
+            fee_amount: 0.0,
+            slippage_bps: None,
+            timestamp: chrono::Utc::now(),
+        };
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, chrono::Utc::now());
+
+        let summary = build_option_summary(Some(&instrument), None, &portfolio).unwrap();
+        let greeks = summary.final_greeks.expect("a marked option position should produce real Greeks");
+        assert_ne!(greeks, derivatives::Greeks::default());
     }
 
     #[test]
@@ -3039,12 +3301,160 @@ mod tests {
             "SPY",
             derivatives::InstrumentKind::Put {
                 strike: 460.0,
-                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+                // Fixed for the same reason as test_call_instrument's expiry.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
             },
             100.0,
             "USD",
             "test",
         )
+    }
+
+    fn test_position(side: portfoliomanager::PositionSide, instrument: Option<DerivativeMetadata>, closed: bool) -> portfoliomanager::Position {
+        let now = chrono::Utc::now();
+        portfoliomanager::Position {
+            symbol: instrument.as_ref().map(|i| i.symbol.clone()).unwrap_or_else(|| "TEST".to_string()),
+            side,
+            quantity: 1.0,
+            entry_price: 100.0,
+            mark_price: None,
+            realized_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            open_time: now,
+            close_time: if closed { Some(now) } else { None },
+            instrument,
+            greeks: None,
+            margin_posted: 0.0,
+        }
+    }
+
+    // -- leverage liquidation exemption (is_exempt_from_leverage_liquidation_check) --
+
+    #[test]
+    fn liquidation_exemption_a_closed_position_is_exempt_regardless_of_instrument() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, true);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_plain_leveraged_position_is_not_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_long_option_is_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_short_written_option_is_also_exempt() {
+        // Deliberate: a short option's unbounded loss potential is real, but
+        // this specific leveraged-futures-style formula still doesn't model
+        // real option margin-call mechanics for it -- see this function's
+        // doc comment for why the account-level drawdown gate is the
+        // applicable backstop instead, not this per-position check.
+        let pos = test_position(portfoliomanager::PositionSide::Short, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_future_position_is_not_exempt() {
+        // Regression test for the 2026-09-02 fix: futures/perps were
+        // previously (incorrectly) swept into a blanket "any derivative"
+        // exemption -- they use the exact leveraged-margin accounting this
+        // check models, so they must NOT be exempt.
+        let future = DerivativeMetadata::new(
+            "BTC-PERP", "BTC",
+            derivatives::InstrumentKind::Perpetual,
+            1.0, "USD", "test",
+        );
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(future), false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    // -- greeks wiring (select_greeks_vol / annualized_underlying_realized_vol) --
+
+    #[test]
+    fn select_greeks_vol_prefers_the_real_iv_surface_when_available() {
+        let instrument = test_call_instrument();
+        let strike = instrument.instrument_kind.strike().unwrap();
+        let expiry = instrument.instrument_kind.expiry().unwrap();
+        let surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: vec![derivatives::IvPoint { strike, expiry, iv: 0.42, bid_iv: 0.41, ask_iv: 0.43 }],
+        };
+        let vol = select_greeks_vol(Some(&surface), &instrument, Some(0.99));
+        assert_eq!(vol, Some(0.42), "the real IV surface reading must win over the fallback");
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_to_realized_vol_without_a_surface() {
+        let instrument = test_call_instrument();
+        let vol = select_greeks_vol(None, &instrument, Some(0.35));
+        assert_eq!(vol, Some(0.35));
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_when_the_surface_has_no_points() {
+        let instrument = test_call_instrument();
+        let empty_surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: Vec::new(),
+        };
+        let vol = select_greeks_vol(Some(&empty_surface), &instrument, Some(0.28));
+        assert_eq!(vol, Some(0.28));
+    }
+
+    #[test]
+    fn select_greeks_vol_returns_none_when_no_usable_source_exists() {
+        let instrument = test_call_instrument();
+        assert_eq!(select_greeks_vol(None, &instrument, None), None);
+        // A non-finite or non-positive fallback must not be treated as usable.
+        assert_eq!(select_greeks_vol(None, &instrument, Some(f64::NAN)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(-0.1)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(0.0)), None);
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_is_empty_for_too_short_a_series() {
+        assert!(annualized_underlying_realized_vol(&[100.0], &[0], 20).is_empty());
+        assert!(annualized_underlying_realized_vol(&[], &[], 20).is_empty());
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_scales_by_the_real_bars_per_year_annualization() {
+        // A varying price series long enough for `lookback=3` to produce
+        // real readings.
+        let series = vec![100.0, 102.0, 99.0, 103.0, 98.0, 105.0, 97.0, 104.0, 101.0, 103.0];
+        let n = series.len();
+        // One year of daily bars -> annualization factor near `n` itself
+        // (observations_per_year_from_span(n, one_year_secs) ~= n).
+        let one_year_ms: i64 = (365.25 * 86_400.0 * 1000.0) as i64;
+        let timestamps: Vec<i64> = (0..n as i64).map(|i| i * (one_year_ms / n as i64)).collect();
+
+        let annualized = annualized_underlying_realized_vol(&series, &timestamps, 3);
+        let raw = portfoliomanager::margin::trailing_realized_vol_series(&series, 3);
+        assert_eq!(annualized.len(), raw.len());
+
+        // Every populated entry must be the raw per-bar std scaled by the
+        // SAME annualization factor (not an arbitrary/hardcoded one) --
+        // confirm the ratio is constant across every populated index.
+        let ratios: Vec<f64> = annualized.iter().zip(raw.iter())
+            .filter_map(|(a, r)| match (a, r) {
+                (Some(a), Some(r)) if *r > 0.0 => Some(a / r),
+                _ => None,
+            })
+            .collect();
+        assert!(!ratios.is_empty(), "expected at least one populated reading from this fixture");
+        let first = ratios[0];
+        for ratio in &ratios {
+            assert!((ratio - first).abs() < 1e-6, "annualization factor must be identical across ticks: {:?}", ratios);
+        }
+        assert!(first > 1.0, "annualizing ~daily bars over a year should scale vol up materially, got factor {}", first);
     }
 
     fn vertical_spread_legs() -> Vec<OptionSpreadLeg> {

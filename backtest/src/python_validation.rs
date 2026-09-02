@@ -857,6 +857,10 @@ pub struct ValidationConfig {
     /// OptionSpreadLeg`'s doc comment for the exact scope (2-leg verticals
     /// only today).
     pub option_spread: Option<Vec<OptionSpreadLeg>>,
+    /// Same forwarding pattern as `option_instrument`/`option_spread` above.
+    /// See `PythonSimConfig.underlying_series`'s doc comment -- required for
+    /// `update_position_greeks` to have anything to price Greeks against.
+    pub underlying_series: Option<Vec<f64>>,
 }
 
 impl Default for ValidationConfig {
@@ -883,6 +887,7 @@ impl Default for ValidationConfig {
             historical_iv_surfaces: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         }
     }
 }
@@ -1835,6 +1840,7 @@ pub async fn run_validation_pipeline(
                             multi_venue_data: None,
                             option_instrument: None,
                             option_spread: None,
+                            underlying_series: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
                             .map(|r| r.backtest_result)
@@ -2671,6 +2677,7 @@ async fn run_single_backtest(
             historical_iv_surfaces: config.historical_iv_surfaces.clone(),
             option_instrument: config.option_instrument.clone(),
             option_spread: config.option_spread.clone(),
+            underlying_series: config.underlying_series.clone(),
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -3491,6 +3498,7 @@ pub async fn detect_lookahead_bias(
         multi_venue_data: None,
         option_instrument: None,
         option_spread: None,
+        underlying_series: None,
     };
 
     let result_truncated = python_simulation::run(truncated_data, sim_config()).await?;
@@ -4629,6 +4637,7 @@ mod tests {
             historical_iv_surfaces: None,
             option_instrument: None,
             option_spread: None,
+            underlying_series: None,
         };
         assert_eq!(config.wf_windows, 5);
         assert_eq!(config.mc_runs, 500);
