@@ -126,6 +126,23 @@ pub struct PythonSimConfig {
     /// normal single-venue path otherwise. `None` (the default) is the existing,
     /// unaffected single-venue behavior.
     pub multi_venue_data: Option<HashMap<(String, String), strategy::traits::VenueSeries>>,
+    /// When set, this run is trading a single pre-resolved option contract
+    /// rather than the underlying spot asset -- `market_data` must already
+    /// be that contract's OWN OHLCV series (see `options_backtest_data` in
+    /// the `program` crate, which resolves a job's `OptionLeg` into this
+    /// exact shape). The strategy's Python `compute_signals()` still only
+    /// ever returns the plain int8 BUY/SELL/HOLD/CLOSE vocabulary (the SDK
+    /// has no way to embed contract metadata in a signal) -- `i8_to_signals`
+    /// reinterprets a bulk BUY/SELL code as `SignalType::BuyOption`/
+    /// `SellOption` on THIS instrument when set, instead of a plain spot
+    /// `Buy`/`Sell`, so the strategy's existing directional logic (when to
+    /// be long/flat) drives the option position without the strategy code
+    /// itself needing to know it's trading an option at all. CLOSE needs no
+    /// equivalent handling: `close_all_positions` already closes each open
+    /// position using ITS OWN recorded instrument (set when the position
+    /// was opened), not a signal-level one. `None` (the default) is the
+    /// existing, unaffected spot/futures behavior.
+    pub option_instrument: Option<DerivativeMetadata>,
 }
 
 /// Run a directional Python strategy simulation.
@@ -633,7 +650,7 @@ async fn run_with_input(
         // -- Generate signals via executor (Tier 0–3) with stable region optimization --
         let signals = if let Some(ref sigs) = precomputed_signals {
             // Bulk path: convert precomputed i8 → Signal (no Python call this tick).
-            last_signals = i8_to_signals(sigs[tick_idx], current_price);
+            last_signals = i8_to_signals(sigs[tick_idx], current_price, config.option_instrument.as_ref());
             &last_signals
         } else if stable_detector.should_process(current_price) {
             // Price moved significantly or max skip reached — call Python strategy
@@ -1546,11 +1563,23 @@ fn resolve_position_size_pct(config: &PythonSimConfig) -> f64 {
 /// Convert a bulk-signal i8 code to a `Vec<Signal>`.
 ///
 /// Signal encoding: 1=BUY, -1=SELL, 0=HOLD, 2=CLOSE
-fn i8_to_signals(code: i8, price: f64) -> Vec<Signal> {
+/// `option_instrument`, when set, reinterprets BUY(1)/SELL(-1) as
+/// `SignalType::BuyOption`/`SellOption` on that contract instead of plain
+/// spot `Buy`/`Sell` -- see `PythonSimConfig.option_instrument`'s doc
+/// comment for the full rationale. CLOSE(2) is deliberately unchanged
+/// either way: `close_all_positions` already closes each open position
+/// using its own recorded instrument, not a signal-level one.
+fn i8_to_signals(code: i8, price: f64, option_instrument: Option<&DerivativeMetadata>) -> Vec<Signal> {
     let reason = SignalReason::TechnicalAnalysis("vectorized".into());
     match code {
-        1  => vec![Signal::buy("bulk", SignalStrength::Medium, reason).with_price(price)],
-        -1 => vec![Signal::sell("bulk", SignalStrength::Medium, reason).with_price(price)],
+        1 => vec![match option_instrument {
+            Some(instr) => Signal::new("bulk", SignalType::BuyOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+            None => Signal::buy("bulk", SignalStrength::Medium, reason),
+        }.with_price(price)],
+        -1 => vec![match option_instrument {
+            Some(instr) => Signal::new("bulk", SignalType::SellOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+            None => Signal::sell("bulk", SignalStrength::Medium, reason),
+        }.with_price(price)],
         2  => vec![Signal::close("bulk", SignalStrength::Medium, reason).with_price(price)],
         _  => Vec::new(), // HOLD or any unknown code
     }
@@ -2755,6 +2784,7 @@ mod tests {
             max_trade_log_size: Some(500),
             orderbook_snapshots: None,
             multi_venue_data: None,
+            option_instrument: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
         assert_eq!(config.max_trade_log_size, Some(500));
@@ -2774,6 +2804,7 @@ mod tests {
             max_trade_log_size: None,
             orderbook_snapshots: None,
             multi_venue_data: None,
+            option_instrument: None,
         };
         assert!(config.max_trade_log_size.is_none());
     }
@@ -2792,6 +2823,60 @@ mod tests {
             "USD",
             "test",
         )
+    }
+
+    #[test]
+    fn i8_to_signals_wraps_buy_and_sell_as_options_when_instrument_is_set() {
+        let instrument = test_call_instrument();
+        let buy_signals = i8_to_signals(1, 5.0, Some(&instrument));
+        assert_eq!(buy_signals.len(), 1);
+        match &buy_signals[0].signal_type {
+            SignalType::BuyOption { instrument: instr, premium } => {
+                assert_eq!(instr, &instrument);
+                assert!(premium.is_none(), "premium is filled in from the fill price downstream, not set here");
+            }
+            other => panic!("expected BuyOption, got {other:?}"),
+        }
+
+        let sell_signals = i8_to_signals(-1, 5.0, Some(&instrument));
+        assert_eq!(sell_signals.len(), 1);
+        match &sell_signals[0].signal_type {
+            SignalType::SellOption { instrument: instr, .. } => assert_eq!(instr, &instrument),
+            other => panic!("expected SellOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_stays_plain_buy_sell_without_an_instrument() {
+        let buy_signals = i8_to_signals(1, 100.0, None);
+        assert_eq!(buy_signals.len(), 1);
+        assert_eq!(buy_signals[0].signal_type, SignalType::Buy);
+
+        let sell_signals = i8_to_signals(-1, 100.0, None);
+        assert_eq!(sell_signals.len(), 1);
+        assert_eq!(sell_signals[0].signal_type, SignalType::Sell);
+    }
+
+    #[test]
+    fn i8_to_signals_close_is_unaffected_by_option_instrument() {
+        // CLOSE needs no option-aware wrapping: close_all_positions already
+        // closes each open position using its OWN recorded instrument, not
+        // a signal-level one -- see PythonSimConfig.option_instrument's doc
+        // comment.
+        let instrument = test_call_instrument();
+        let with_instrument = i8_to_signals(2, 5.0, Some(&instrument));
+        let without_instrument = i8_to_signals(2, 5.0, None);
+        assert_eq!(with_instrument.len(), 1);
+        assert_eq!(without_instrument.len(), 1);
+        assert_eq!(with_instrument[0].signal_type, SignalType::Close);
+        assert_eq!(without_instrument[0].signal_type, SignalType::Close);
+    }
+
+    #[test]
+    fn i8_to_signals_hold_and_unknown_codes_produce_nothing_regardless_of_instrument() {
+        let instrument = test_call_instrument();
+        assert!(i8_to_signals(0, 5.0, Some(&instrument)).is_empty());
+        assert!(i8_to_signals(99, 5.0, Some(&instrument)).is_empty());
     }
 
     #[test]

@@ -1762,6 +1762,7 @@ pub async fn run_validation_pipeline(
                             max_trade_log_size: Some(500),
                             orderbook_snapshots: None,
                             multi_venue_data: None,
+                            option_instrument: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
                             .map(|r| r.backtest_result)
@@ -2572,6 +2573,7 @@ async fn run_single_backtest(
             max_trade_log_size: None,
             orderbook_snapshots: None,
             multi_venue_data: None,
+            option_instrument: None,
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -3342,6 +3344,7 @@ pub async fn detect_lookahead_bias(
         max_trade_log_size: None,
         orderbook_snapshots: None,
         multi_venue_data: None,
+        option_instrument: None,
     };
 
     let result_truncated = python_simulation::run(truncated_data, sim_config()).await?;

@@ -95,6 +95,7 @@ async fn python_strategy_produces_trades_and_metrics() {
         max_trade_log_size: None,
         orderbook_snapshots: None,
         multi_venue_data: None,
+        option_instrument: None,
     };
 
     let result = python_simulation::run(&market_data, config)
@@ -293,6 +294,7 @@ fn run_sizing_config(python_source: String) -> PythonSimConfig {
         max_trade_log_size: None,
         orderbook_snapshots: None,
         multi_venue_data: None,
+        option_instrument: None,
     }
 }
 
