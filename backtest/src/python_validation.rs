@@ -809,6 +809,16 @@ pub struct ValidationConfig {
     /// gated by the caller on `data_requirements().needs_iv_surface`, not
     /// unconditionally computed for every job.
     pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
+    /// Same shape and same forwarding pattern as `historical_iv_surfaces`
+    /// above: forwarded verbatim into every `run_single_backtest` call this
+    /// config drives, which is the pipeline's central, widely-reused single-
+    /// evaluation primitive (GA candidate scoring, walk-forward IS/OOS
+    /// splits, quick pre-checks, the final full-rigor evaluation -- all of
+    /// them route through it), so setting this once here reaches every
+    /// stage. See `PythonSimConfig.option_instrument`'s doc comment for what
+    /// it actually does. `None` (the default) is the existing, unaffected
+    /// behavior for every non-options job.
+    pub option_instrument: Option<derivatives::DerivativeMetadata>,
 }
 
 impl Default for ValidationConfig {
@@ -833,6 +843,7 @@ impl Default for ValidationConfig {
             mc_confidence_level: 0.95,
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
+            option_instrument: None,
         }
     }
 }
@@ -2618,7 +2629,7 @@ async fn run_single_backtest(
             orderbook_snapshots: None,
             multi_venue_data: None,
             historical_iv_surfaces: config.historical_iv_surfaces.clone(),
-            option_instrument: None,
+            option_instrument: config.option_instrument.clone(),
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -4574,6 +4585,7 @@ mod tests {
             mc_confidence_level: 0.99,
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
+            option_instrument: None,
         };
         assert_eq!(config.wf_windows, 5);
         assert_eq!(config.mc_runs, 500);
