@@ -7,6 +7,8 @@ use serde::{Serialize, Deserialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use derivatives::Greeks;
+
 use data_prep::SimulationTick;
 use dataloader::{MarketData, TradeData};
 
@@ -329,6 +331,48 @@ pub struct BacktestResult {
     /// affects trading signals or the pass/fail of the backtest itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_diagnostics: Option<Vec<FeatureDiagnostic>>,
+    /// Contract identity + final Greeks snapshot -- present only when this
+    /// run traded an option instrument or spread (`PythonSimConfig.
+    /// option_instrument`/`option_spread`). `None` for every non-option run,
+    /// unchanged from before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_summary: Option<OptionResultSummary>,
+}
+
+/// Contract identity + final Greeks snapshot for an option-instrument or
+/// option-spread backtest. `contracts` has one entry for a single-leg run,
+/// two for a vertical spread (see `OptionSpreadLeg`'s own scope note).
+/// `final_greeks` is the portfolio's aggregated Greeks as of the last tick
+/// `update_position_greeks` actually ran -- `None` when
+/// `PythonSimConfig.underlying_series` wasn't supplied for this run (Greeks
+/// were never computed at all in that case), or once every option position
+/// has closed (nothing left to aggregate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionResultSummary {
+    pub contracts: Vec<OptionContractInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_greeks: Option<Greeks>,
+}
+
+/// One option contract's static identity -- strike/expiry/type/ratio the
+/// frontend can't derive from the plain trade P&L numbers alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionContractInfo {
+    /// Exchange contract ticker, e.g. "O:AAPL260501C00130000".
+    pub symbol: String,
+    pub underlying: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strike: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<DateTime<Utc>>,
+    /// "call" | "put" | "other" (option_instrument/option_spread are only
+    /// ever populated with actual options today, but this stays honest
+    /// about what InstrumentKind actually said rather than assuming).
+    pub contract_type: String,
+    pub contract_multiplier: f64,
+    /// Signed ratio for this leg (+1 = long, -1 = short). Always 1 for a
+    /// single-leg run; the leg's own `OptionSpreadLeg.ratio` for a spread.
+    pub ratio: i32,
 }
 
 /// IC + quantile analysis for one strategy-declared feature, evaluated

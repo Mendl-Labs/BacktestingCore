@@ -1554,6 +1554,8 @@ async fn run_with_input(
             captured_prices_for_features,
             captured_timestamps_for_features,
             volume_constrained_fills,
+            config.option_instrument.as_ref(),
+            config.option_spread.as_deref(),
         ),
         total_commission,
         pending_limits_at_end: pending_limits.len(),
@@ -2474,6 +2476,8 @@ fn build_backtest_result(
     captured_prices_for_features: Vec<f64>,
     captured_timestamps_for_features: Vec<i64>,
     volume_constrained_fills: usize,
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
 ) -> BacktestResult {
     // Use actual round-trip percentage returns from trade_log instead of per-fill
     // pseudo-returns in trade_returns (which are just cash flow proportions, not real P&L).
@@ -2789,7 +2793,45 @@ fn build_backtest_result(
         } else {
             None
         },
+        option_summary: build_option_summary(option_instrument, option_spread, portfolio),
         ..Default::default()
+    }
+}
+
+/// Build the `BacktestResult.option_summary` field: contract identity for
+/// every leg this run traded (single instrument or spread), plus the
+/// portfolio's final aggregated Greeks snapshot. `None` when this run
+/// wasn't an options run at all (neither `option_instrument` nor
+/// `option_spread` set) -- unchanged, existing behavior.
+fn build_option_summary(
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+    portfolio: &PortfolioState,
+) -> Option<crate::types::OptionResultSummary> {
+    let contracts: Vec<crate::types::OptionContractInfo> = if let Some(legs) = option_spread {
+        legs.iter().map(|leg| option_contract_info(&leg.instrument, leg.ratio)).collect()
+    } else {
+        vec![option_contract_info(option_instrument?, 1)]
+    };
+    let greeks = portfolio.get_portfolio_greeks();
+    let final_greeks = if greeks == derivatives::Greeks::default() { None } else { Some(greeks) };
+    Some(crate::types::OptionResultSummary { contracts, final_greeks })
+}
+
+fn option_contract_info(instrument: &DerivativeMetadata, ratio: i32) -> crate::types::OptionContractInfo {
+    let contract_type = match instrument.instrument_kind {
+        derivatives::InstrumentKind::Call { .. } => "call",
+        derivatives::InstrumentKind::Put { .. } => "put",
+        _ => "other",
+    }.to_string();
+    crate::types::OptionContractInfo {
+        symbol: instrument.symbol.clone(),
+        underlying: instrument.underlying.clone(),
+        strike: instrument.instrument_kind.strike(),
+        expiry: instrument.instrument_kind.expiry(),
+        contract_type,
+        contract_multiplier: instrument.contract_multiplier,
+        ratio,
     }
 }
 
@@ -3109,12 +3151,92 @@ mod tests {
             "SPY",
             derivatives::InstrumentKind::Call {
                 strike: 450.0,
-                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+                // Fixed, not `Utc::now() + ...`: several tests build this
+                // twice (once via a shared fixture helper, once directly for
+                // an equality assertion) and compare the two `DerivativeMetadata`
+                // values for exact equality -- a `Utc::now()`-based expiry
+                // makes the two calls' timestamps differ by whatever wall-clock
+                // time elapsed between them (even a few microseconds), which
+                // fails `PartialEq` on the embedded `DateTime<Utc>`. Confirmed
+                // as a real, live flake once these `python`-feature tests were
+                // actually run (not just compile-checked) for the first time,
+                // 2026-09-02.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
             },
             100.0,
             "USD",
             "test",
         )
+    }
+
+    // -- BacktestResult.option_summary (build_option_summary / option_contract_info) --
+
+    #[test]
+    fn build_option_summary_is_none_for_a_non_option_run() {
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        assert!(build_option_summary(None, None, &portfolio).is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_the_single_leg_contract_identity() {
+        let instrument = test_call_instrument();
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(Some(&instrument), None, &portfolio)
+            .expect("a single-leg option run should produce a summary");
+        assert_eq!(summary.contracts.len(), 1);
+        let contract = &summary.contracts[0];
+        assert_eq!(contract.symbol, "O:SPY-TEST-C");
+        assert_eq!(contract.underlying, "SPY");
+        assert_eq!(contract.strike, Some(450.0));
+        assert_eq!(contract.contract_type, "call");
+        assert_eq!(contract.contract_multiplier, 100.0);
+        assert_eq!(contract.ratio, 1);
+        // No Greeks were ever computed for this portfolio (no fill, no
+        // update_position_greeks call) -- must stay None, not a spurious
+        // all-zero Greeks value.
+        assert!(summary.final_greeks.is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_both_legs_of_a_spread_with_their_own_ratios() {
+        let call = test_call_instrument();
+        let put = test_put_instrument();
+        let legs = vec![
+            OptionSpreadLeg { instrument: call, ratio: 1, prices: vec![5.0] },
+            OptionSpreadLeg { instrument: put, ratio: -1, prices: vec![2.0] },
+        ];
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(None, Some(&legs), &portfolio)
+            .expect("a spread run should produce a summary");
+        assert_eq!(summary.contracts.len(), 2);
+        assert_eq!(summary.contracts[0].contract_type, "call");
+        assert_eq!(summary.contracts[0].ratio, 1);
+        assert_eq!(summary.contracts[1].contract_type, "put");
+        assert_eq!(summary.contracts[1].ratio, -1);
+    }
+
+    #[test]
+    fn build_option_summary_prefers_a_nonzero_final_greeks_snapshot_when_available() {
+        let instrument = test_call_instrument();
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let fill = orderbook::Fill {
+            order_id: std::sync::Arc::from("test"),
+            side: orderbook::BookSide::Bid,
+            price: 5.0,
+            base_price: None,
+            quantity: 1.0,
+            liquidity_type: orderbook::LiquidityType::Taker,
+            fee_rate: 0.0,
+            fee_amount: 0.0,
+            slippage_bps: None,
+            timestamp: chrono::Utc::now(),
+        };
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, chrono::Utc::now());
+
+        let summary = build_option_summary(Some(&instrument), None, &portfolio).unwrap();
+        let greeks = summary.final_greeks.expect("a marked option position should produce real Greeks");
+        assert_ne!(greeks, derivatives::Greeks::default());
     }
 
     #[test]
@@ -3179,7 +3301,8 @@ mod tests {
             "SPY",
             derivatives::InstrumentKind::Put {
                 strike: 460.0,
-                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+                // Fixed for the same reason as test_call_instrument's expiry.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
             },
             100.0,
             "USD",
