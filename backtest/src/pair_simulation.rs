@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::types::{TradeLeg, TradeRecord};
+use derivatives::DerivativeMetadata;
 use portfoliomanager::PositionSide;
 use strategy::traits::{HedgeRatioMode, PairSpec, VenueSeries};
 
@@ -100,6 +101,26 @@ struct OpenLeg {
     entry_price: f64,
     entry_commission: f64,
     entry_slippage: f64,
+    /// Set when this leg trades an option contract (`PairSpec::option_leg_a`/
+    /// `option_leg_b`) rather than `symbol`/`exchange` directly. Drives
+    /// option-aware commission (`taker_fill`), P&L scaling by
+    /// `contract_multiplier` (`signed_pnl`), and exemption from the
+    /// margin-call liquidation check below (an option's max loss is bounded
+    /// by its own premium/strike math, not the leveraged-futures liquidation
+    /// formula `portfoliomanager::margin::is_liquidated` implements) --
+    /// mirrors `python_simulation.rs`'s existing single-leg exemption of
+    /// every derivative position from that same check.
+    option_instrument: Option<DerivativeMetadata>,
+}
+
+/// `leg.quantity`'s dollar-economics multiplier: 1.0 for a plain spot/futures
+/// leg (`quantity` already IS the dollar-equivalent unit count), or the
+/// option contract's own `contract_multiplier` when this leg trades an
+/// option (each contract represents `contract_multiplier` units of
+/// underlying) -- matches `apply_derivative_fill`'s `trade_value = price *
+/// quantity * multiplier` convention in `portfoliomanager`.
+pub(crate) fn leg_multiplier(instrument: Option<&DerivativeMetadata>) -> f64 {
+    instrument.map(|i| i.contract_multiplier).unwrap_or(1.0)
 }
 
 /// An open two-leg pair position.
@@ -224,11 +245,24 @@ pub(crate) fn sharpe_from_equity(equity_curve: &[f64], bars_per_year: Option<f64
 /// Mirrors `python_simulation.rs::execute_taker_fill`'s flat-slippage-bps
 /// branch — deliberately not sharing that function directly (it's a private,
 /// deeply single-instrument-coupled helper; see this module's doc comment).
-pub(crate) fn taker_fill(mid_price: f64, quantity: f64, is_buy: bool, fee: PairLegFeeConfig) -> (f64, f64, f64) {
+///
+/// `instrument` mirrors `python_simulation.rs::compute_commission`'s
+/// dispatch exactly: an option (`is_option()`) is charged the real
+/// per-contract Alpaca fee schedule (`config::OptionsFeeConfig`), not a
+/// percentage of notional; any other derivative still applies `fee.taker_fee`
+/// but against the correctly-scaled notional (`fill_price * quantity *
+/// contract_multiplier`); a plain leg (`None`) keeps this function's
+/// original `fill_price * quantity * fee.taker_fee` behavior exactly.
+pub(crate) fn taker_fill(mid_price: f64, quantity: f64, is_buy: bool, fee: PairLegFeeConfig, instrument: Option<&DerivativeMetadata>) -> (f64, f64, f64) {
     let factor = fee.slippage_bps / 10_000.0;
     let fill_price = if is_buy { mid_price * (1.0 + factor) } else { mid_price * (1.0 - factor) };
-    let notional = fill_price * quantity;
-    let commission = notional * fee.taker_fee;
+    let commission = match instrument {
+        Some(instr) if instr.instrument_kind.is_option() => {
+            config::OptionsFeeConfig::alpaca().commission_for_fill(fill_price, quantity, instr.contract_multiplier, is_buy)
+        }
+        Some(instr) => fill_price * quantity * instr.contract_multiplier * fee.taker_fee,
+        None => fill_price * quantity * fee.taker_fee,
+    };
     let slippage_cost = (fill_price - mid_price).abs() * quantity;
     (fill_price, commission, slippage_cost)
 }
@@ -263,7 +297,8 @@ fn close_pair_position(
     let leg_b_pnl = signed_pnl(&pos.leg_b, exit_fill_b) - pos.leg_b.entry_commission - exit_comm_b;
     let net_pnl = leg_a_pnl + leg_b_pnl;
 
-    let entry_notional = pos.leg_a.entry_price * pos.leg_a.quantity + pos.leg_b.entry_price * pos.leg_b.quantity;
+    let entry_notional = pos.leg_a.entry_price * pos.leg_a.quantity * leg_multiplier(pos.leg_a.option_instrument.as_ref())
+        + pos.leg_b.entry_price * pos.leg_b.quantity * leg_multiplier(pos.leg_b.option_instrument.as_ref());
     let pnl_pct = if entry_notional > 0.0 { net_pnl / entry_notional } else { 0.0 };
     let total_commission = pos.leg_a.entry_commission + pos.leg_b.entry_commission + exit_comm_a + exit_comm_b;
     let total_slippage = pos.leg_a.entry_slippage + pos.leg_b.entry_slippage + exit_slip_a + exit_slip_b;
@@ -390,8 +425,15 @@ pub fn run_pair_backtest(
                     let extreme_a = if side_a == PositionSide::Long { low_a } else { high_a };
                     let extreme_b = if side_b == PositionSide::Long { low_b } else { high_b };
 
-                    let liq_a = portfoliomanager::margin::is_liquidated(extreme_a, pos_ref.leg_a.entry_price, side_a, config.leverage, config.maintenance_margin_ratio);
-                    let liq_b = portfoliomanager::margin::is_liquidated(extreme_b, pos_ref.leg_b.entry_price, side_b, config.leverage, config.maintenance_margin_ratio);
+                    // An option leg is exempt from this leveraged-futures
+                    // margin-call formula entirely (see `OpenLeg::option_instrument`'s
+                    // doc comment) -- mirrors `python_simulation.rs`'s existing
+                    // single-leg behavior of exempting every derivative
+                    // position from liquidation, not just options.
+                    let liq_a = pos_ref.leg_a.option_instrument.is_none()
+                        && portfoliomanager::margin::is_liquidated(extreme_a, pos_ref.leg_a.entry_price, side_a, config.leverage, config.maintenance_margin_ratio);
+                    let liq_b = pos_ref.leg_b.option_instrument.is_none()
+                        && portfoliomanager::margin::is_liquidated(extreme_b, pos_ref.leg_b.entry_price, side_b, config.leverage, config.maintenance_margin_ratio);
 
                     if liq_a || liq_b {
                         let pos = open.take().unwrap();
@@ -420,8 +462,8 @@ pub fn run_pair_backtest(
                         // than the trigger price) -- matches `candle_sim.rs`'s
                         // own liquidation handling, which still runs its fee
                         // model on the penalty-adjusted fill.
-                        let (exit_fill_a, exit_comm_a, exit_slip_a) = taker_fill(base_a, pos.leg_a.quantity, pos.leg_a.side == "short", fee_a);
-                        let (exit_fill_b, exit_comm_b, exit_slip_b) = taker_fill(base_b, pos.leg_b.quantity, pos.leg_b.side == "short", fee_b);
+                        let (exit_fill_a, exit_comm_a, exit_slip_a) = taker_fill(base_a, pos.leg_a.quantity, pos.leg_a.side == "short", fee_a, pos.leg_a.option_instrument.as_ref());
+                        let (exit_fill_b, exit_comm_b, exit_slip_b) = taker_fill(base_b, pos.leg_b.quantity, pos.leg_b.side == "short", fee_b, pos.leg_b.option_instrument.as_ref());
 
                         let triggered = match (liq_a, liq_b) {
                             (true, true) => format!("{}+{}", pos.leg_a.symbol, pos.leg_b.symbol),
@@ -526,8 +568,8 @@ pub fn run_pair_backtest(
                             let long_spread = signal == 1;
                             let (side_a, side_b) = if long_spread { ("long", "short") } else { ("short", "long") };
 
-                            let (fill_a, comm_a, slip_a) = taker_fill(price_a, qty_a, side_a == "long", fee_a);
-                            let (fill_b, comm_b, slip_b) = taker_fill(price_b, qty_b, side_b == "long", fee_b);
+                            let (fill_a, comm_a, slip_a) = taker_fill(price_a, qty_a, side_a == "long", fee_a, pair_spec.option_leg_a.as_ref());
+                            let (fill_b, comm_b, slip_b) = taker_fill(price_b, qty_b, side_b == "long", fee_b, pair_spec.option_leg_b.as_ref());
 
                             let entry_zscore = rolling_spread_zscore(venue_a, venue_b, hr, t, config.lookback_window);
 
@@ -540,6 +582,7 @@ pub fn run_pair_backtest(
                                     entry_price: fill_a,
                                     entry_commission: comm_a,
                                     entry_slippage: slip_a,
+                                    option_instrument: pair_spec.option_leg_a.clone(),
                                 },
                                 leg_b: OpenLeg {
                                     symbol: pair_spec.symbol_b.clone(),
@@ -549,6 +592,7 @@ pub fn run_pair_backtest(
                                     entry_price: fill_b,
                                     entry_commission: comm_b,
                                     entry_slippage: slip_b,
+                                    option_instrument: pair_spec.option_leg_b.clone(),
                                 },
                                 hedge_ratio: hr,
                                 entry_time: timestamp_from_millis(venue_a.timestamps[t]),
@@ -563,8 +607,8 @@ pub fn run_pair_backtest(
                 if prices_valid {
                     let exit_time = timestamp_from_millis(venue_a.timestamps[t]);
 
-                    let (exit_fill_a, exit_comm_a, exit_slip_a) = taker_fill(price_a, pos.leg_a.quantity, pos.leg_a.side == "short", fee_a);
-                    let (exit_fill_b, exit_comm_b, exit_slip_b) = taker_fill(price_b, pos.leg_b.quantity, pos.leg_b.side == "short", fee_b);
+                    let (exit_fill_a, exit_comm_a, exit_slip_a) = taker_fill(price_a, pos.leg_a.quantity, pos.leg_a.side == "short", fee_a, pos.leg_a.option_instrument.as_ref());
+                    let (exit_fill_b, exit_comm_b, exit_slip_b) = taker_fill(price_b, pos.leg_b.quantity, pos.leg_b.side == "short", fee_b, pos.leg_b.option_instrument.as_ref());
 
                     let (record, net_pnl) = close_pair_position(
                         pos, exit_fill_a, exit_fill_b, exit_comm_a, exit_comm_b, exit_slip_a, exit_slip_b,
@@ -602,9 +646,11 @@ pub fn run_pair_backtest(
     })
 }
 
-/// Mark-to-market P&L for one leg at `current_price`, sign-adjusted for side.
+/// Mark-to-market P&L for one leg at `current_price`, sign-adjusted for side
+/// and scaled by the leg's contract multiplier (1.0 for a plain spot leg;
+/// an option contract's own multiplier otherwise -- see `leg_multiplier`).
 fn signed_pnl(leg: &OpenLeg, current_price: f64) -> f64 {
-    let raw = (current_price - leg.entry_price) * leg.quantity;
+    let raw = (current_price - leg.entry_price) * leg.quantity * leg_multiplier(leg.option_instrument.as_ref());
     if leg.side == "long" { raw } else { -raw }
 }
 
@@ -703,7 +749,20 @@ mod tests {
             symbol_b: "BBB".to_string(),
             exchange_b: "test".to_string(),
             hedge_ratio_mode: HedgeRatioMode::Fixed(1.0),
+            option_leg_a: None,
+            option_leg_b: None,
         }
+    }
+
+    fn test_call_instrument(strike: f64) -> DerivativeMetadata {
+        DerivativeMetadata::new(
+            "AAA260320C00150000",
+            "AAA",
+            derivatives::InstrumentKind::Call { strike, expiry: Utc::now() },
+            100.0,
+            "USD",
+            "test",
+        )
     }
 
     #[test]
@@ -976,6 +1035,128 @@ mod tests {
         assert_eq!(result.trades.len(), 1, "only the liquidation should produce a trade -- the later signal==2 has nothing open");
         assert_eq!(result.trades[0].legs.len(), 2);
         assert_eq!(result.liquidations, 1);
+    }
+
+    // -- option legs ---------------------------------------------------
+
+    #[test]
+    fn option_leg_pnl_is_scaled_by_contract_multiplier() {
+        // Leg A is an option contract (multiplier 100): quantity is
+        // CONTRACTS, not shares, so a $1 premium move should produce
+        // 100x the PnL a plain equal-quantity leg would.
+        let prices_a = vec![5.0, 6.0]; // option premium
+        let prices_b = vec![100.0, 100.0]; // plain leg, flat
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
+
+        let mut spec = simple_pair_spec();
+        spec.option_leg_a = Some(test_call_instrument(50.0));
+        let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
+
+        let signals = vec![1i8, 2];
+        let result = run_pair_backtest(&venues, &spec, &signals, zero_fee(), zero_fee(), config).unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let leg_a = &result.trades[0].legs[0];
+        assert!(leg_a.quantity > 0.0);
+        // leg A alone (leg B is flat, plain, contributes ~0 at zero_fee):
+        // raw (6.0 - 5.0) * qty * 100 multiplier, less the REAL per-contract
+        // Alpaca commission on both fills (unavoidable for an option leg
+        // even at `PairLegFeeConfig.taker_fee == 0.0` -- see the next test).
+        // Quantity is taken from the actual result (subject to
+        // `scale_paired_legs_to_cap`'s combined-notional safety net) rather
+        // than hand-derived via the raw sizing formula.
+        let fee_cfg = config::OptionsFeeConfig::alpaca();
+        let entry_comm = fee_cfg.commission_for_fill(5.0, leg_a.quantity, 100.0, true);
+        let exit_comm = fee_cfg.commission_for_fill(6.0, leg_a.quantity, 100.0, false);
+        let expected_leg_a_pnl = (6.0 - 5.0) * leg_a.quantity * 100.0 - entry_comm - exit_comm;
+        assert!((result.trades[0].pnl.unwrap() - expected_leg_a_pnl).abs() < 1e-6,
+            "expected pnl {}, got {}", expected_leg_a_pnl, result.trades[0].pnl.unwrap());
+    }
+
+    #[test]
+    fn option_leg_commission_uses_the_real_alpaca_schedule_not_the_flat_taker_fee() {
+        // A large flat taker_fee (10%) on a plain leg would dominate any
+        // option commission if the dispatch were broken -- use zero fee on
+        // the option leg's own PairLegFeeConfig.taker_fee and confirm a
+        // nonzero commission is still charged (from OptionsFeeConfig, not
+        // the zeroed-out percentage rate).
+        let prices_a = vec![5.0, 5.0];
+        let prices_b = vec![100.0, 100.0];
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
+
+        let mut spec = simple_pair_spec();
+        spec.option_leg_a = Some(test_call_instrument(50.0));
+        let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
+
+        // taker_fee: 0.0 would zero out a plain leg's commission entirely --
+        // an option leg must still be charged via OptionsFeeConfig.
+        let zero_pct_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 };
+        let signals = vec![1i8, 2];
+        let result = run_pair_backtest(&venues, &spec, &signals, zero_pct_fee, zero_pct_fee, config).unwrap();
+
+        assert!(result.trades[0].legs[0].commission > 0.0, "option leg should be charged the real per-contract fee schedule even at taker_fee=0.0");
+        assert_eq!(result.trades[0].legs[1].commission, 0.0, "plain leg at taker_fee=0.0 should be charged nothing");
+    }
+
+    #[test]
+    fn option_leg_is_exempt_from_margin_call_liquidation() {
+        // Leg A is an option carrying a catastrophic intrabar crash that
+        // would trigger liquidation for a plain leveraged leg -- an option's
+        // max loss is bounded by its own premium, not this leveraged-futures
+        // liquidation formula, so it must never fire regardless of leverage.
+        let prices_a = vec![5.0, 5.0];
+        let lows_a = vec![5.0, 0.01]; // catastrophic intrabar crash
+        let highs_a = vec![5.0, 5.0];
+        let prices_b = vec![100.0, 100.0];
+        let lows_b = vec![100.0, 100.0];
+        let highs_b = vec![100.0, 100.0];
+
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), venue_series_with_range(prices_a, lows_a, highs_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), venue_series_with_range(prices_b, lows_b, highs_b));
+
+        let mut spec = simple_pair_spec();
+        spec.option_leg_a = Some(test_call_instrument(50.0));
+        let config = PairBacktestConfig { max_net_exposure_pct: 1.0, leverage: 5.0, ..PairBacktestConfig::default() };
+
+        let signals = vec![1i8, 0];
+        let result = run_pair_backtest(&venues, &spec, &signals, zero_fee(), zero_fee(), config).unwrap();
+
+        assert_eq!(result.liquidations, 0, "an option leg must never be margin-called");
+    }
+
+    #[test]
+    fn plain_leg_in_a_mixed_option_pair_can_still_be_liquidated() {
+        // Leg A is an option (exempt); leg B is a plain leveraged leg. On a
+        // long-spread entry (signal==1) leg B opens SHORT, so its
+        // liquidation trigger is breached by a price RISE -- drive its
+        // intrabar HIGH up past the trigger and confirm the pair still
+        // force-closes atomically via leg B's own breach, proving the
+        // option exemption doesn't suppress the OTHER leg's real check.
+        let prices_a = vec![5.0, 5.0];
+        let prices_b = vec![100.0, 100.0];
+        let lows_b = vec![100.0, 100.0];
+        let highs_b = vec![100.0, 140.0];
+
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), venue_series_with_range(prices_b, lows_b, highs_b));
+
+        let mut spec = simple_pair_spec();
+        spec.option_leg_a = Some(test_call_instrument(50.0));
+        let config = PairBacktestConfig { max_net_exposure_pct: 1.0, leverage: 5.0, ..PairBacktestConfig::default() };
+
+        let signals = vec![1i8, 0];
+        let result = run_pair_backtest(&venues, &spec, &signals, zero_fee(), zero_fee(), config).unwrap();
+
+        assert_eq!(result.liquidations, 1, "leg B's own breach should still force-close the pair");
+        let reason = result.trades[0].exit_reason.as_ref().unwrap();
+        assert!(reason.contains("BBB"), "reason={reason}");
+        assert!(!reason.contains("AAA"), "the option leg (AAA) must never be named as a liquidation trigger: reason={reason}");
     }
 
     #[test]

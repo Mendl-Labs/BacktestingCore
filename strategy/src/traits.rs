@@ -83,6 +83,18 @@ pub struct PairSpec {
     pub symbol_b: String,
     pub exchange_b: String,
     pub hedge_ratio_mode: HedgeRatioMode,
+    /// When leg A trades an option contract rather than `symbol_a` itself
+    /// (spot/futures), this carries that contract's strike/expiry/kind.
+    /// `symbol_a`/`exchange_a` still name the *underlying* in this case,
+    /// matching `DerivativeMetadata.underlying`'s convention elsewhere.
+    /// `#[serde(default)]` keeps this field backward-compatible with
+    /// `PairSpec` values already serialized by the live SignalEngine
+    /// deployment before this field existed.
+    #[serde(default)]
+    pub option_leg_a: Option<DerivativeMetadata>,
+    /// Same as `option_leg_a`, for leg B / `symbol_b`.
+    #[serde(default)]
+    pub option_leg_b: Option<DerivativeMetadata>,
 }
 
 /// One leg of a basket cointegration trade. See `BasketSpec`.
@@ -90,6 +102,12 @@ pub struct PairSpec {
 pub struct BasketLeg {
     pub symbol: String,
     pub exchange: String,
+    /// When this leg trades an option contract rather than `symbol` itself,
+    /// carries that contract's strike/expiry/kind — see `PairSpec::option_leg_a`'s
+    /// doc comment for the same convention. `#[serde(default)]` for the same
+    /// backward-compatibility reason.
+    #[serde(default)]
+    pub option_instrument: Option<DerivativeMetadata>,
 }
 
 /// How a basket strategy's weights are determined -- the N-way
