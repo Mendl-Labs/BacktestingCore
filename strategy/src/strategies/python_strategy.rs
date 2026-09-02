@@ -1962,7 +1962,7 @@ impl Strategy for PythonStrategy {
                                 .unwrap_or(1.0);
                             HedgeRatioMode::Fixed(ratio)
                         };
-                        Ok(PairSpec { symbol_a, exchange_a, symbol_b, exchange_b, hedge_ratio_mode })
+                        Ok(PairSpec { symbol_a, exchange_a, symbol_b, exchange_b, hedge_ratio_mode, option_leg_a: None, option_leg_b: None })
                     })();
                     match parsed {
                         Ok(spec) => (Some(spec), None),
@@ -2009,7 +2009,7 @@ impl Strategy for PythonStrategy {
                             let exchange: String = leg_dict.get_item("exchange").ok().flatten()
                                 .ok_or_else(|| "a leg in basket_spec()'s 'legs' list is missing 'exchange'".to_string())?
                                 .extract().map_err(|_| "a leg's 'exchange' must be a string".to_string())?;
-                            legs.push(BasketLeg { symbol, exchange });
+                            legs.push(BasketLeg { symbol, exchange, option_instrument: None });
                         }
                         if legs.len() < 3 {
                             return Err(format!(

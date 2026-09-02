@@ -18,11 +18,29 @@
 //! convention: notional is a fixed fraction of `initial_capital`, not
 //! compounded off the running equity curve, so a single bad period can't
 //! runaway-compound the next period's sizing.
+//!
+//! Option-leg support here is intentionally narrower than `pair_simulation`/
+//! `basket_simulation`'s: `CrossSectionalAsset::option_instrument` lets a
+//! caller run the rotation against a SINGLE FIXED option contract per symbol
+//! for the whole backtest window (fee/P&L economics are option-aware exactly
+//! like the other two engines -- real Alpaca per-contract fees, PnL scaled
+//! by `contract_multiplier`). What this does NOT do is re-resolve a fresh
+//! contract each rebalance period -- `prices[i]` is one continuous series
+//! for the entire run, and a real rotating options deployment needs a
+//! DIFFERENT contract each period (the previous one ages toward expiry and
+//! drifts away from ATM). Picking that per-period replacement contract
+//! (nearest-expiry, closest-to-ATM, per this platform's resolution
+//! convention) is a `program::worker` data-loading concern -- swapping in a
+//! new price series at each `rank_end` boundary -- and remains unbuilt;
+//! don't assume a symbol backed by `option_instrument` here tracks a real
+//! rolling options deployment across periods that cross its fixed contract's
+//! expiry.
 
 use chrono::{DateTime, Utc};
 
-use crate::pair_simulation::{max_drawdown_from_equity, sharpe_from_equity, taker_fill, PairLegFeeConfig};
+use crate::pair_simulation::{leg_multiplier, max_drawdown_from_equity, sharpe_from_equity, taker_fill, PairLegFeeConfig};
 use crate::types::{TradeLeg, TradeRecord};
+use derivatives::DerivativeMetadata;
 use quant_diagnostics::{cross_sectional_rank_spread_by_class, volatility_tercile_regimes, CrossSectionalRankResult, VolatilityRegime};
 
 /// Below this many symbols, a top/bottom-half split isn't meaningful --
@@ -34,6 +52,9 @@ pub struct CrossSectionalAsset {
     pub symbol: String,
     pub exchange: String,
     pub asset_class: String,
+    /// See this module's doc comment -- a single fixed contract for the
+    /// whole run, not a per-period rotation.
+    pub option_instrument: Option<DerivativeMetadata>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,9 +255,10 @@ pub fn run_cross_sectional_backtest(
                 continue;
             }
             let quantity = long_notional_per_asset / entry_px;
-            let (entry_fill, entry_comm, entry_slip) = taker_fill(entry_px, quantity, true, fees[i]);
-            let (exit_fill, exit_comm, exit_slip) = taker_fill(exit_px, quantity, false, fees[i]);
-            let leg_pnl = (exit_fill - entry_fill) * quantity - entry_comm - exit_comm;
+            let instrument = assets[i].option_instrument.as_ref();
+            let (entry_fill, entry_comm, entry_slip) = taker_fill(entry_px, quantity, true, fees[i], instrument);
+            let (exit_fill, exit_comm, exit_slip) = taker_fill(exit_px, quantity, false, fees[i], instrument);
+            let leg_pnl = (exit_fill - entry_fill) * quantity * leg_multiplier(instrument) - entry_comm - exit_comm;
             period_pnl += leg_pnl;
             total_commission += entry_comm + exit_comm;
             total_slippage += entry_slip + exit_slip;
@@ -261,9 +283,10 @@ pub fn run_cross_sectional_backtest(
                 continue;
             }
             let quantity = short_notional_per_asset / entry_px;
-            let (entry_fill, entry_comm, entry_slip) = taker_fill(entry_px, quantity, false, fees[i]);
-            let (exit_fill, exit_comm, exit_slip) = taker_fill(exit_px, quantity, true, fees[i]);
-            let leg_pnl = (entry_fill - exit_fill) * quantity - entry_comm - exit_comm;
+            let instrument = assets[i].option_instrument.as_ref();
+            let (entry_fill, entry_comm, entry_slip) = taker_fill(entry_px, quantity, false, fees[i], instrument);
+            let (exit_fill, exit_comm, exit_slip) = taker_fill(exit_px, quantity, true, fees[i], instrument);
+            let leg_pnl = (entry_fill - exit_fill) * quantity * leg_multiplier(instrument) - entry_comm - exit_comm;
             period_pnl += leg_pnl;
             total_commission += entry_comm + exit_comm;
             total_slippage += entry_slip + exit_slip;
@@ -333,11 +356,22 @@ mod tests {
     use super::*;
 
     fn asset(symbol: &str, class: &str) -> CrossSectionalAsset {
-        CrossSectionalAsset { symbol: symbol.to_string(), exchange: "test".to_string(), asset_class: class.to_string() }
+        CrossSectionalAsset { symbol: symbol.to_string(), exchange: "test".to_string(), asset_class: class.to_string(), option_instrument: None }
     }
 
     fn flat_fee() -> PairLegFeeConfig {
         PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 }
+    }
+
+    fn test_call_instrument(symbol: &str, underlying: &str, strike: f64) -> DerivativeMetadata {
+        DerivativeMetadata::new(
+            symbol,
+            underlying,
+            derivatives::InstrumentKind::Call { strike, expiry: Utc::now() },
+            100.0,
+            "USD",
+            "test",
+        )
     }
 
     /// Build a deterministic price panel where symbols 0-1 (class "a")
@@ -440,6 +474,61 @@ mod tests {
         let full_pnl = full_result.summarize(None).total_pnl;
         let half_pnl = half_result.summarize(None).total_pnl;
         assert!((half_pnl - full_pnl / 2.0).abs() < 1e-6, "halving gross exposure should roughly halve PnL: full={} half={}", full_pnl, half_pnl);
+    }
+
+    #[test]
+    fn option_instrument_leg_pnl_is_scaled_by_contract_multiplier_and_charged_the_real_fee_schedule() {
+        // Asset 0 (class "a", the strongest steady up-trend) is always a
+        // winner in this panel and is given a fixed option contract --
+        // its leg's PnL/commission must scale by `contract_multiplier`
+        // (100) using the real Alpaca schedule, exactly like
+        // pair_simulation/basket_simulation's own option-leg behavior.
+        let mut assets = vec![asset("A", "crypto"), asset("B", "crypto"), asset("C", "crypto"), asset("D", "crypto")];
+        assets[0].option_instrument = Some(test_call_instrument("A260320C00100000", "A", 100.0));
+        let (prices, ts) = trending_panel(400);
+        let fees = vec![flat_fee(); 4];
+        let config = CrossSectionalConfig { lookback_bars: 20, holding_bars: 20, regime_window: 0, gross_exposure_pct: 0.5, ..Default::default() };
+        let result = run_cross_sectional_backtest(&assets, &prices, &ts, &fees, config).unwrap();
+        assert!(result.n_periods > 0);
+
+        // Recompute period 0's rank/hold boundaries exactly as the engine
+        // does, to independently derive asset 0's entry/exit price.
+        let rank_end = config.lookback_bars;
+        let hold_end = rank_end + config.holding_bars;
+        let entry_px = prices[0][rank_end];
+        let exit_px = prices[0][hold_end];
+        assert!(exit_px > entry_px, "asset A should have risen over the period (sanity check on the fixture)");
+
+        let leg_a = result.trades[0].legs.iter().find(|l| l.symbol == "A")
+            .expect("asset A should be a winner (long leg) every period in this steadily-trending panel");
+        assert_eq!(leg_a.side, "long");
+        assert!(leg_a.commission > 0.0, "option leg must be charged the real per-contract fee schedule even at taker_fee=0.0");
+
+        let fee_cfg = config::OptionsFeeConfig::alpaca();
+        let entry_comm = fee_cfg.commission_for_fill(entry_px, leg_a.quantity, 100.0, true);
+        let exit_comm = fee_cfg.commission_for_fill(exit_px, leg_a.quantity, 100.0, false);
+        let expected_leg_pnl = (exit_px - entry_px) * leg_a.quantity * 100.0 - entry_comm - exit_comm;
+
+        // Isolate leg A's own contribution: rerun with the SAME config but
+        // asset A as a plain (non-option) leg -- position sizing (quantity)
+        // is unaffected by `option_instrument` (it's driven purely by
+        // notional/price, matching every other engine's established, if
+        // imperfect, sizing convention), and every OTHER leg's fill is
+        // identical between the two runs (ranking is price-only, unaffected
+        // by asset A's instrument), so the total-PnL difference isolates
+        // exactly what leg A alone contributed.
+        let mut plain_assets = assets.clone();
+        plain_assets[0].option_instrument = None;
+        let plain_result = run_cross_sectional_backtest(&plain_assets, &prices, &ts, &fees, config).unwrap();
+        let plain_leg_a = plain_result.trades[0].legs.iter().find(|l| l.symbol == "A").unwrap();
+        assert!((plain_leg_a.quantity - leg_a.quantity).abs() < 1e-9, "sizing must be identical regardless of option_instrument");
+
+        let total_pnl_with_option_a = result.trades[0].pnl.unwrap();
+        let total_pnl_with_plain_a = plain_result.trades[0].pnl.unwrap();
+        let leg_a_contribution = total_pnl_with_option_a - total_pnl_with_plain_a
+            + (exit_px - entry_px) * leg_a.quantity; // plain leg A's own raw pnl at flat_fee (zero commission)
+        assert!((leg_a_contribution - expected_leg_pnl).abs() < 1.0,
+            "expected leg A's isolated contribution near {}, got {}", expected_leg_pnl, leg_a_contribution);
     }
 
     #[test]
