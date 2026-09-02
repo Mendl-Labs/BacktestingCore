@@ -1783,6 +1783,7 @@ pub async fn run_validation_pipeline(
                             orderbook_snapshots: None,
                             historical_iv_surfaces: None,
                             multi_venue_data: None,
+                            option_instrument: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
                             .map(|r| r.backtest_result)
@@ -2617,6 +2618,7 @@ async fn run_single_backtest(
             orderbook_snapshots: None,
             multi_venue_data: None,
             historical_iv_surfaces: config.historical_iv_surfaces.clone(),
+            option_instrument: None,
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -3435,6 +3437,7 @@ pub async fn detect_lookahead_bias(
         orderbook_snapshots: None,
         historical_iv_surfaces: None,
         multi_venue_data: None,
+        option_instrument: None,
     };
 
     let result_truncated = python_simulation::run(truncated_data, sim_config()).await?;
