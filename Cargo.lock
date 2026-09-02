@@ -2032,6 +2032,8 @@ dependencies = [
  "diesel-async",
  "once_cell",
  "proptest",
+ "rand 0.8.7",
+ "rand_distr",
  "serde",
  "serde_json",
  "tempfile",
