@@ -1231,6 +1231,101 @@ impl ExchangeFeeConfig {
     }
 }
 
+/// Real per-contract fee structure for US-listed equity/ETF options,
+/// distinct from `ExchangeFeeConfig` (which models spot/crypto/forex fees
+/// as a percentage of notional value via maker_fee/taker_fee). Options fees
+/// are fundamentally NOT a percentage of the premium -- they're near-flat
+/// per-contract regulatory pass-throughs (SEC, FINRA, the options exchanges,
+/// and the Options Clearing Corporation), most of which don't scale with
+/// premium at all. Using `ExchangeFeeConfig`'s percentage model for options
+/// was the platform's actual prior behavior (see `python_simulation.rs`'s
+/// `execute_taker_fill`/maker-fill commission calc, fixed alongside this
+/// type) -- confirmed live: a $5 premium 1-contract fill was charged
+/// Kraken's ~0.25% crypto taker rate against the (also wrongly-unscaled,
+/// missing the 100x contract multiplier) $5 fill value, both errors
+/// compounding to a commission many orders of magnitude off any real
+/// options broker's actual cost.
+///
+/// This platform has exactly one broker integration that both (a) is
+/// already wired for live order execution and (b) actually supports the
+/// same asset class options data comes from (US-listed equities/ETFs via
+/// Massive/Polygon): Alpaca. `alpaca()`'s numbers below are the real,
+/// current retail commission-and-regulatory-fee schedule, verified
+/// directly against Alpaca Securities LLC's own published fee schedule
+/// (files.alpaca.markets/disclosures/library/BrokFeeSched.pdf, revised
+/// 2026-09-01) -- not estimated or approximated. `deribit()`'s crypto-
+/// options fee entry in `ExchangeFeeConfig` above is a different asset
+/// class (BTC/ETH options) with no data provider wired into this platform
+/// at all today, so it's out of scope for this type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OptionsFeeConfig {
+    /// Broker's own per-contract commission, charged on both opens and
+    /// closes. Alpaca retail: $0 (commission-free). A non-retail/
+    /// professional-order-flow trader pays a real tiered rate ($0.10-$0.40/
+    /// contract) under Alpaca's own schedule, but this platform has no
+    /// concept of professional-order-flow classification for a simulated
+    /// backtest, so the retail rate is the only one modeled.
+    pub broker_commission_per_contract: f64,
+    /// SEC Transaction Fee: a rate applied to trade VALUE (premium *
+    /// contracts * contract_multiplier), sells only. $0.0000206 per Alpaca's
+    /// current schedule -- identical rate to equities, since it's a
+    /// government fee on sale proceeds, not options-specific.
+    pub sec_fee_rate: f64,
+    /// FINRA Trading Activity Fee (TAF): flat per contract, sells only.
+    pub finra_taf_per_contract: f64,
+    /// FINRA Consolidated Audit Trail (CAT) fee: per "executed equivalent
+    /// share" -- for options this means per contract times the contract's
+    /// own multiplier (1 standard equity option contract = 100 shares).
+    /// Charged on both opens and closes.
+    pub cat_fee_per_share_equivalent: f64,
+    /// Options Regulatory Fee (ORF), charged by the options exchanges: flat
+    /// per contract, both opens and closes.
+    pub orf_per_contract: f64,
+    /// OCC (Options Clearing Corporation) clearing fee: flat per contract,
+    /// both opens and closes.
+    pub occ_clearing_fee_per_contract: f64,
+}
+
+impl OptionsFeeConfig {
+    /// Alpaca Securities LLC's real retail equity-options fee schedule.
+    /// Source: files.alpaca.markets/disclosures/library/BrokFeeSched.pdf,
+    /// "Revised on September 1, 2026" (the schedule's own effective-date
+    /// stamp, not just when this was checked). Index options (SPX/SPXW/DJX/
+    /// XSP/VIX) carry a different, symbol-specific exchange-fee table on top
+    /// of these regulatory pass-throughs -- out of scope here since this
+    /// platform's options data source (Massive/Polygon) covers standard
+    /// equity/ETF-underlying contracts, not index-settled products.
+    pub fn alpaca() -> Self {
+        Self {
+            broker_commission_per_contract: 0.0,
+            sec_fee_rate: 0.0000206,
+            finra_taf_per_contract: 0.00329,
+            cat_fee_per_share_equivalent: 0.000003,
+            orf_per_contract: 0.015,
+            occ_clearing_fee_per_contract: 0.025,
+        }
+    }
+
+    /// Total commission for one fill: `premium` is the per-contract fill
+    /// price, `contracts` the executed quantity, `contract_multiplier` the
+    /// instrument's own multiplier (100 for a standard equity option), and
+    /// `is_buy` distinguishes the sells-only fees (SEC, TAF) from the
+    /// charged-both-ways ones (CAT, ORF, OCC, broker commission).
+    pub fn commission_for_fill(&self, premium: f64, contracts: f64, contract_multiplier: f64, is_buy: bool) -> f64 {
+        let both_ways = contracts
+            * (self.broker_commission_per_contract
+                + self.cat_fee_per_share_equivalent * contract_multiplier
+                + self.orf_per_contract
+                + self.occ_clearing_fee_per_contract);
+        if is_buy {
+            both_ways
+        } else {
+            let trade_value = premium * contracts * contract_multiplier;
+            both_ways + trade_value * self.sec_fee_rate + contracts * self.finra_taf_per_contract
+        }
+    }
+}
+
 /// Volume-based fee tier
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeTier {
@@ -2324,6 +2419,52 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── OptionsFeeConfig: real Alpaca retail equity-options fee schedule ──
+
+    #[test]
+    fn options_fee_alpaca_buy_charges_only_the_both_ways_fees() {
+        let cfg = OptionsFeeConfig::alpaca();
+        // Buy 1 contract at $5.00 premium, standard 100x multiplier.
+        let commission = cfg.commission_for_fill(5.0, 1.0, 100.0, true);
+        // both_ways = 1 * (0 + 0.000003*100 + 0.015 + 0.025) = 1 * (0.0003 + 0.015 + 0.025) = 0.0403
+        assert!((commission - 0.0403).abs() < 1e-9, "commission={commission}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_sell_adds_sec_fee_and_taf_on_top() {
+        let cfg = OptionsFeeConfig::alpaca();
+        let commission = cfg.commission_for_fill(5.0, 1.0, 100.0, false);
+        // both_ways = 0.0403 (same as buy case)
+        // trade_value = 5.0 * 1 * 100 = 500.0; sec = 500 * 0.0000206 = 0.0103
+        // taf = 1 * 0.00329 = 0.00329
+        let expected = 0.0403 + 0.0103 + 0.00329;
+        assert!((commission - expected).abs() < 1e-6, "commission={commission}, expected={expected}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_scales_linearly_with_contract_count() {
+        let cfg = OptionsFeeConfig::alpaca();
+        let one = cfg.commission_for_fill(5.0, 1.0, 100.0, true);
+        let ten = cfg.commission_for_fill(5.0, 10.0, 100.0, true);
+        assert!((ten - one * 10.0).abs() < 1e-9, "one={one}, ten={ten}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_is_never_a_percentage_of_premium() {
+        // The defining property this type exists to fix: a 10x higher
+        // premium on the SAME contract must not change the both-ways fee at
+        // all (unlike ExchangeFeeConfig's maker/taker percentage model).
+        let cfg = OptionsFeeConfig::alpaca();
+        let cheap = cfg.commission_for_fill(1.0, 1.0, 100.0, true);
+        let expensive = cfg.commission_for_fill(50.0, 1.0, 100.0, true);
+        assert!((cheap - expensive).abs() < 1e-12, "cheap={cheap}, expensive={expensive}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_broker_commission_is_zero_for_retail() {
+        assert_eq!(OptionsFeeConfig::alpaca().broker_commission_per_contract, 0.0);
+    }
 
     // ── Exchange fee routing: every id the Massive/Polygon feeds emit must
     //    resolve to the correct preset, not the generic fallback. ──────────

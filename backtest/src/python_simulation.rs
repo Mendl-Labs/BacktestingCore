@@ -17,7 +17,7 @@ use dataloader::MarketData;
 use derivatives::DerivativeMetadata;
 use orderbook::{BookSide, Fill, LiquidityType};
 use portfoliomanager::PortfolioState;
-use signal::{Signal, SignalStrength, SignalReason, SignalType};
+use signal::{Signal, SignalStrength, SignalReason, SignalType, SpreadLeg};
 use strategy::traits::{
     MarketSession, PricePoint, PriceSource, SessionType, StrategyContext, VolumePoint,
     PortfolioSnapshot,
@@ -26,6 +26,7 @@ use strategy::Strategy; // trait import — required for .initialize() / .genera
 use strategy::executor::{self, StrategyExecutor, ExecutionTier};
 
 use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel};
+use crate::python_validation::OptionSpreadLeg;
 use crate::rolling_window::RollingWindow;
 use genetic::adaptive_sampling::StableRegionDetector;
 use metrics::significance;
@@ -134,6 +135,31 @@ pub struct PythonSimConfig {
     /// every tick exactly as before -- zero behavior change for any
     /// strategy that doesn't opt in via `data_requirements().needs_iv_surface`.
     pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
+    /// When set, this run is trading a single pre-resolved option contract
+    /// rather than the underlying spot asset -- `market_data` must already
+    /// be that contract's OWN OHLCV series (see `options_backtest_data` in
+    /// the `program` crate, which resolves a job's `OptionLeg` into this
+    /// exact shape). The strategy's Python `compute_signals()` still only
+    /// ever returns the plain int8 BUY/SELL/HOLD/CLOSE vocabulary (the SDK
+    /// has no way to embed contract metadata in a signal) -- `i8_to_signals`
+    /// reinterprets a bulk BUY/SELL code as `SignalType::BuyOption`/
+    /// `SellOption` on THIS instrument when set, instead of a plain spot
+    /// `Buy`/`Sell`, so the strategy's existing directional logic (when to
+    /// be long/flat) drives the option position without the strategy code
+    /// itself needing to know it's trading an option at all. CLOSE needs no
+    /// equivalent handling: `close_all_positions` already closes each open
+    /// position using ITS OWN recorded instrument (set when the position
+    /// was opened), not a signal-level one. `None` (the default) is the
+    /// existing, unaffected spot/futures behavior.
+    pub option_instrument: Option<DerivativeMetadata>,
+    /// When set, this run is trading a pre-configured multi-leg option
+    /// spread (a vertical, currently -- 2 legs, see `OptionSpreadLeg`'s doc
+    /// comment for the exact scope) instead of a single option or the
+    /// underlying spot asset. Mutually exclusive with `option_instrument`
+    /// (a run is single-leg or multi-leg, never both) -- when both are
+    /// `Some`, `option_spread` takes precedence. `None` (the default) is
+    /// the existing, unaffected behavior.
+    pub option_spread: Option<Vec<OptionSpreadLeg>>,
 }
 
 /// Binary-search the pre-sorted historical IV series for the entry whose
@@ -672,7 +698,7 @@ async fn run_with_input(
         // -- Generate signals via executor (Tier 0–3) with stable region optimization --
         let signals = if let Some(ref sigs) = precomputed_signals {
             // Bulk path: convert precomputed i8 → Signal (no Python call this tick).
-            last_signals = i8_to_signals(sigs[tick_idx], current_price);
+            last_signals = i8_to_signals(sigs[tick_idx], current_price, tick_idx, config.option_instrument.as_ref(), config.option_spread.as_deref());
             &last_signals
         } else if stable_detector.should_process(current_price) {
             // Price moved significantly or max skip reached — call Python strategy
@@ -1024,7 +1050,16 @@ async fn run_with_input(
                             break;
                         }
 
-                        let leg_price = leg.limit_price.unwrap_or(sig_price);
+                        // A real explicit limit_price always wins. Otherwise,
+                        // for a TAKER fill, this leg's own price (looked up
+                        // from config.option_spread by instrument symbol at
+                        // this exact tick_idx) is the correct fill price --
+                        // sig_price is the PRIMARY series' own price and is
+                        // only correct for whichever leg happens to BE the
+                        // primary series; every other leg needs its own.
+                        let leg_price = leg.limit_price.unwrap_or_else(|| {
+                            spread_leg_price_at(config.option_spread.as_deref(), leg_instrument.as_ref(), tick_idx, sig_price)
+                        });
                         let is_limit_leg = leg.limit_price.is_some() || signal.is_limit;
 
                         if let Some(ref rm) = risk_manager {
@@ -1073,7 +1108,7 @@ async fn run_with_input(
                         } else {
                             execute_taker_fill(
                                 &dir_signal,
-                                current_price,
+                                leg_price,
                                 leg_qty,
                                 &mut portfolio,
                                 &mut total_commission,
@@ -1585,11 +1620,83 @@ fn resolve_position_size_pct(config: &PythonSimConfig) -> f64 {
 /// Convert a bulk-signal i8 code to a `Vec<Signal>`.
 ///
 /// Signal encoding: 1=BUY, -1=SELL, 0=HOLD, 2=CLOSE
-fn i8_to_signals(code: i8, price: f64) -> Vec<Signal> {
+///
+/// `option_spread`, when set (and non-empty), takes precedence over
+/// `option_instrument`: BUY(1) reinterprets as `SignalType::OptionSpread`
+/// entering every leg AS CONFIGURED (a leg with positive `ratio` opens long
+/// via `BuyOption`, negative opens short via `SellOption`), and SELL(-1) as
+/// the MIRROR -- every leg's direction and ratio sign negated, so the same
+/// spread closes (or, for a leg `apply_derivative_fill` finds no matching
+/// open position for, opens the inverse) exactly the way a plain SELL
+/// closes a plain BUY. Each leg's fill price comes from ITS OWN `prices[
+/// tick_idx]`, not the shared `price` parameter -- see `OptionSpreadLeg`'s
+/// doc comment for why every leg needs its own aligned series. Falls back
+/// to `price` (with a loud warning) if a leg's series is shorter than
+/// `tick_idx` requires -- callers are responsible for aligning every leg's
+/// series to the primary market_data length; this is a defensive
+/// fallback for a caller bug, not expected in practice.
+///
+/// `option_instrument`, when set and `option_spread` is not, reinterprets
+/// BUY(1)/SELL(-1) as `SignalType::BuyOption`/`SellOption` on that single
+/// contract instead of plain spot `Buy`/`Sell` -- see `PythonSimConfig.
+/// option_instrument`'s doc comment for the full rationale.
+///
+/// CLOSE(2) is deliberately unchanged in every case: `close_all_positions`
+/// already closes each open position (single-leg or spread-leg alike)
+/// using its own recorded instrument, not a signal-level one.
+fn i8_to_signals(
+    code: i8,
+    price: f64,
+    tick_idx: usize,
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+) -> Vec<Signal> {
     let reason = SignalReason::TechnicalAnalysis("vectorized".into());
+
+    let spread_leg_price = |leg: &OptionSpreadLeg| -> f64 {
+        leg.prices.get(tick_idx).copied().unwrap_or_else(|| {
+            log_warn!(
+                BACKTEST_LOGGER,
+                "OptionSpreadLeg '{}' has no price at tick {} (series len {}) -- falling back to the primary series' price, which is WRONG for this contract; the caller must align every leg's series to market_data's length",
+                leg.instrument.symbol, tick_idx, leg.prices.len()
+            );
+            price
+        })
+    };
+    let build_spread_signal = |legs: &[OptionSpreadLeg], entering: bool| -> Signal {
+        let spread_legs: Vec<SpreadLeg> = legs.iter().map(|leg| {
+            let leg_price = spread_leg_price(leg);
+            let opens_long = if entering { leg.ratio > 0 } else { leg.ratio < 0 };
+            let effective_ratio = if entering { leg.ratio } else { -leg.ratio };
+            let signal_type = if opens_long {
+                SignalType::BuyOption { instrument: leg.instrument.clone(), premium: Some(leg_price) }
+            } else {
+                SignalType::SellOption { instrument: leg.instrument.clone(), premium: Some(leg_price) }
+            };
+            SpreadLeg { signal_type, ratio: effective_ratio, limit_price: None }
+        }).collect();
+        Signal::new("bulk", SignalType::OptionSpread { legs: spread_legs }, SignalStrength::Medium, reason.clone())
+    };
+
     match code {
-        1  => vec![Signal::buy("bulk", SignalStrength::Medium, reason).with_price(price)],
-        -1 => vec![Signal::sell("bulk", SignalStrength::Medium, reason).with_price(price)],
+        1 => {
+            if let Some(legs) = option_spread.filter(|l| !l.is_empty()) {
+                return vec![build_spread_signal(legs, true).with_price(price)];
+            }
+            vec![match option_instrument {
+                Some(instr) => Signal::new("bulk", SignalType::BuyOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+                None => Signal::buy("bulk", SignalStrength::Medium, reason),
+            }.with_price(price)]
+        }
+        -1 => {
+            if let Some(legs) = option_spread.filter(|l| !l.is_empty()) {
+                return vec![build_spread_signal(legs, false).with_price(price)];
+            }
+            vec![match option_instrument {
+                Some(instr) => Signal::new("bulk", SignalType::SellOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+                None => Signal::sell("bulk", SignalStrength::Medium, reason),
+            }.with_price(price)]
+        }
         2  => vec![Signal::close("bulk", SignalStrength::Medium, reason).with_price(price)],
         _  => Vec::new(), // HOLD or any unknown code
     }
@@ -1643,6 +1750,61 @@ fn extract_instrument(signal_type: &SignalType) -> Option<DerivativeMetadata> {
         | SignalType::SellFuture { instrument }
         | SignalType::ExerciseOption { instrument } => Some(instrument.clone()),
         _ => None,
+    }
+}
+
+/// Look up an `OptionSpread` leg's own price at `tick_idx`, matched against
+/// `option_spread` by instrument symbol. Falls back to `fallback` (with a
+/// loud warning) when `option_spread` is `None`, the symbol isn't found, or
+/// the matched leg's series doesn't reach `tick_idx` -- each of these means
+/// this fill is either not actually part of a configured spread (a plain
+/// single-leg BuyOption/SellOption reusing the same taker-fill machinery,
+/// where `fallback` -- `sig_price` at the call site -- is already correct)
+/// or a genuine caller alignment bug, never something to silently mis-price
+/// without at least logging it.
+fn spread_leg_price_at(
+    option_spread: Option<&[OptionSpreadLeg]>,
+    instrument: Option<&DerivativeMetadata>,
+    tick_idx: usize,
+    fallback: f64,
+) -> f64 {
+    let (Some(legs), Some(instr)) = (option_spread, instrument) else {
+        return fallback;
+    };
+    match legs.iter().find(|l| l.instrument.symbol == instr.symbol) {
+        Some(leg) => leg.prices.get(tick_idx).copied().unwrap_or_else(|| {
+            log_warn!(
+                BACKTEST_LOGGER,
+                "OptionSpreadLeg '{}' has no price at tick {} (series len {}) -- falling back to {}, which is WRONG for this contract",
+                instr.symbol, tick_idx, leg.prices.len(), fallback
+            );
+            fallback
+        }),
+        None => fallback,
+    }
+}
+
+/// Commission for one fill. An option instrument (`is_option()`) uses the
+/// real per-contract Alpaca fee schedule (`config::OptionsFeeConfig`) --
+/// flat regulatory pass-throughs, not a percentage of premium -- rather
+/// than `generic_fee_rate` (this platform's only other broker integration
+/// for the same underlying asset class; see `OptionsFeeConfig::alpaca`'s
+/// doc comment for why). Any other instrument (a future, say) still applies
+/// `generic_fee_rate` but against the correctly-scaled notional (`price *
+/// qty * contract_multiplier`) -- fixes a second, compounding bug this fee
+/// model shared with options: `fill_value` was previously computed as
+/// `price * qty` with no multiplier at all, understating notional by
+/// exactly the multiplier factor for every derivative instrument, not just
+/// options. A plain (non-derivative) fill keeps the pre-existing `price *
+/// qty * generic_fee_rate` behavior exactly, since its implicit multiplier
+/// is 1.
+fn compute_commission(price: f64, qty: f64, is_buy: bool, instrument: Option<&DerivativeMetadata>, generic_fee_rate: f64) -> f64 {
+    match instrument {
+        Some(instr) if instr.instrument_kind.is_option() => {
+            config::OptionsFeeConfig::alpaca().commission_for_fill(price, qty, instr.contract_multiplier, is_buy)
+        }
+        Some(instr) => price * qty * instr.contract_multiplier * generic_fee_rate,
+        None => price * qty * generic_fee_rate,
     }
 }
 
@@ -1727,7 +1889,8 @@ fn execute_taker_fill(
     let fill_qty = executed_qty;
 
     let fill_value = adjusted_price * fill_qty;
-    let commission = fill_value * taker_fee;
+    let is_buy = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
+    let commission = compute_commission(adjusted_price, fill_qty, is_buy, instrument, taker_fee);
     *total_commission += commission;
     *num_trades += 1;
     portfolio.fees_paid += commission;
@@ -1923,8 +2086,8 @@ fn fill_pending_limits(
 
             if executed_qty >= 1e-10 {
                 let exec_fill_qty = executed_qty;
-                let fill_value = order.price * exec_fill_qty;
-                let commission = fill_value * maker_fee;
+                let is_buy = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
+                let commission = compute_commission(order.price, exec_fill_qty, is_buy, order.instrument.as_ref(), maker_fee);
                 *total_commission += commission;
                 *num_trades += 1;
                 portfolio.fees_paid += commission;
@@ -2770,6 +2933,8 @@ mod tests {
             orderbook_snapshots: None,
             historical_iv_surfaces: None,
             multi_venue_data: None,
+            option_instrument: None,
+            option_spread: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
         assert_eq!(config.max_trade_log_size, Some(500));
@@ -2790,6 +2955,8 @@ mod tests {
             orderbook_snapshots: None,
             historical_iv_surfaces: None,
             multi_venue_data: None,
+            option_instrument: None,
+            option_spread: None,
         };
         assert!(config.max_trade_log_size.is_none());
     }
@@ -2808,6 +2975,147 @@ mod tests {
             "USD",
             "test",
         )
+    }
+
+    #[test]
+    fn i8_to_signals_wraps_buy_and_sell_as_options_when_instrument_is_set() {
+        let instrument = test_call_instrument();
+        let buy_signals = i8_to_signals(1, 5.0, 0, Some(&instrument), None);
+        assert_eq!(buy_signals.len(), 1);
+        match &buy_signals[0].signal_type {
+            SignalType::BuyOption { instrument: instr, premium } => {
+                assert_eq!(instr, &instrument);
+                assert!(premium.is_none(), "premium is filled in from the fill price downstream, not set here");
+            }
+            other => panic!("expected BuyOption, got {other:?}"),
+        }
+
+        let sell_signals = i8_to_signals(-1, 5.0, 0, Some(&instrument), None);
+        assert_eq!(sell_signals.len(), 1);
+        match &sell_signals[0].signal_type {
+            SignalType::SellOption { instrument: instr, .. } => assert_eq!(instr, &instrument),
+            other => panic!("expected SellOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_stays_plain_buy_sell_without_an_instrument() {
+        let buy_signals = i8_to_signals(1, 100.0, 0, None, None);
+        assert_eq!(buy_signals.len(), 1);
+        assert_eq!(buy_signals[0].signal_type, SignalType::Buy);
+
+        let sell_signals = i8_to_signals(-1, 100.0, 0, None, None);
+        assert_eq!(sell_signals.len(), 1);
+        assert_eq!(sell_signals[0].signal_type, SignalType::Sell);
+    }
+
+    #[test]
+    fn i8_to_signals_close_is_unaffected_by_option_instrument() {
+        // CLOSE needs no option-aware wrapping: close_all_positions already
+        // closes each open position using its OWN recorded instrument, not
+        // a signal-level one -- see PythonSimConfig.option_instrument's doc
+        // comment.
+        let instrument = test_call_instrument();
+        let with_instrument = i8_to_signals(2, 5.0, 0, Some(&instrument), None);
+        let without_instrument = i8_to_signals(2, 5.0, 0, None, None);
+        assert_eq!(with_instrument.len(), 1);
+        assert_eq!(without_instrument.len(), 1);
+        assert_eq!(with_instrument[0].signal_type, SignalType::Close);
+        assert_eq!(without_instrument[0].signal_type, SignalType::Close);
+    }
+
+    #[test]
+    fn i8_to_signals_hold_and_unknown_codes_produce_nothing_regardless_of_instrument() {
+        let instrument = test_call_instrument();
+        assert!(i8_to_signals(0, 5.0, 0, Some(&instrument), None).is_empty());
+        assert!(i8_to_signals(99, 5.0, 0, Some(&instrument), None).is_empty());
+    }
+
+    // ---- i8_to_signals: OptionSpread construction ----
+
+    fn test_put_instrument() -> DerivativeMetadata {
+        DerivativeMetadata::new(
+            "O:SPY-TEST-P",
+            "SPY",
+            derivatives::InstrumentKind::Put {
+                strike: 460.0,
+                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+            },
+            100.0,
+            "USD",
+            "test",
+        )
+    }
+
+    fn vertical_spread_legs() -> Vec<OptionSpreadLeg> {
+        vec![
+            OptionSpreadLeg { instrument: test_call_instrument(), ratio: 1, prices: vec![5.0, 5.5, 4.5] },
+            OptionSpreadLeg { instrument: test_put_instrument(), ratio: -1, prices: vec![2.0, 1.8, 2.2] },
+        ]
+    }
+
+    #[test]
+    fn i8_to_signals_buy_enters_spread_legs_as_configured() {
+        let legs = vertical_spread_legs();
+        let signals = i8_to_signals(1, 999.0, 1, None, Some(&legs));
+        assert_eq!(signals.len(), 1);
+        match &signals[0].signal_type {
+            SignalType::OptionSpread { legs: spread_legs } => {
+                assert_eq!(spread_legs.len(), 2);
+                match &spread_legs[0].signal_type {
+                    SignalType::BuyOption { instrument, premium } => {
+                        assert_eq!(instrument, &test_call_instrument());
+                        // tick_idx=1 -> this leg's own price (5.5), not the
+                        // shared `price` param (999.0) passed in.
+                        assert_eq!(*premium, Some(5.5));
+                    }
+                    other => panic!("expected BuyOption for the +1 ratio leg, got {other:?}"),
+                }
+                assert_eq!(spread_legs[0].ratio, 1);
+                match &spread_legs[1].signal_type {
+                    SignalType::SellOption { instrument, premium } => {
+                        assert_eq!(instrument, &test_put_instrument());
+                        assert_eq!(*premium, Some(1.8));
+                    }
+                    other => panic!("expected SellOption for the -1 ratio leg, got {other:?}"),
+                }
+                assert_eq!(spread_legs[1].ratio, -1);
+            }
+            other => panic!("expected OptionSpread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_sell_mirrors_every_leg_to_close_or_reverse() {
+        let legs = vertical_spread_legs();
+        let signals = i8_to_signals(-1, 999.0, 0, None, Some(&legs));
+        match &signals[0].signal_type {
+            SignalType::OptionSpread { legs: spread_legs } => {
+                // The +1 ratio leg (entered via BuyOption) must now close
+                // via SellOption with a negated ratio; the -1 ratio leg
+                // (entered via SellOption) must now close via BuyOption.
+                assert!(matches!(spread_legs[0].signal_type, SignalType::SellOption { .. }));
+                assert_eq!(spread_legs[0].ratio, -1);
+                assert!(matches!(spread_legs[1].signal_type, SignalType::BuyOption { .. }));
+                assert_eq!(spread_legs[1].ratio, 1);
+            }
+            other => panic!("expected OptionSpread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_option_spread_takes_precedence_over_option_instrument() {
+        let legs = vertical_spread_legs();
+        let single = test_call_instrument();
+        let signals = i8_to_signals(1, 999.0, 0, Some(&single), Some(&legs));
+        assert!(matches!(signals[0].signal_type, SignalType::OptionSpread { .. }));
+    }
+
+    #[test]
+    fn i8_to_signals_empty_option_spread_falls_back_to_single_leg_or_plain() {
+        let empty: Vec<OptionSpreadLeg> = Vec::new();
+        let signals = i8_to_signals(1, 100.0, 0, None, Some(&empty));
+        assert_eq!(signals[0].signal_type, SignalType::Buy);
     }
 
     #[test]
@@ -2847,5 +3155,54 @@ mod tests {
         assert_eq!(extract_instrument(&buy), Some(instrument.clone()));
         assert_eq!(extract_instrument(&sell), Some(instrument.clone()));
         assert_eq!(extract_instrument(&exercise), Some(instrument));
+    }
+
+    // ---- compute_commission: real per-contract options fees, not a % of premium ----
+
+    #[test]
+    fn compute_commission_option_buy_ignores_the_generic_percentage_fee_rate() {
+        let instrument = test_call_instrument();
+        // A generic_fee_rate of 10% would dominate a percentage-based calc
+        // (0.10 * $5 * 1 contract = $0.50) -- for an option this must be
+        // completely ignored in favor of the flat per-contract schedule.
+        let commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.10);
+        let expected = config::OptionsFeeConfig::alpaca().commission_for_fill(5.0, 1.0, 100.0, true);
+        assert!((commission - expected).abs() < 1e-9, "commission={commission}, expected={expected}");
+        assert!(commission < 0.10, "must not be anywhere near the 10% generic rate: {commission}");
+    }
+
+    #[test]
+    fn compute_commission_option_sell_includes_sec_fee_and_taf() {
+        let instrument = test_call_instrument();
+        let buy_commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.001);
+        let sell_commission = compute_commission(5.0, 1.0, false, Some(&instrument), 0.001);
+        assert!(sell_commission > buy_commission, "sell must add SEC fee + TAF on top of the both-ways fees");
+    }
+
+    #[test]
+    fn compute_commission_non_derivative_fill_uses_the_generic_rate_unscaled() {
+        // No instrument at all (a plain equity/crypto/forex fill) -- must
+        // keep the pre-existing price * qty * generic_fee_rate behavior
+        // exactly, with no multiplier applied.
+        let commission = compute_commission(100.0, 2.0, true, None, 0.001);
+        assert!((commission - 100.0 * 2.0 * 0.001).abs() < 1e-9, "commission={commission}");
+    }
+
+    #[test]
+    fn compute_commission_non_option_derivative_still_scales_by_contract_multiplier() {
+        // A future (not an option) with a real multiplier still applies the
+        // generic percentage fee, but against the correctly-scaled notional
+        // -- fixes the second bug this fee model shared with options
+        // (fill_value previously had no multiplier applied at all).
+        let future = DerivativeMetadata::new(
+            "TEST-FUT",
+            "BTC-USD",
+            derivatives::InstrumentKind::Future { expiry: chrono::Utc::now() + chrono::Duration::days(30) },
+            5.0, // e.g. a micro future's contract multiplier
+            "USD",
+            "test",
+        );
+        let commission = compute_commission(100.0, 2.0, true, Some(&future), 0.001);
+        assert!((commission - 100.0 * 2.0 * 5.0 * 0.001).abs() < 1e-9, "commission={commission}");
     }
 }
