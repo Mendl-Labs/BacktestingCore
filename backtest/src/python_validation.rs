@@ -744,6 +744,39 @@ async fn run_cross_sectional_check(
 // Public types
 // ---------------------------------------------------------------------------
 
+/// One leg of a pre-configured multi-leg option spread -- see
+/// `ValidationConfig.option_spread` / `python_simulation::PythonSimConfig.
+/// option_spread`. Every leg carries its OWN price series, aligned tick-
+/// for-tick (same length and timestamp order) with the primary market_data
+/// series and every other leg's series here -- the caller
+/// (`options_backtest_data` in the `program` crate) is responsible for that
+/// alignment before constructing this; `python_simulation::i8_to_signals`/
+/// the `OptionSpread` fill path both index into `prices` by the SAME
+/// `tick_idx` the primary series uses, with no independent timestamp
+/// matching of their own.
+///
+/// Defined here (not in `python_simulation`, which is gated behind the
+/// `python` feature) because `ValidationConfig` below is NOT feature-gated
+/// and needs this type unconditionally.
+///
+/// Scope: this platform's `job_queue::OptionLeg` array (and therefore
+/// `option_legs.len()`) already supports any leg count, but only 2-leg
+/// (vertical) spreads are wired end-to-end today -- `options_backtest_data`
+/// only resolves and aligns 2 legs. 3+-leg structures (iron condors,
+/// butterflies) are a real, larger follow-up (N-way series alignment,
+/// N-way margin/risk treatment) deliberately not attempted here.
+#[derive(Debug, Clone)]
+pub struct OptionSpreadLeg {
+    pub instrument: derivatives::DerivativeMetadata,
+    /// Signed ratio: positive = long, negative = short -- same convention
+    /// as `signal::SpreadLeg.ratio` and `job_queue::OptionLeg.ratio`.
+    pub ratio: i32,
+    /// This leg's own price at each tick, aligned 1:1 with the primary
+    /// `market_data` series by index (not by re-matching timestamps at
+    /// fill time).
+    pub prices: Vec<f64>,
+}
+
 /// Configuration for the validation pipeline.
 pub struct ValidationConfig {
     /// User Python source code.
@@ -819,6 +852,11 @@ pub struct ValidationConfig {
     /// it actually does. `None` (the default) is the existing, unaffected
     /// behavior for every non-options job.
     pub option_instrument: Option<derivatives::DerivativeMetadata>,
+    /// Same forwarding pattern as `option_instrument` above, for a multi-leg
+    /// spread instead of a single contract. See `crate::python_simulation::
+    /// OptionSpreadLeg`'s doc comment for the exact scope (2-leg verticals
+    /// only today).
+    pub option_spread: Option<Vec<OptionSpreadLeg>>,
 }
 
 impl Default for ValidationConfig {
@@ -844,6 +882,7 @@ impl Default for ValidationConfig {
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
             option_instrument: None,
+            option_spread: None,
         }
     }
 }
@@ -1795,6 +1834,7 @@ pub async fn run_validation_pipeline(
                             historical_iv_surfaces: None,
                             multi_venue_data: None,
                             option_instrument: None,
+                            option_spread: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
                             .map(|r| r.backtest_result)
@@ -2630,6 +2670,7 @@ async fn run_single_backtest(
             multi_venue_data: None,
             historical_iv_surfaces: config.historical_iv_surfaces.clone(),
             option_instrument: config.option_instrument.clone(),
+            option_spread: config.option_spread.clone(),
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
@@ -3449,6 +3490,7 @@ pub async fn detect_lookahead_bias(
         historical_iv_surfaces: None,
         multi_venue_data: None,
         option_instrument: None,
+        option_spread: None,
     };
 
     let result_truncated = python_simulation::run(truncated_data, sim_config()).await?;
@@ -4586,6 +4628,7 @@ mod tests {
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
             option_instrument: None,
+            option_spread: None,
         };
         assert_eq!(config.wf_windows, 5);
         assert_eq!(config.mc_runs, 500);

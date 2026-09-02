@@ -97,6 +97,7 @@ async fn python_strategy_produces_trades_and_metrics() {
         historical_iv_surfaces: None,
         multi_venue_data: None,
         option_instrument: None,
+        option_spread: None,
     };
 
     let result = python_simulation::run(&market_data, config)
@@ -297,6 +298,7 @@ fn run_sizing_config(python_source: String) -> PythonSimConfig {
         historical_iv_surfaces: None,
         multi_venue_data: None,
         option_instrument: None,
+        option_spread: None,
     }
 }
 
