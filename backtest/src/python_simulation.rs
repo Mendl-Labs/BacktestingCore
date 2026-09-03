@@ -1878,6 +1878,35 @@ fn to_directional_signal(signal_type: &SignalType) -> Option<SignalType> {
     }
 }
 
+/// Which round-trip action a Buy/Sell(-family) fill represents, given the
+/// side of whatever position (if any) `open_positions` currently has open.
+/// Real bug (confirmed live, 2026-09-02, harvesting-skill eval): the two
+/// callers of this (`execute_taker_fill`, `fill_pending_limits`) used to
+/// classify purely off the signal type -- ANY Buy/ScaleIn was "open a new
+/// long", ANY Sell/ScaleOut was "close" -- which silently dropped a bare
+/// Sell arriving while flat from the round-trip ledger entirely (it matched
+/// neither "close" (nothing open) nor "entry" (not a Buy)), even though
+/// `PortfolioState::apply_fill_executed` already opens a real short for it
+/// (see that function's own doc comment -- the portfolio-level short-open
+/// bug was already fixed; this reporting-layer companion never was). A
+/// later Buy meant to cover that (invisible-to-the-ledger) short then got
+/// misclassified as a fresh "long" entry instead of a close, corrupting
+/// `trade_log`'s `side`/`pnl` for every strategy that ever goes short.
+fn classify_round_trip_action(is_buy_direction: bool, open_positions: &[OpenPosition]) -> RoundTripAction {
+    match (is_buy_direction, open_positions.last().map(|p| p.side.as_str())) {
+        (true, Some("short")) => RoundTripAction::Close,
+        (false, Some("long")) => RoundTripAction::Close,
+        (true, _) => RoundTripAction::OpenLong,
+        (false, _) => RoundTripAction::OpenShort,
+    }
+}
+
+enum RoundTripAction {
+    OpenLong,
+    OpenShort,
+    Close,
+}
+
 /// Pull the `DerivativeMetadata` out of a signal that carries one, so the
 /// fill path can apply it via `apply_derivative_fill` (multiplier-aware,
 /// long/short-correct) instead of collapsing straight to a plain spot fill.
@@ -2049,8 +2078,9 @@ fn execute_taker_fill(
     };
     trade_returns.push(pnl_pct);
 
-    let is_entry = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
-    let is_exit = matches!(signal_type, SignalType::Sell | SignalType::ScaleOut);
+    let is_buy_direction = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
+    let action = classify_round_trip_action(is_buy_direction, open_positions);
+    let is_exit = matches!(action, RoundTripAction::Close);
 
     // MAE: for exits, convert the round-trip's fractional MAE to dollars;
     // for entries, no completed trade yet → 0.
@@ -2108,11 +2138,15 @@ fn execute_taker_fill(
                 });
             }
         }
-    } else if is_entry {
-        // Open a new position for round-trip tracking
+    } else {
+        // Open a new position for round-trip tracking -- long for a bare
+        // Buy/ScaleIn, short for a bare Sell/ScaleOut (see
+        // `classify_round_trip_action`'s doc comment for why this can't
+        // just assume "long").
+        let side = if matches!(action, RoundTripAction::OpenShort) { "short" } else { "long" };
         open_positions.push(OpenPosition {
             trade_id: *next_trade_id,
-            side: "long".to_string(),
+            side: side.to_string(),
             entry_signal_price: fill_price,
             entry_fill_price: adjusted_price,
             quantity: fill_qty,
@@ -2235,9 +2269,12 @@ fn fill_pending_limits(
 
                 trade_returns.push(0.0); // Actual P&L tracked via portfolio
 
-                // Round-trip tracking for maker fills
-                let is_entry = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
-                let is_exit = matches!(order.signal_type, SignalType::Sell | SignalType::ScaleOut);
+                // Round-trip tracking for maker fills -- see
+                // `classify_round_trip_action`'s doc comment for why this
+                // can't classify off the signal type alone.
+                let is_buy_direction = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
+                let action = classify_round_trip_action(is_buy_direction, open_positions);
+                let is_exit = matches!(action, RoundTripAction::Close);
 
                 // MAE for maker fills
                 let mae_dollars = if is_exit && !open_positions.is_empty() {
@@ -2291,10 +2328,11 @@ fn fill_pending_limits(
                             });
                         }
                     }
-                } else if is_entry {
+                } else {
+                    let side = if matches!(action, RoundTripAction::OpenShort) { "short" } else { "long" };
                     open_positions.push(OpenPosition {
                         trade_id: *next_trade_id,
-                        side: "long".to_string(),
+                        side: side.to_string(),
                         entry_signal_price: order.price,
                         entry_fill_price: order.price,
                         quantity: exec_fill_qty,
@@ -3141,6 +3179,69 @@ mod tests {
             underlying_series: None,
         };
         assert!(config.max_trade_log_size.is_none());
+    }
+
+    // ---- classify_round_trip_action (real bug, 2026-09-02: a bare Sell
+    // arriving while flat used to vanish from the round-trip ledger, and a
+    // Buy meant to cover an open short got recorded as a fresh long) ----
+
+    fn mk_open_position(side: &str) -> OpenPosition {
+        OpenPosition {
+            trade_id: 1,
+            side: side.to_string(),
+            entry_signal_price: 100.0,
+            entry_fill_price: 100.0,
+            quantity: 1.0,
+            entry_commission: 0.0,
+            entry_slippage: 0.0,
+            entry_time: chrono::Utc::now(),
+            entry_liquidity: "taker".to_string(),
+            entry_reason: "signal".to_string(),
+            worst_unrealized: 0.0,
+            best_unrealized: 0.0,
+        }
+    }
+
+    #[test]
+    fn classify_round_trip_action_buy_from_flat_opens_long() {
+        let open_positions: Vec<OpenPosition> = Vec::new();
+        assert!(matches!(classify_round_trip_action(true, &open_positions), RoundTripAction::OpenLong));
+    }
+
+    #[test]
+    fn classify_round_trip_action_sell_from_flat_opens_short() {
+        // The core bug: a bare Sell with nothing open used to match neither
+        // "close" (nothing to close) nor "entry" (not a Buy), so it was
+        // silently dropped from the round-trip ledger even though the
+        // portfolio itself opens a real short for it.
+        let open_positions: Vec<OpenPosition> = Vec::new();
+        assert!(matches!(classify_round_trip_action(false, &open_positions), RoundTripAction::OpenShort));
+    }
+
+    #[test]
+    fn classify_round_trip_action_sell_closes_open_long() {
+        let open_positions = vec![mk_open_position("long")];
+        assert!(matches!(classify_round_trip_action(false, &open_positions), RoundTripAction::Close));
+    }
+
+    #[test]
+    fn classify_round_trip_action_buy_covers_open_short() {
+        // The other half of the bug: a Buy meant to cover an open short
+        // used to be misread as opening a brand-new "long".
+        let open_positions = vec![mk_open_position("short")];
+        assert!(matches!(classify_round_trip_action(true, &open_positions), RoundTripAction::Close));
+    }
+
+    #[test]
+    fn classify_round_trip_action_buy_adds_to_open_long() {
+        let open_positions = vec![mk_open_position("long")];
+        assert!(matches!(classify_round_trip_action(true, &open_positions), RoundTripAction::OpenLong));
+    }
+
+    #[test]
+    fn classify_round_trip_action_sell_adds_to_open_short() {
+        let open_positions = vec![mk_open_position("short")];
+        assert!(matches!(classify_round_trip_action(false, &open_positions), RoundTripAction::OpenShort));
     }
 
     // ---- Options signal routing: to_directional_signal / extract_instrument ----
