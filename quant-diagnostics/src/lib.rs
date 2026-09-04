@@ -17,6 +17,7 @@ pub mod linalg;
 pub mod johansen;
 pub mod spread;
 pub mod vrp;
+pub mod portfolio_weights;
 
 pub use variance_ratio::{variance_ratio as compute_variance_ratio, VrResult};
 pub use ic::{compute_ic, IcResult};
@@ -35,3 +36,6 @@ pub use cointegration::{
 };
 pub use johansen::{johansen_test, normalize_cointegrating_vector, JohansenResult};
 pub use spread::corwin_schultz_spread;
+pub use portfolio_weights::{
+    cap_turnover, min_variance_weights, sample_covariance, shrink_toward_constant_correlation,
+};
