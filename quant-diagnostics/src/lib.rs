@@ -16,11 +16,13 @@ pub mod cointegration;
 pub mod linalg;
 pub mod johansen;
 pub mod spread;
+pub mod vrp;
 
 pub use variance_ratio::{variance_ratio as compute_variance_ratio, VrResult};
 pub use ic::{compute_ic, IcResult};
 pub use quantile::{quantile_analysis, QuantileBucket};
-pub use volatility_regime::{volatility_tercile_regimes, VolatilityRegime};
+pub use volatility_regime::{rolling_volatility, volatility_tercile_regimes, VolatilityRegime};
+pub use vrp::{vrp_significance, VrpResult};
 pub use seasonality::{seasonality_by_bucket, SeasonalityBucket};
 pub use multiple_testing::benjamini_hochberg;
 pub use cross_sectional::{
