@@ -53,8 +53,9 @@ pub struct WorkerConfig {
     pub backtest_config: serde_json::Value,
     /// Serialised `ExchangeFeeConfig`
     pub fee_config: Option<serde_json::Value>,
-    /// Supplementary data (key → value)
-    pub supplementary_data: std::collections::HashMap<String, f64>,
+    /// User-uploaded alt-data series (key → sorted `(timestamp_ms, value)` points).
+    /// See `backtest::python_simulation::PythonSimConfig::supplementary_data`.
+    pub supplementary_data: std::collections::HashMap<String, Vec<(i64, f64)>>,
     /// Fitness weights
     pub fitness_weights: serde_json::Value,
     /// Initial capital

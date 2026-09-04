@@ -59,6 +59,28 @@ fn tardis_to_orderbook(snap: &BookSnapshot) -> OrderbookSnapshot {
     OrderbookSnapshot { bids, asks, spread, mid_price, bid_depth, ask_depth, imbalance }
 }
 
+/// Binary-search a pre-sorted `(timestamp_ms, value)` series for the value
+/// observable as-of the given tick timestamp: the last entry at-or-before it.
+///
+/// Unlike `find_nearest_snapshot` below, this deliberately returns `None`
+/// (not the earliest entry) when every entry is still in the future relative
+/// to `timestamp` -- an orderbook snapshot approximates market microstructure
+/// and a same-day fallback is harmless, but a user-supplied alt-data series
+/// (e.g. insider-buying intensity) is a candidate alpha signal, and silently
+/// exposing tomorrow's value on today's tick would be real lookahead bias.
+pub(crate) fn find_asof_value(series: &[(i64, f64)], timestamp: &chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    if series.is_empty() {
+        return None;
+    }
+    let tick_ms = timestamp.timestamp_millis();
+    let idx = series.partition_point(|(ts, _)| *ts <= tick_ms);
+    if idx == 0 {
+        None
+    } else {
+        Some(series[idx - 1].1)
+    }
+}
+
 /// Binary-search the pre-sorted snapshots for the entry whose `timestamp_us`
 /// is closest to (but not after) the given tick timestamp.
 pub(crate) fn find_nearest_snapshot(
@@ -103,8 +125,12 @@ pub struct PythonSimConfig {
     pub backtest_config: BacktestConfig,
     /// Optional exchange fee config for maker/taker fee lookup.
     pub fee_config: Option<ExchangeFeeConfig>,
-    /// Optional user-supplied supplementary data (key → value per tick).
-    pub supplementary_data: HashMap<String, f64>,
+    /// Optional user-uploaded alt-data series: key (e.g. filename stem) →
+    /// `(timestamp_ms, value)` points, sorted ascending by timestamp.
+    /// Looked up per tick via `find_asof_value` (last value at-or-before the
+    /// tick's own timestamp -- never a future value), so a key is simply
+    /// absent from `StrategyContext.custom_data` before its series starts.
+    pub supplementary_data: HashMap<String, Vec<(i64, f64)>>,
     /// Optional pre-parsed parameters to pass to the strategy.
     pub parameters: HashMap<String, ParameterValue>,
     /// Optional progress callback: receives (current_tick, total_ticks).
@@ -730,8 +756,10 @@ async fn run_with_input(
         // BEFORE building StrategyContext, so on_tick avoids cloning ~48 KB of
         // price/volume history.
         custom_data_buf.clear();
-        for (k, v) in &supplementary_data {
-            custom_data_buf.insert(k.clone(), *v);
+        for (k, series) in &supplementary_data {
+            if let Some(v) = find_asof_value(series, &timestamp) {
+                custom_data_buf.insert(k.clone(), v);
+            }
         }
         executor.pre_enrich(data, &mut custom_data_buf);
         
@@ -2879,6 +2907,36 @@ mod tests {
             mfe: None,
             legs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn find_asof_value_returns_last_value_at_or_before_tick() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0), (3_000, 30.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        assert_eq!(find_asof_value(&series, &ts(2_500)), Some(20.0));
+        assert_eq!(find_asof_value(&series, &ts(2_000)), Some(20.0)); // exact match is at-or-before
+    }
+
+    #[test]
+    fn find_asof_value_never_returns_a_future_value() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        // Every point is still in the future relative to this tick -- must be
+        // None, not the earliest point (that would be lookahead bias).
+        assert_eq!(find_asof_value(&series, &ts(500)), None);
+    }
+
+    #[test]
+    fn find_asof_value_empty_series_is_none() {
+        let ts = chrono::Utc::now();
+        assert_eq!(find_asof_value(&[], &ts), None);
+    }
+
+    #[test]
+    fn find_asof_value_after_last_point_returns_last_value() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        assert_eq!(find_asof_value(&series, &ts(999_999)), Some(20.0));
     }
 
     #[test]
