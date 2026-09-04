@@ -785,8 +785,10 @@ pub struct ValidationConfig {
     pub backtest_config: BacktestConfig,
     /// Exchange fee config.
     pub fee_config: Option<ExchangeFeeConfig>,
-    /// Supplementary data.
-    pub supplementary_data: HashMap<String, f64>,
+    /// User-uploaded alt-data series: key → `(timestamp_ms, value)` points,
+    /// sorted ascending. See `python_simulation::PythonSimConfig::supplementary_data`
+    /// for the point-in-time lookup contract -- this is passed straight through.
+    pub supplementary_data: HashMap<String, Vec<(i64, f64)>>,
     /// Strategy parameters.
     pub parameters: HashMap<String, ParameterValue>,
     /// Number of walk-forward windows (0 = auto, default ~8).
