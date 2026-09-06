@@ -737,7 +737,14 @@ impl CandleSimulator {
             total_pnl,
             num_trades,
             win_rate,
-            max_drawdown: max_drawdown * self.initial_capital,
+            // `max_drawdown` is a fraction (e.g. 0.15 = 15%), matching every
+            // other engine path -- see python_simulation.rs's own
+            // compute_max_drawdown doc comment. Bug fixed 2026-09-06: this
+            // used to multiply by `self.initial_capital`, turning the
+            // fraction back into a dollar figure and silently breaking every
+            // downstream consumer (Calmar ratio, risk gates, UI %) that
+            // expects [0,1].
+            max_drawdown,
             sharpe_ratio,
             profit_factor,
             trade_returns,
@@ -923,6 +930,24 @@ mod tests {
         let result = sim.run(&signals, &candles, None, None, 1.0, None);
         assert_eq!(result.num_trades, 1);
         assert!(result.total_pnl > 0.0);
+    }
+
+    #[test]
+    fn max_drawdown_is_a_fraction_not_a_dollar_amount() {
+        // Regression test for a 2026-09-06 bug: max_drawdown used to be
+        // multiplied by `self.initial_capital`, turning the [0,1] fraction
+        // into a dollar figure. A large adverse move while holding a full-size
+        // position should still report a drawdown no greater than 1.0.
+        let sim = flat_sim(10000.0, 0.0, 0.0);
+        let candles = make_candles(&[100.0, 50.0, 60.0, 60.0]);
+        let signals = vec![SIGNAL_BUY, SIGNAL_HOLD, SIGNAL_HOLD, SIGNAL_CLOSE];
+        let result = sim.run(&signals, &candles, None, None, 1.0, None);
+        assert!(result.max_drawdown > 0.0, "expected a real drawdown from the 50% adverse move");
+        assert!(
+            result.max_drawdown <= 1.0,
+            "max_drawdown must be a [0,1] fraction, got {} (looks dollar-scaled)",
+            result.max_drawdown
+        );
     }
 
     #[test]
