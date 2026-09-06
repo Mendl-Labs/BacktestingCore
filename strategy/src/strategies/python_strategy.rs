@@ -483,9 +483,29 @@ pub struct PythonStrategy {
     /// Cached numpy int64 dtype object (for timestamp arrays)
     cached_np_int64: Option<PyObject>,
     /// Whether the user's `compute_signals` accepts the optional OHLC arrays
-    /// (opens/highs/lows). Detected once at initialization via signature
-    /// inspection. When false the engine skips building/passing those arrays.
+    /// (opens/highs/lows) AT ALL -- true if it declares ANY ONE of the three,
+    /// or takes `**kwargs`. Detected once at initialization via signature
+    /// inspection. When false the engine skips building/passing those arrays
+    /// entirely (and callers like `python_simulation.rs` use this to decide
+    /// whether the whole run even needs OHLC data loaded). Deliberately an
+    /// any-of check, NOT "declares all three" -- kept coarse on purpose since
+    /// the data-loading decision doesn't care which specific arrays a
+    /// strategy wants, only whether it wants any of them.
     compute_signals_accepts_ohlc: bool,
+    /// Per-parameter refinement of the above, used ONLY for building the
+    /// actual `compute_signals` call's kwargs (never exposed via the
+    /// `compute_signals_accepts_ohlc()` trait method). Fixes a real bug
+    /// (confirmed live, 2026-09-02, harvesting-skill eval): the old code
+    /// passed ALL THREE of opens/highs/lows as keyword arguments whenever
+    /// `compute_signals_accepts_ohlc` was true, but a strategy declaring
+    /// only ONE of them (e.g. `highs` alone, for an ATR calculation) has no
+    /// `opens`/`lows` parameter to receive the other two -- `TypeError:
+    /// got an unexpected keyword argument 'opens'`, even though the file is
+    /// otherwise entirely valid. Each flag is `named_X || has_varkw`, so a
+    /// `**kwargs`-taking strategy still receives all three as before.
+    compute_signals_wants_opens: bool,
+    compute_signals_wants_highs: bool,
+    compute_signals_wants_lows: bool,
     /// Cross-exchange strategy support (2026-07-22): whether the user's
     /// Python class defines `compute_signals_multi_venue`. Detected once at
     /// initialization (a simple `hasattr` check — no signature introspection
@@ -567,6 +587,9 @@ impl PythonStrategy {
             cached_np_float64: None,
             cached_np_int64: None,
             compute_signals_accepts_ohlc: false,
+            compute_signals_wants_opens: false,
+            compute_signals_wants_highs: false,
+            compute_signals_wants_lows: false,
             accepts_multi_venue: false,
             accepts_position_sizes: false,
             defines_generate_signals: false,
@@ -1835,13 +1858,15 @@ impl Strategy for PythonStrategy {
             }
 
             // Detect whether the user's compute_signals accepts the optional OHLC
-            // arrays (opens/highs/lows). We read the function's __code__ directly
-            // rather than importing `inspect` (keeps us off the sandbox import path).
-            // OHLC is passed as keyword args, so we accept when: a param is named
-            // opens/highs/lows, OR the function takes **kwargs.
-            self.compute_signals_accepts_ohlc = {
+            // arrays (opens/highs/lows), and WHICH of the three specifically --
+            // see compute_signals_wants_{opens,highs,lows}'s doc comment for the
+            // real bug this per-parameter granularity fixes (declaring only one
+            // of the three used to crash with a TypeError on the other two).
+            // We read the function's __code__ directly rather than importing
+            // `inspect` (keeps us off the sandbox import path).
+            {
                 let strat = py_obj.bind(py);
-                strat
+                let (named_opens, named_highs, named_lows, has_varkw) = strat
                     .getattr("compute_signals")
                     .and_then(|m| m.getattr("__code__"))
                     .map(|code| {
@@ -1866,13 +1891,23 @@ impl Strategy for PythonStrategy {
                         // Only the first (argcount + kwonly) entries are parameters;
                         // the rest are local variables and must be ignored.
                         let nparams = (argcount + kwonly).min(names.len());
-                        let named_ohlc = names[..nparams]
-                            .iter()
-                            .any(|n| n == "opens" || n == "highs" || n == "lows");
-                        named_ohlc || has_varkw
+                        let params = &names[..nparams];
+                        (
+                            params.iter().any(|n| n == "opens"),
+                            params.iter().any(|n| n == "highs"),
+                            params.iter().any(|n| n == "lows"),
+                            has_varkw,
+                        )
                     })
-                    .unwrap_or(false)
-            };
+                    .unwrap_or((false, false, false, false));
+                self.compute_signals_wants_opens = named_opens || has_varkw;
+                self.compute_signals_wants_highs = named_highs || has_varkw;
+                self.compute_signals_wants_lows = named_lows || has_varkw;
+                self.compute_signals_accepts_ohlc =
+                    self.compute_signals_wants_opens
+                        || self.compute_signals_wants_highs
+                        || self.compute_signals_wants_lows;
+            }
 
             // Cross-exchange strategy support (2026-07-22): does the user's
             // class define compute_signals_multi_venue at all? Simple
@@ -2311,21 +2346,31 @@ _thread.start_new_thread(_persistent_watchdog, ())
 
             // Single Python call for all N ticks ─────────────────────────────
             // When the strategy opted into OHLC, pass opens/highs/lows as keyword
-            // arguments (works for both explicit params and **kwargs forms).
+            // arguments -- but ONLY the specific ones it actually declared (or
+            // all three for a **kwargs form). Passing all three unconditionally
+            // whenever ANY was detected used to crash with a TypeError on any
+            // strategy declaring, say, only `highs` -- confirmed live,
+            // 2026-09-02, harvesting-skill eval.
             let call_result = if pass_ohlc {
-                let opens_arr = build_f64_array(&opens_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("opens array build error: {}", e))
-                })?;
-                let highs_arr = build_f64_array(&highs_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("highs array build error: {}", e))
-                })?;
-                let lows_arr = build_f64_array(&lows_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("lows array build error: {}", e))
-                })?;
                 let kwargs = pyo3::types::PyDict::new_bound(py);
-                let _ = kwargs.set_item("opens", opens_arr);
-                let _ = kwargs.set_item("highs", highs_arr);
-                let _ = kwargs.set_item("lows", lows_arr);
+                if self.compute_signals_wants_opens {
+                    let opens_arr = build_f64_array(&opens_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("opens array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("opens", opens_arr);
+                }
+                if self.compute_signals_wants_highs {
+                    let highs_arr = build_f64_array(&highs_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("highs array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("highs", highs_arr);
+                }
+                if self.compute_signals_wants_lows {
+                    let lows_arr = build_f64_array(&lows_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("lows array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("lows", lows_arr);
+                }
                 strategy.call_method(
                     "compute_signals",
                     (prices_arr, volumes_arr, timestamps_arr),
@@ -3323,6 +3368,56 @@ class Strategy(BaseStrategy):
             Err(e) if e.contains("Python") || e.contains("interpreter") => {}
             Err(e) => panic!("OHLC signature should validate, got: {}", e),
         }
+    }
+
+    /// Real bug, confirmed live (2026-09-02, harvesting-skill eval): a
+    /// `compute_signals` declaring only ONE of opens/highs/lows (not all
+    /// three together) used to crash with `TypeError: got an unexpected
+    /// keyword argument 'opens'` -- the old detection logic treated ANY ONE
+    /// of the three as "opted into OHLC" and then unconditionally passed
+    /// ALL THREE as keyword arguments, including ones the function never
+    /// declared. `validate_source` (a syntax-only check) never caught this
+    /// because the file IS syntactically valid Python -- only a real
+    /// `compute_all_signals` call exercises the actual dispatch path.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_accepts_a_partial_ohlc_signature() {
+        use crate::Strategy;
+
+        const HIGHS_ONLY_STRATEGY: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "HighsOnlyAtr"
+
+    def compute_signals(self, prices, volumes, timestamps, highs=None):
+        sig = np.zeros(len(prices), dtype=np.int8)
+        if highs is not None and len(highs) > 0:
+            sig[highs > 100] = 1
+        return sig
+"#;
+
+        let mut strategy = PythonStrategy::new(HIGHS_ONLY_STRATEGY.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+
+        let result = strategy
+            .compute_all_signals(
+                &[1.0; 10],
+                &[1.0; 10],
+                &[0i64; 10],
+                &[0.0; 10],   // opens -- present in the call, NOT declared by the strategy
+                &[150.0; 10], // highs -- declared, should reach the strategy
+                &[0.0; 10],   // lows -- present in the call, NOT declared by the strategy
+            )
+            .await;
+
+        let signals = result
+            .expect("compute_all_signals must not error just because the strategy only declared `highs`, not all three of opens/highs/lows")
+            .expect("compute_signals is implemented -- should return Some(signals)");
+        assert_eq!(signals.len(), 10);
+        assert_eq!(&signals[..], &[1; 10], "highs=150 > 100 for every tick, so every signal should be BUY");
     }
 
     #[test]
