@@ -16,7 +16,7 @@ use config::{BacktestConfig, ExchangeFeeConfig, ParameterValue};
 use dataloader::MarketData;
 use derivatives::DerivativeMetadata;
 use orderbook::{BookSide, Fill, LiquidityType};
-use portfoliomanager::PortfolioState;
+use portfoliomanager::{PortfolioState, PositionSide, FillOutcome};
 use signal::{Signal, SignalStrength, SignalReason, SignalType, SpreadLeg};
 use strategy::traits::{
     MarketSession, PricePoint, PriceSource, SessionType, StrategyContext, VolumePoint,
@@ -408,7 +408,7 @@ async fn run_with_input(
     let mut trade_returns: Vec<f64> = Vec::new();
     let mut trade_maes: Vec<f64> = Vec::new();
     let mut trade_log: Vec<TradeRecord> = Vec::new();
-    let mut open_positions: Vec<OpenPosition> = Vec::new();
+    let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
     let mut next_trade_id: usize = 1;
     let max_trade_log_size = config.max_trade_log_size;
     let mut total_commission = 0.0_f64;
@@ -689,18 +689,21 @@ async fn run_with_input(
         last_price = current_price;
         price_series.push(current_price);
 
-        // Update MAE/MFE for all open positions
-        for pos in &mut open_positions {
-            let unrealized = if pos.side == "long" {
-                (current_price - pos.entry_fill_price) / pos.entry_fill_price
-            } else {
-                (pos.entry_fill_price - current_price) / pos.entry_fill_price
-            };
-            if unrealized < pos.worst_unrealized {
-                pos.worst_unrealized = unrealized;
-            }
-            if unrealized > pos.best_unrealized {
-                pos.best_unrealized = unrealized;
+        // Update MAE/MFE for all open positions, reading side/entry price
+        // from the portfolio's own real ledger (correct for shorts) rather
+        // than the old shadow ledger.
+        for position in portfolio.positions.iter().filter(|p| p.close_time.is_none()) {
+            if let Some(meta) = open_lot_meta.get_mut(&(position.symbol.clone(), position.side)) {
+                let unrealized = match position.side {
+                    PositionSide::Long => (current_price - position.entry_price) / position.entry_price,
+                    PositionSide::Short => (position.entry_price - current_price) / position.entry_price,
+                };
+                if unrealized < meta.worst_unrealized {
+                    meta.worst_unrealized = unrealized;
+                }
+                if unrealized > meta.best_unrealized {
+                    meta.best_unrealized = unrealized;
+                }
             }
         }
 
@@ -715,7 +718,7 @@ async fn run_with_input(
             &mut trade_returns,
             &mut trade_maes,
             &mut trade_log,
-            &mut open_positions,
+            &mut open_lot_meta,
             &mut next_trade_id,
             max_trade_log_size,
             timestamp,
@@ -981,7 +984,7 @@ async fn run_with_input(
                         &mut trade_returns,
                         &mut trade_maes,
                         &mut trade_log,
-                        &mut open_positions,
+                        &mut open_lot_meta,
                         max_trade_log_size,
                         timestamp,
                         slippage_bps,
@@ -1176,7 +1179,7 @@ async fn run_with_input(
                             &mut trade_returns,
                             &mut trade_maes,
                             &mut trade_log,
-                            &mut open_positions,
+                            &mut open_lot_meta,
                             &mut next_trade_id,
                             max_trade_log_size,
                             timestamp,
@@ -1283,7 +1286,7 @@ async fn run_with_input(
                                 &mut trade_returns,
                                 &mut trade_maes,
                                 &mut trade_log,
-                                &mut open_positions,
+                                &mut open_lot_meta,
                                 &mut next_trade_id,
                                 max_trade_log_size,
                                 timestamp,
@@ -1307,7 +1310,7 @@ async fn run_with_input(
                         &mut trade_returns,
                         &mut trade_maes,
                         &mut trade_log,
-                        &mut open_positions,
+                        &mut open_lot_meta,
                         max_trade_log_size,
                         timestamp,
                         slippage_bps,
@@ -1346,7 +1349,7 @@ async fn run_with_input(
                             &mut trade_returns,
                             &mut trade_maes,
                             &mut trade_log,
-                            &mut open_positions,
+                            &mut open_lot_meta,
                             &mut next_trade_id,
                             max_trade_log_size,
                             timestamp,
@@ -1452,7 +1455,7 @@ async fn run_with_input(
                 &mut trade_returns,
                 &mut trade_maes,
                 &mut trade_log,
-                &mut open_positions,
+                &mut open_lot_meta,
                 &mut dummy_id,
                 max_trade_log_size,
                 timestamp,
@@ -1484,45 +1487,11 @@ async fn run_with_input(
     let final_equity = equity_curve.last().copied().unwrap_or(initial_capital);
     let total_pnl = final_equity - initial_capital;
 
-    // Close out remaining open positions as "still open" trade records
-    for pos in open_positions.drain(..) {
-        let should_log = match max_trade_log_size {
-            Some(max) => trade_log.len() < max,
-            None => true,
-        };
-        if should_log {
-            // Compute unrealized P&L at final price
-            let unrealized_pnl = if pos.side == "long" {
-                (last_price - pos.entry_fill_price) * pos.quantity - pos.entry_commission
-            } else {
-                (pos.entry_fill_price - last_price) * pos.quantity - pos.entry_commission
-            };
-            let unrealized_pct = unrealized_pnl / (pos.entry_fill_price * pos.quantity);
-            trade_log.push(TradeRecord {
-                trade_id: pos.trade_id,
-                side: pos.side,
-                entry_signal_price: pos.entry_signal_price,
-                entry_fill_price: pos.entry_fill_price,
-                exit_signal_price: None,
-                exit_fill_price: None,
-                quantity: pos.quantity,
-                pnl: Some(unrealized_pnl),
-                pnl_pct: Some(unrealized_pct),
-                commission: pos.entry_commission,
-                slippage_cost: pos.entry_slippage,
-                entry_time: pos.entry_time,
-                exit_time: None,
-                duration_secs: None,
-                entry_liquidity: pos.entry_liquidity,
-                exit_liquidity: None,
-                entry_reason: pos.entry_reason,
-                exit_reason: None,
-                mae: Some(pos.worst_unrealized),
-                mfe: Some(pos.best_unrealized),
-                legs: Vec::new(),
-            });
-        }
-    }
+    // Close out remaining open positions as "still open" trade records,
+    // sourced from the portfolio's own real ledger (correct side/entry
+    // price/quantity/mark-to-market unrealized P&L) instead of the old
+    // shadow ledger, which hardcoded every position's side as "long".
+    flush_open_positions_to_trade_log(&portfolio, &open_lot_meta, &mut trade_log, max_trade_log_size);
 
     log_info!(BACKTEST_LOGGER, "Python directional simulation complete: {} trades, PnL=${:.2}, equity=${:.2}", num_trades, total_pnl, final_equity);
     log_info!(BACKTEST_LOGGER, "Signal Summary ({} ticks): Buy={} Sell={} Close={} Hold={} ZeroQty={} Errors={} Trades={}", total_ticks, diag_buy_signals, diag_sell_signals, diag_close_signals, diag_hold_signals, diag_zero_qty_skips, diag_error_ticks, num_trades);
@@ -1629,16 +1598,25 @@ struct PendingLimit {
     instrument: Option<DerivativeMetadata>,
 }
 
-/// An open position being tracked for round-trip trade log.
-struct OpenPosition {
+/// Diagnostic/cosmetic metadata tracked per currently-open (symbol, side)
+/// position. Used only to enrich `TradeRecord`'s display fields (entry
+/// signal price, cumulative slippage/commission not yet attributed to a
+/// closed trade, MAE/MFE, entry reason/liquidity, trade_id). Deliberately
+/// carries NOTHING that participates in P&L: entry price, executed
+/// quantity, and realized P&L all come straight from `PortfolioState` via
+/// `FillOutcome`/`Position`, so this table drifting can never reproduce the
+/// old shadow-ledger P&L bug (2026-09-06: a real backtest's old, separate
+/// `OpenPosition` shadow ledger summed to +$23,066.88 in trade_log.pnl while
+/// the real portfolio-driven equity never exceeded $16,759 out of $10,000
+/// starting capital) -- at worst a cosmetic field goes stale.
+struct EntryMetadata {
     trade_id: usize,
-    side: String,
     entry_signal_price: f64,
-    entry_fill_price: f64,
-    quantity: f64,
+    /// Entry commission/slippage not yet attributed to a closed trade --
+    /// decremented proportionally as partial exits consume it, so a
+    /// multi-step exit's `TradeRecord`s sum to the lot's true total.
     entry_commission: f64,
     entry_slippage: f64,
-    entry_time: DateTime<Utc>,
     entry_liquidity: String,
     entry_reason: String,
     /// Tracks worst unrealized loss during this position (fraction).
@@ -1989,7 +1967,7 @@ fn execute_taker_fill(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     next_trade_id: &mut usize,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
@@ -2039,22 +2017,22 @@ fn execute_taker_fill(
     // `apply_derivative_fill` (multiplier-aware, correctly opens/covers a
     // short rather than assuming every Ask-side fill closes a long) instead
     // of the plain spot path.
-    let executed_qty = match instrument {
-        Some(instr) => portfolio.apply_derivative_fill(&fill, instr),
-        None => portfolio.apply_fills_executed(&[fill]),
+    let outcome = match instrument {
+        Some(instr) => portfolio.apply_derivative_fill_with_outcome(&fill, instr),
+        None => portfolio.apply_fill_executed_with_outcome(&fill),
     };
-    let executed_qty = match executed_qty {
-        Ok(q) => q,
+    let outcome = match outcome {
+        Ok(o) => o,
         Err(e) => {
             log_warn!(BACKTEST_LOGGER, "Taker fill error: {}", e);
-            0.0
+            return;
         }
     };
-    if executed_qty < 1e-10 {
+    if outcome.executed_quantity < 1e-10 {
         // Nothing executed — no trade, no fees.
         return;
     }
-    let fill_qty = executed_qty;
+    let fill_qty = outcome.executed_quantity;
 
     let fill_value = adjusted_price * fill_qty;
     let is_buy = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
@@ -2077,17 +2055,15 @@ fn execute_taker_fill(
     };
     trade_returns.push(pnl_pct);
 
-    let is_entry = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
-    let is_exit = matches!(signal_type, SignalType::Sell | SignalType::ScaleOut);
-
-    // MAE: for exits, convert the round-trip's fractional MAE to dollars;
-    // for entries, no completed trade yet → 0.
-    let mae_dollars = if is_exit && !open_positions.is_empty() {
-        let pos = &open_positions[open_positions.len() - 1];
-        pos.worst_unrealized.abs() * pos.entry_fill_price * pos.quantity
-    } else {
-        0.0
-    };
+    // MAE: for a fill that closes/reduces a position, convert the round-trip's
+    // fractional MAE to dollars; for an entry/scale-in, no completed trade
+    // yet → 0. Driven by `outcome.closed_side` -- the portfolio's own real
+    // classification -- not a signal-direction guess, which fixes shorts
+    // being silently dropped/misclassified by the old shadow ledger.
+    let mae_dollars = outcome.closed_side
+        .and_then(|side| open_lot_meta.get(&(outcome.symbol.clone(), side)))
+        .map(|meta| meta.worst_unrealized.abs() * outcome.closed_entry_price.unwrap_or(0.0) * fill_qty)
+        .unwrap_or(0.0);
     trade_maes.push(mae_dollars);
     let slippage_cost = (adjusted_price - fill_price).abs() * fill_qty;
 
@@ -2096,65 +2072,151 @@ fn execute_taker_fill(
         None => true,
     };
 
-    if is_exit && !open_positions.is_empty() {
-        // Close the oldest matching open position (FIFO)
-        if let Some(pos) = open_positions.pop() {
-            if should_log {
-                let exit_slippage = slippage_cost;
-                let raw_pnl = if pos.side == "long" {
-                    (adjusted_price - pos.entry_fill_price) * pos.quantity
-                } else {
-                    (pos.entry_fill_price - adjusted_price) * pos.quantity
-                };
-                let total_comm = pos.entry_commission + commission;
-                let net_pnl = raw_pnl - total_comm;
-                let net_pnl_pct = net_pnl / (pos.entry_fill_price * pos.quantity);
-                let duration = (timestamp - pos.entry_time).num_seconds();
+    if let Some(closed_side) = outcome.closed_side {
+        // This fill closed or partially closed an existing position --
+        // build the TradeRecord from the portfolio's own real entry price,
+        // real executed quantity, and real realized P&L (never a caller-side
+        // guess), pro-rating the metadata map's remaining entry commission/
+        // slippage by the fraction of the lot this fill actually closed so a
+        // multi-step exit's records sum to the lot's true total.
+        let key = (outcome.symbol.clone(), closed_side);
+        let closed_entry_price = outcome.closed_entry_price.unwrap_or(adjusted_price);
+        let closed_open_time = outcome.closed_open_time.unwrap_or(timestamp);
+        let realized_pnl = outcome.realized_pnl.unwrap_or(0.0);
 
-                trade_log.push(TradeRecord {
-                    trade_id: pos.trade_id,
-                    side: pos.side,
-                    entry_signal_price: pos.entry_signal_price,
-                    entry_fill_price: pos.entry_fill_price,
-                    exit_signal_price: Some(fill_price),
-                    exit_fill_price: Some(adjusted_price),
-                    quantity: pos.quantity,
-                    pnl: Some(net_pnl),
-                    pnl_pct: Some(net_pnl_pct),
-                    commission: total_comm,
-                    slippage_cost: pos.entry_slippage + exit_slippage,
-                    entry_time: pos.entry_time,
-                    exit_time: Some(timestamp),
-                    duration_secs: Some(duration),
-                    entry_liquidity: pos.entry_liquidity,
-                    exit_liquidity: Some("taker".to_string()),
-                    entry_reason: pos.entry_reason,
-                    exit_reason: Some(signal_reason.to_string()),
-                    mae: Some(pos.worst_unrealized),
-                    mfe: Some(pos.best_unrealized),
-                    legs: Vec::new(),
+        if should_log {
+            let side_str = match closed_side { PositionSide::Long => "long", PositionSide::Short => "short" };
+            let qty_before = outcome.remaining_open_quantity + fill_qty;
+            let frac = if qty_before > 0.0 { (fill_qty / qty_before).min(1.0) } else { 1.0 };
+            let (attributed_commission, attributed_slippage, entry_signal_price, entry_liquidity, entry_reason, trade_id, worst_unrealized, best_unrealized) =
+                if let Some(meta) = open_lot_meta.get_mut(&key) {
+                    let ec = meta.entry_commission * frac;
+                    let es = meta.entry_slippage * frac;
+                    meta.entry_commission -= ec;
+                    meta.entry_slippage -= es;
+                    (ec, es, meta.entry_signal_price, meta.entry_liquidity.clone(), meta.entry_reason.clone(), meta.trade_id, meta.worst_unrealized, meta.best_unrealized)
+                } else {
+                    (0.0, 0.0, closed_entry_price, "unknown".to_string(), "unknown".to_string(), 0, 0.0, 0.0)
+                };
+            let total_comm = attributed_commission + commission;
+            let net_pnl = realized_pnl - total_comm;
+            let denom = closed_entry_price * fill_qty;
+            let net_pnl_pct = if denom != 0.0 { net_pnl / denom } else { 0.0 };
+            let duration = (timestamp - closed_open_time).num_seconds();
+
+            trade_log.push(TradeRecord {
+                trade_id,
+                side: side_str.to_string(),
+                entry_signal_price,
+                entry_fill_price: closed_entry_price,
+                exit_signal_price: Some(fill_price),
+                exit_fill_price: Some(adjusted_price),
+                quantity: fill_qty,
+                pnl: Some(net_pnl),
+                pnl_pct: Some(net_pnl_pct),
+                commission: total_comm,
+                slippage_cost: attributed_slippage + slippage_cost,
+                entry_time: closed_open_time,
+                exit_time: Some(timestamp),
+                duration_secs: Some(duration),
+                entry_liquidity,
+                exit_liquidity: Some("taker".to_string()),
+                entry_reason,
+                exit_reason: Some(signal_reason.to_string()),
+                mae: Some(worst_unrealized),
+                mfe: Some(best_unrealized),
+                legs: Vec::new(),
+            });
+        }
+        if outcome.position_fully_closed {
+            open_lot_meta.remove(&key);
+        }
+    } else {
+        // This fill opened a new position or scaled into an existing one.
+        // Side comes from the ACTUAL book side the fill executed on (what
+        // the portfolio itself used to decide open-vs-close), not the
+        // signal's Buy/Sell label -- a flat account issuing a Sell opens a
+        // real short here, rather than being silently dropped.
+        let opened_side = if fill.side == BookSide::Bid { PositionSide::Long } else { PositionSide::Short };
+        let key = (outcome.symbol.clone(), opened_side);
+        match open_lot_meta.get_mut(&key) {
+            Some(meta) => {
+                meta.entry_commission += commission;
+                meta.entry_slippage += slippage_cost;
+            }
+            None => {
+                open_lot_meta.insert(key, EntryMetadata {
+                    trade_id: *next_trade_id,
+                    entry_signal_price: fill_price,
+                    entry_commission: commission,
+                    entry_slippage: slippage_cost,
+                    entry_liquidity: "taker".to_string(),
+                    entry_reason: signal_reason.to_string(),
+                    worst_unrealized: 0.0,
+                    best_unrealized: 0.0,
                 });
+                *next_trade_id += 1;
             }
         }
-    } else if is_entry {
-        // Open a new position for round-trip tracking
-        open_positions.push(OpenPosition {
-            trade_id: *next_trade_id,
-            side: "long".to_string(),
-            entry_signal_price: fill_price,
-            entry_fill_price: adjusted_price,
-            quantity: fill_qty,
-            entry_commission: commission,
-            entry_slippage: slippage_cost,
-            entry_time: timestamp,
-            entry_liquidity: "taker".to_string(),
-            entry_reason: signal_reason.to_string(),
-            worst_unrealized: 0.0,
-            best_unrealized: 0.0,
-        });
-        *next_trade_id += 1;
     }
 }
+
+/// Build synthetic still-open `TradeRecord`s for every open position in
+/// `portfolio` at end-of-run, sourcing side/entry-price/quantity/unrealized
+/// P&L from the portfolio's own ledger (correct for shorts) instead of the
+/// old shadow `open_positions` vec (which hardcoded `side: "long"` at every
+/// push site). Extracted to its own function so it's unit-testable directly.
+fn flush_open_positions_to_trade_log(
+    portfolio: &PortfolioState,
+    open_lot_meta: &HashMap<(String, PositionSide), EntryMetadata>,
+    trade_log: &mut Vec<TradeRecord>,
+    max_trade_log_size: Option<usize>,
+) {
+    for position in portfolio.positions.iter().filter(|p| p.close_time.is_none()) {
+        let should_log = match max_trade_log_size {
+            Some(max) => trade_log.len() < max,
+            None => true,
+        };
+        if !should_log {
+            continue;
+        }
+        let side_str = match position.side { PositionSide::Long => "long", PositionSide::Short => "short" };
+        let meta = open_lot_meta.get(&(position.symbol.clone(), position.side));
+        let entry_commission = meta.map(|m| m.entry_commission).unwrap_or(0.0);
+        // position.unrealized_pnl is already correctly mark-to-market as of
+        // the last portfolio.update_unrealized_pnl(current_price) call in the
+        // main loop (real per-side formula) -- net out entry commission the
+        // same way a closed trade's net_pnl does, so this record participates
+        // correctly in the pnl-reconciliation invariant.
+        let unrealized_pnl = position.unrealized_pnl - entry_commission;
+        let denom = position.entry_price * position.quantity;
+        let unrealized_pct = if denom != 0.0 { unrealized_pnl / denom } else { 0.0 };
+        trade_log.push(TradeRecord {
+            trade_id: meta.map(|m| m.trade_id).unwrap_or(0),
+            side: side_str.to_string(),
+            entry_signal_price: meta.map(|m| m.entry_signal_price).unwrap_or(position.entry_price),
+            entry_fill_price: position.entry_price,
+            exit_signal_price: None,
+            exit_fill_price: None,
+            quantity: position.quantity,
+            pnl: Some(unrealized_pnl),
+            pnl_pct: Some(unrealized_pct),
+            commission: entry_commission,
+            slippage_cost: meta.map(|m| m.entry_slippage).unwrap_or(0.0),
+            entry_time: position.open_time,
+            exit_time: None,
+            duration_secs: None,
+            entry_liquidity: meta.map(|m| m.entry_liquidity.clone()).unwrap_or_else(|| "unknown".to_string()),
+            exit_liquidity: None,
+            entry_reason: meta.map(|m| m.entry_reason.clone()).unwrap_or_else(|| "unknown".to_string()),
+            exit_reason: None,
+            mae: Some(meta.map(|m| m.worst_unrealized).unwrap_or(0.0)),
+            mfe: Some(meta.map(|m| m.best_unrealized).unwrap_or(0.0)),
+            legs: Vec::new(),
+        });
+    }
+}
+
 fn fill_pending_limits(
     pending: &mut Vec<PendingLimit>,
     current_price: f64,
@@ -2165,7 +2227,7 @@ fn fill_pending_limits(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     next_trade_id: &mut usize,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
@@ -2240,20 +2302,20 @@ fn fill_pending_limits(
             // See `execute_taker_fill`'s matching comment: an order carrying
             // `instrument` came from a BuyOption/SellOption/etc. signal and
             // must go through `apply_derivative_fill`, not the plain spot path.
-            let executed_qty = match order.instrument.as_ref() {
-                Some(instr) => portfolio.apply_derivative_fill(&fill, instr),
-                None => portfolio.apply_fills_executed(&[fill]),
+            let outcome = match order.instrument.as_ref() {
+                Some(instr) => portfolio.apply_derivative_fill_with_outcome(&fill, instr),
+                None => portfolio.apply_fill_executed_with_outcome(&fill),
             };
-            let executed_qty = match executed_qty {
-                Ok(q) => q,
+            let outcome = match outcome {
+                Ok(o) => o,
                 Err(e) => {
                     log_warn!(BACKTEST_LOGGER, "Maker fill error: {}", e);
-                    0.0
+                    FillOutcome::zero(String::new())
                 }
             };
 
-            if executed_qty >= 1e-10 {
-                let exec_fill_qty = executed_qty;
+            if outcome.executed_quantity >= 1e-10 {
+                let exec_fill_qty = outcome.executed_quantity;
                 let is_buy = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
                 let commission = compute_commission(order.price, exec_fill_qty, is_buy, order.instrument.as_ref(), maker_fee);
                 *total_commission += commission;
@@ -2263,17 +2325,13 @@ fn fill_pending_limits(
 
                 trade_returns.push(0.0); // Actual P&L tracked via portfolio
 
-                // Round-trip tracking for maker fills
-                let is_entry = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
-                let is_exit = matches!(order.signal_type, SignalType::Sell | SignalType::ScaleOut);
-
-                // MAE for maker fills
-                let mae_dollars = if is_exit && !open_positions.is_empty() {
-                    let pos = &open_positions[open_positions.len() - 1];
-                    pos.worst_unrealized.abs() * pos.entry_fill_price * pos.quantity
-                } else {
-                    0.0
-                };
+                // MAE for maker fills -- driven by the portfolio's own real
+                // closed_side, not a signal-direction guess (see
+                // execute_taker_fill's matching comment).
+                let mae_dollars = outcome.closed_side
+                    .and_then(|side| open_lot_meta.get(&(outcome.symbol.clone(), side)))
+                    .map(|meta| meta.worst_unrealized.abs() * outcome.closed_entry_price.unwrap_or(0.0) * exec_fill_qty)
+                    .unwrap_or(0.0);
                 trade_maes.push(mae_dollars);
 
                 let should_log = match max_trade_log_size {
@@ -2281,60 +2339,80 @@ fn fill_pending_limits(
                     None => true,
                 };
 
-                if is_exit && !open_positions.is_empty() {
-                    if let Some(pos) = open_positions.pop() {
-                        if should_log {
-                            let raw_pnl = if pos.side == "long" {
-                                (order.price - pos.entry_fill_price) * pos.quantity
-                            } else {
-                                (pos.entry_fill_price - order.price) * pos.quantity
-                            };
-                            let total_comm = pos.entry_commission + commission;
-                            let net_pnl = raw_pnl - total_comm;
-                            let net_pnl_pct = net_pnl / (pos.entry_fill_price * pos.quantity);
-                            let duration = (timestamp - pos.entry_time).num_seconds();
+                if let Some(closed_side) = outcome.closed_side {
+                    let key = (outcome.symbol.clone(), closed_side);
+                    let closed_entry_price = outcome.closed_entry_price.unwrap_or(order.price);
+                    let closed_open_time = outcome.closed_open_time.unwrap_or(timestamp);
+                    let realized_pnl = outcome.realized_pnl.unwrap_or(0.0);
 
-                            trade_log.push(TradeRecord {
-                                trade_id: pos.trade_id,
-                                side: pos.side,
-                                entry_signal_price: pos.entry_signal_price,
-                                entry_fill_price: pos.entry_fill_price,
-                                exit_signal_price: Some(order.price),
-                                exit_fill_price: Some(order.price),
-                                quantity: pos.quantity,
-                                pnl: Some(net_pnl),
-                                pnl_pct: Some(net_pnl_pct),
-                                commission: total_comm,
-                                slippage_cost: pos.entry_slippage,
-                                entry_time: pos.entry_time,
-                                exit_time: Some(timestamp),
-                                duration_secs: Some(duration),
-                                entry_liquidity: pos.entry_liquidity,
-                                exit_liquidity: Some("maker".to_string()),
-                                entry_reason: pos.entry_reason,
-                                exit_reason: Some(order.reason.clone()),
-                                mae: Some(pos.worst_unrealized),
-                                mfe: Some(pos.best_unrealized),
-                                legs: Vec::new(),
+                    if should_log {
+                        let side_str = match closed_side { PositionSide::Long => "long", PositionSide::Short => "short" };
+                        let qty_before = outcome.remaining_open_quantity + exec_fill_qty;
+                        let frac = if qty_before > 0.0 { (exec_fill_qty / qty_before).min(1.0) } else { 1.0 };
+                        let (attributed_commission, attributed_slippage, entry_signal_price, entry_liquidity, entry_reason, trade_id, worst_unrealized, best_unrealized) =
+                            if let Some(meta) = open_lot_meta.get_mut(&key) {
+                                let ec = meta.entry_commission * frac;
+                                let es = meta.entry_slippage * frac;
+                                meta.entry_commission -= ec;
+                                meta.entry_slippage -= es;
+                                (ec, es, meta.entry_signal_price, meta.entry_liquidity.clone(), meta.entry_reason.clone(), meta.trade_id, meta.worst_unrealized, meta.best_unrealized)
+                            } else {
+                                (0.0, 0.0, closed_entry_price, "unknown".to_string(), "unknown".to_string(), 0, 0.0, 0.0)
+                            };
+                        let total_comm = attributed_commission + commission;
+                        let net_pnl = realized_pnl - total_comm;
+                        let denom = closed_entry_price * exec_fill_qty;
+                        let net_pnl_pct = if denom != 0.0 { net_pnl / denom } else { 0.0 };
+                        let duration = (timestamp - closed_open_time).num_seconds();
+
+                        trade_log.push(TradeRecord {
+                            trade_id,
+                            side: side_str.to_string(),
+                            entry_signal_price,
+                            entry_fill_price: closed_entry_price,
+                            exit_signal_price: Some(order.price),
+                            exit_fill_price: Some(order.price),
+                            quantity: exec_fill_qty,
+                            pnl: Some(net_pnl),
+                            pnl_pct: Some(net_pnl_pct),
+                            commission: total_comm,
+                            slippage_cost: attributed_slippage,
+                            entry_time: closed_open_time,
+                            exit_time: Some(timestamp),
+                            duration_secs: Some(duration),
+                            entry_liquidity,
+                            exit_liquidity: Some("maker".to_string()),
+                            entry_reason,
+                            exit_reason: Some(order.reason.clone()),
+                            mae: Some(worst_unrealized),
+                            mfe: Some(best_unrealized),
+                            legs: Vec::new(),
+                        });
+                    }
+                    if outcome.position_fully_closed {
+                        open_lot_meta.remove(&key);
+                    }
+                } else {
+                    let opened_side = if fill.side == BookSide::Bid { PositionSide::Long } else { PositionSide::Short };
+                    let key = (outcome.symbol.clone(), opened_side);
+                    match open_lot_meta.get_mut(&key) {
+                        Some(meta) => {
+                            meta.entry_commission += commission;
+                        }
+                        None => {
+                            open_lot_meta.insert(key, EntryMetadata {
+                                trade_id: *next_trade_id,
+                                entry_signal_price: order.price,
+                                entry_commission: commission,
+                                entry_slippage: 0.0,
+                                entry_liquidity: "maker".to_string(),
+                                entry_reason: order.reason.clone(),
+                                worst_unrealized: 0.0,
+                                best_unrealized: 0.0,
                             });
+                            *next_trade_id += 1;
                         }
                     }
-                } else if is_entry {
-                    open_positions.push(OpenPosition {
-                        trade_id: *next_trade_id,
-                        side: "long".to_string(),
-                        entry_signal_price: order.price,
-                        entry_fill_price: order.price,
-                        quantity: exec_fill_qty,
-                        entry_commission: commission,
-                        entry_slippage: 0.0,
-                        entry_time: order.placed_at,
-                        entry_liquidity: "maker".to_string(),
-                        entry_reason: order.reason.clone(),
-                        worst_unrealized: 0.0,
-                        best_unrealized: 0.0,
-                    });
-                    *next_trade_id += 1;
                 }
             }
             filled_count += 1;
@@ -2366,7 +2444,7 @@ fn close_all_positions(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
     slippage_bps: f64,
@@ -2400,7 +2478,7 @@ fn close_all_positions(
             trade_returns,
             trade_maes,
             trade_log,
-            open_positions,
+            open_lot_meta,
             &mut dummy_id,
             max_trade_log_size,
             timestamp,
@@ -2907,6 +2985,124 @@ mod tests {
             mfe: None,
             legs: Vec::new(),
         }
+    }
+
+    // ================================================================
+    // Regression tests for the 2026-09-06 shadow-ledger bug: python_simulation.rs
+    // used to maintain its OWN local `open_positions: Vec<OpenPosition>` ledger
+    // to build `trade_log`, completely independent of `PortfolioState`'s own
+    // authoritative ledger that actually drives `balance`/the equity curve.
+    // Confirmed in production: one real backtest's shadow-ledger trade_log
+    // summed to +$23,066.88 while the real portfolio-driven equity never
+    // exceeded $16,759 out of $10,000 starting capital. Fixed by deriving
+    // TradeRecords directly from PortfolioState's own FillOutcome/Position
+    // data instead of a parallel shadow ledger.
+    // ================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        portfolio: &mut PortfolioState,
+        total_commission: &mut f64,
+        num_trades: &mut usize,
+        trade_returns: &mut Vec<f64>,
+        trade_maes: &mut Vec<f64>,
+        trade_log: &mut Vec<TradeRecord>,
+        open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
+        next_trade_id: &mut usize,
+        signal: SignalType,
+        price: f64,
+        qty: f64,
+        timestamp: DateTime<Utc>,
+    ) {
+        execute_taker_fill(
+            &signal, price, qty, portfolio, total_commission, 0.001,
+            num_trades, trade_returns, trade_maes, trade_log,
+            open_lot_meta, next_trade_id, None, timestamp, 0.0, None, None,
+            "test", None,
+        );
+    }
+
+    #[test]
+    fn execute_taker_fill_trade_log_reconciles_with_equity_for_scale_in_partial_exit_and_short() {
+        let mut portfolio = PortfolioState::with_balance(10_000.0);
+        let mut total_commission = 0.0_f64;
+        let mut num_trades = 0usize;
+        let mut trade_returns = Vec::new();
+        let mut trade_maes = Vec::new();
+        let mut trade_log: Vec<TradeRecord> = Vec::new();
+        let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
+        let mut next_trade_id = 1usize;
+        let now = chrono::Utc::now();
+
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 100.0, 10.0, now);   // open long 10 @ 100
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 110.0, 5.0, now);    // scale-in: blended entry = 103.3333...
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 120.0, 6.0, now);   // partial exit: 6 of 15
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 90.0, 9.0, now);    // full exit of remainder: now flat
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 95.0, 4.0, now);    // flat -> opens a short
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 80.0, 4.0, now);     // covers the short: now flat
+
+        // Bug #1 regression: shorts must not be dropped/misclassified as longs.
+        let closed: Vec<_> = trade_log.iter().filter(|t| t.exit_time.is_some()).collect();
+        assert_eq!(closed.len(), 3, "expected 3 closed round-trip records, got {} records", closed.len());
+        assert_eq!(closed[0].side, "long");
+        assert_eq!(closed[1].side, "long");
+        assert_eq!(closed[2].side, "short");
+
+        // Bug #3 regression: partial exit must use the ACTUAL executed quantity,
+        // not the original scaled-in lot's full quantity.
+        assert!((closed[0].quantity - 6.0).abs() < 1e-6);
+        assert!((closed[1].quantity - 9.0).abs() < 1e-6);
+        assert!((closed[2].quantity - 4.0).abs() < 1e-6);
+
+        // Bug #2 regression: both long exits must be priced off the BLENDED
+        // (weighted-average) entry, not a discrete per-lot entry price.
+        let blended = (10.0 * 100.0 + 5.0 * 110.0) / 15.0;
+        assert!((closed[0].entry_fill_price - blended).abs() < 1e-6);
+        assert!((closed[1].entry_fill_price - blended).abs() < 1e-6);
+
+        // Both long-exit records share one trade_id (same round trip, split
+        // across 2 partial exits); the short is a distinct round trip.
+        assert_eq!(closed[0].trade_id, closed[1].trade_id);
+        assert_ne!(closed[0].trade_id, closed[2].trade_id);
+
+        // No open positions remain -- the key invariant.
+        assert!(portfolio.positions.iter().all(|p| p.close_time.is_some()));
+        assert!(open_lot_meta.is_empty());
+
+        // THE reconciliation invariant that would have caught the original bug:
+        // sum(closed trade_log pnl) + sum(open unrealized pnl) == final equity - initial capital.
+        portfolio.update_unrealized_pnl(80.0);
+        let final_equity = portfolio.get_total_value();
+        let initial_capital = 10_000.0;
+        let closed_pnl_sum: f64 = trade_log.iter().filter(|t| t.exit_time.is_some()).filter_map(|t| t.pnl).sum();
+        let open_unrealized_sum: f64 = trade_log.iter().filter(|t| t.exit_time.is_none()).filter_map(|t| t.pnl).sum();
+        let gap = (closed_pnl_sum + open_unrealized_sum) - (final_equity - initial_capital);
+        assert!(gap.abs() < 1e-6, "trade_log/equity reconciliation gap: {}", gap);
+    }
+
+    #[test]
+    fn flush_open_positions_uses_real_portfolio_side_not_hardcoded_long() {
+        let mut portfolio = PortfolioState::with_balance(10_000.0);
+        let mut total_commission = 0.0_f64;
+        let mut num_trades = 0usize;
+        let mut trade_returns = Vec::new();
+        let mut trade_maes = Vec::new();
+        let mut trade_log: Vec<TradeRecord> = Vec::new();
+        let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
+        let mut next_trade_id = 1usize;
+        let now = chrono::Utc::now();
+
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 100.0, 5.0, now); // flat -> opens a short; never closed
+
+        portfolio.update_unrealized_pnl(90.0); // short gains: (100-90)*5 = 50
+
+        flush_open_positions_to_trade_log(&portfolio, &open_lot_meta, &mut trade_log, None);
+
+        assert_eq!(trade_log.len(), 1);
+        assert_eq!(trade_log[0].side, "short", "old code hardcoded \"long\" here even for a short");
+        assert!(trade_log[0].exit_time.is_none());
+        let expected_pnl = 50.0 - trade_log[0].commission; // netted of entry commission, consistent with closed trades
+        assert!((trade_log[0].pnl.unwrap() - expected_pnl).abs() < 1e-6);
     }
 
     #[test]
