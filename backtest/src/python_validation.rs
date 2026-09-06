@@ -1139,6 +1139,22 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         stat_returns.iter().sum::<f64>() / n as f64
     } else { 0.0 };
 
+    // Real observation rate from the actual OOS time span, mirroring the fix
+    // already applied to the in-sample Sharpe calc elsewhere in this file
+    // (see its own comment on `observations_per_year_from_span`). A fixed
+    // sqrt(252) here assumes exactly one trade per trading day; combined
+    // with a handful of sparse OOS trades and no ceiling, that silently
+    // produced meaningless Sharpe ratios in production (e.g. 96.25 on 6
+    // trades, 53.54 on 4 trades) whenever the real trade cadence was
+    // sparser than daily -- which walk-forward OOS windows usually are.
+    let oos_first_ts = results.first().and_then(|r| r.first_trade_timestamp);
+    let oos_last_ts = results.last().and_then(|r| r.last_trade_timestamp);
+    let oos_span_secs: Option<f64> = match (oos_first_ts, oos_last_ts) {
+        (Some(a), Some(b)) if b > a => Some((b - a).num_seconds() as f64),
+        _ => None,
+    };
+    let annualization_factor = metrics::significance::observations_per_year_from_span(n, oos_span_secs).sqrt();
+
     // Sharpe ratio from combined pct returns
     let sharpe = if n > 1 {
         let mean = avg_return;
@@ -1146,7 +1162,10 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
             .map(|r| (r - mean).powi(2))
             .sum::<f64>() / (n - 1) as f64;
         let std = variance.sqrt();
-        if std > 1e-12 { mean / std * 252.0_f64.sqrt() } else { 0.0 }
+        // Clamp at ±20, matching the in-sample Sharpe calc -- prevents
+        // blowup when std dev is tiny relative to mean (a handful of
+        // near-identical winning OOS trades).
+        if std > 1e-12 { (mean / std * annualization_factor).clamp(-20.0, 20.0) } else { 0.0 }
     } else { 0.0 };
 
     // Sortino ratio from combined pct returns
@@ -1157,7 +1176,7 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
             .map(|r| r.powi(2))
             .sum::<f64>() / n as f64;
         let downside_std = downside_var.sqrt();
-        if downside_std > 1e-12 { mean / downside_std * 252.0_f64.sqrt() } else { 0.0 }
+        if downside_std > 1e-12 { (mean / downside_std * annualization_factor).clamp(-20.0, 20.0) } else { 0.0 }
     } else { 0.0 };
 
     // Max drawdown from chained equity curve
@@ -1172,9 +1191,10 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         max_dd
     } else { 0.0 };
 
-    // First/last timestamps and prices from trade log
-    let first_ts = results.first().and_then(|r| r.first_trade_timestamp);
-    let last_ts = results.last().and_then(|r| r.last_trade_timestamp);
+    // First/last prices from trade log (timestamps already computed above
+    // as oos_first_ts/oos_last_ts for the annualization factor; reused here
+    // under their original names for the calmar calc below).
+    let (first_ts, last_ts) = (oos_first_ts, oos_last_ts);
     let first_price = results.first().and_then(|r| r.first_trade_price);
     let last_price = results.last().and_then(|r| r.last_trade_price);
 
@@ -1198,13 +1218,14 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         Some(annualized / max_drawdown)
     } else { None };
 
-    // Volatility of returns (from pct returns — annualized)
+    // Volatility of returns (from pct returns — annualized, same real
+    // observation-rate factor as sharpe/sortino above).
     let volatility = if n > 1 {
         let mean = avg_return;
         let var = stat_returns.iter()
             .map(|r| (r - mean).powi(2))
             .sum::<f64>() / (n - 1) as f64;
-        Some(var.sqrt() * 252.0_f64.sqrt())
+        Some(var.sqrt() * annualization_factor)
     } else { None };
 
     // Net profit
@@ -4739,6 +4760,47 @@ mod tests {
         assert!((net_pct - (combined.total_pnl / initial_capital * 100.0)).abs() < 1e-6);
         // realized_pnl must agree with total_pnl too.
         assert!((combined.realized_pnl.unwrap() - combined.total_pnl).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_combine_oos_sharpe_uses_real_span_and_is_clamped() {
+        // Regression test for a 2026-09-06 production bug: combine_oos_results
+        // annualized Sharpe/Sortino/volatility with a FIXED sqrt(252) factor
+        // (assumes exactly one trade per trading day) and no ceiling. Combined
+        // with a handful of sparse OOS trades spread over a much longer real
+        // span, this produced nonsense Sharpe ratios in production (96.25 on
+        // 6 trades, 53.54 on 4 trades). The fix derives the annualization
+        // factor from the real elapsed time between the first and last trade
+        // and clamps the result at +/-20, matching the in-sample Sharpe calc.
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        // 6 trades spread over 2 years, all small, consistent +1% winners --
+        // exactly the "sparse but suspiciously clean" shape that blew up
+        // under the old fixed-252 factor.
+        let mut w = oos_window(
+            vec![10_000.0, 10_100.0, 10_201.0, 10_303.01, 10_406.04, 10_510.10, 10_615.20],
+            vec![0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+        );
+        w.first_trade_timestamp = Some(start);
+        w.last_trade_timestamp = Some(start + chrono::Duration::days(730));
+
+        let combined = combine_oos_results(&[w], 10_000.0);
+
+        let sharpe = combined.sharpe_ratio.expect("sharpe should be computed");
+        assert!(
+            sharpe <= 20.0 && sharpe >= -20.0,
+            "sharpe must stay within the +/-20 clamp, got {sharpe}"
+        );
+        // With the real ~2-year span (a handful of trades/year, not one/day),
+        // annualizing should be far more conservative than the old fixed-252
+        // factor would have produced -- assert it lands well under the old
+        // bug's observed magnitude (96.25) as a sanity floor on the fix.
+        assert!(sharpe < 20.0, "expected the real span to avoid pinning the clamp, got {sharpe}");
+
+        let sortino = combined.sortino_ratio.expect("sortino should be computed");
+        assert!(
+            sortino <= 20.0 && sortino >= -20.0,
+            "sortino must stay within the +/-20 clamp, got {sortino}"
+        );
     }
 
     #[test]
