@@ -486,12 +486,21 @@ impl WorkerPool {
                             log_warn_structured!(crate::GENETIC_LOGGER, "WORKER_KILLED",
                                 "worker_idx" => i,
                             );
+                            // kill() only sends SIGKILL -- it does not reap the
+                            // process. Without the follow-up wait(), the worker
+                            // becomes a zombie the instant it actually exits and
+                            // stays one forever, since this coordinator process
+                            // is long-running and never itself exits to let init
+                            // adopt-and-reap it. wait() after kill() returns
+                            // almost immediately (SIGKILL can't be caught/delayed).
                             let _ = worker.child.kill();
+                            let _ = worker.child.wait();
                         }
                     }
                 }
                 Err(_) => {
                     let _ = worker.child.kill();
+                    let _ = worker.child.wait();
                 }
             }
         }
@@ -503,11 +512,19 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // Best-effort cleanup: send shutdown + kill
+        // Best-effort cleanup: send shutdown + kill + reap. This is the path
+        // hit whenever a WorkerPool is dropped WITHOUT an explicit shutdown()
+        // call first -- an error return, a panic, or any early exit out of a
+        // GA run. The missing wait() here (fixed 2026-09-07) meant every such
+        // drop leaked one zombie per worker under the long-running coordinator
+        // process, which never itself exits to let init adopt-and-reap them --
+        // confirmed in production as 270+ accumulated zombies driving system
+        // load high enough to make CI flake with spurious test timeouts.
         for worker in self.workers.iter_mut() {
             let _ = writeln!(worker.stdin, "\"SHUTDOWN\"");
             let _ = worker.stdin.flush();
             let _ = worker.child.kill();
+            let _ = worker.child.wait();
         }
     }
 }
