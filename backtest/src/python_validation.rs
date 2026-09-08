@@ -2507,12 +2507,34 @@ pub async fn run_validation_pipeline(
                 // is `Some`, so an unreliable value here silently wins over a
                 // trustworthy one -- gating it at the source is simpler than
                 // threading a reliability flag through every caller.
-                cpcv_deflated_sharpe = if result.min_trades_per_fold >= walkforward::MIN_RELIABLE_TRADES_PER_FOLD {
-                    Some(result.deflated_sharpe_ratio)
-                } else {
-                    log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: min_trades_per_fold={} < {}",
-                        result.min_trades_per_fold, walkforward::MIN_RELIABLE_TRADES_PER_FOLD);
-                    None
+                // Even when every fold clears the trade-count floor, CPCV's DSR
+                // is estimated from only C(n_folds, n_test_folds) per-combination
+                // OOS Sharpes (10 for this platform's fixed 5-fold/2-test-fold
+                // config) -- too few for the extreme-value asymptotics DSR
+                // relies on to hold reliably. A single noisy combination can
+                // still blow up sharpe_variance_across_folds and collapse the
+                // result to an astronomically extreme tail value regardless of
+                // trade count (observed in production: 1e-118, 1e-141 -- see
+                // this field's own doc comment). A real, well-calibrated DSR
+                // from this method essentially never lands beyond a ~4.75-sigma
+                // tail; anything more extreme is the noise artifact that same
+                // comment already warns about, not a real result -- 2026-09-08
+                // fix (found live: a real replay of a real production job's
+                // exact strategy/data still hit this after the DSR sigma-scaling
+                // fix, because THIS override -- not that bug -- had final say).
+                cpcv_deflated_sharpe = match cpcv_dsr_reliability(result.min_trades_per_fold, result.deflated_sharpe_ratio) {
+                    Ok(dsr) => Some(dsr),
+                    Err(CpcvDsrUnreliable::TooFewTradesPerFold) => {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: min_trades_per_fold={} < {}",
+                            result.min_trades_per_fold, walkforward::MIN_RELIABLE_TRADES_PER_FOLD);
+                        None
+                    }
+                    Err(CpcvDsrUnreliable::ImplausiblyExtreme) => {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: implausibly extreme value {} \
+                            (likely cross-fold variance noise from only {} combinations, not a real signal)",
+                            result.deflated_sharpe_ratio, result.total_combinations);
+                        None
+                    }
                 };
                 cpcv_parameter_stability = Some(result.parameter_stability_score);
 
@@ -2882,6 +2904,48 @@ pub async fn quick_signal_dry_run(
 /// gets converted from calendar days to a bar count for arbitrary candle
 /// granularity.
 const WF_PURGE_GAP_DAYS: f64 = 5.0;
+
+/// Why CPCV's own `deflated_sharpe_ratio` was not trusted as the job's final
+/// DSR. See `cpcv_dsr_reliability`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpcvDsrUnreliable {
+    TooFewTradesPerFold,
+    ImplausiblyExtreme,
+}
+
+/// Whether CPCV's own `deflated_sharpe_ratio` should be trusted as the job's
+/// final DSR (`worker.rs`'s override unconditionally replaces the properly
+/// lineage-aware DSR with this value whenever it's `Some`). Split out from
+/// its call site (Stage 3.5) so the two independent reliability conditions
+/// are each testable without a full CPCV run:
+///
+/// 1. `min_trades_per_fold` below `walkforward::MIN_RELIABLE_TRADES_PER_FOLD`
+///    -- a low-trade-count strategy can leave individual test folds with
+///    2-3 trades each, whose unstable Sharpe blows up
+///    `sharpe_variance_across_folds` (pre-existing gate).
+/// 2. Even when every fold clears that floor, CPCV's DSR is estimated from
+///    only `C(n_folds, n_test_folds)` per-combination OOS Sharpes (10 for
+///    this platform's fixed 5-fold/2-test-fold config) -- too few for the
+///    extreme-value asymptotics DSR relies on to hold reliably. A single
+///    noisy combination can still blow up the cross-fold variance and
+///    collapse the result to an astronomically extreme tail value
+///    regardless of trade count (observed in production: 1e-118, 1e-141).
+///    A real, well-calibrated DSR from this method essentially never lands
+///    beyond a ~4.75-sigma tail; anything more extreme is a noise artifact,
+///    not a real result (2026-09-08 fix -- found live: a real replay of a
+///    real production job's exact strategy/data still hit this after the
+///    DSR sigma-scaling fix, because THIS override, not that bug, had final
+///    say over the persisted value).
+fn cpcv_dsr_reliability(min_trades_per_fold: usize, deflated_sharpe_ratio: f64) -> Result<f64, CpcvDsrUnreliable> {
+    const CPCV_DSR_PLAUSIBLE_FLOOR: f64 = 1e-6;
+    if min_trades_per_fold < walkforward::MIN_RELIABLE_TRADES_PER_FOLD {
+        return Err(CpcvDsrUnreliable::TooFewTradesPerFold);
+    }
+    if !(CPCV_DSR_PLAUSIBLE_FLOOR..=1.0 - CPCV_DSR_PLAUSIBLE_FLOOR).contains(&deflated_sharpe_ratio) {
+        return Err(CpcvDsrUnreliable::ImplausiblyExtreme);
+    }
+    Ok(deflated_sharpe_ratio)
+}
 
 /// Pure conversion of `WF_PURGE_GAP_DAYS` into a bar count for data spanning
 /// `span_ms` over `n` bars, capped at half of `test_size` -- split out from
@@ -3701,6 +3765,77 @@ pub fn compute_tick_divergence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── cpcv_dsr_reliability — 2026-09-08 fix ──────────────────────────
+
+    #[test]
+    fn cpcv_dsr_reliability_rejects_too_few_trades_per_fold() {
+        let err = cpcv_dsr_reliability(walkforward::MIN_RELIABLE_TRADES_PER_FOLD - 1, 0.5)
+            .expect_err("below the trade-count floor must be rejected regardless of the DSR value");
+        assert_eq!(err, CpcvDsrUnreliable::TooFewTradesPerFold);
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_accepts_the_trade_count_floor_exactly() {
+        assert_eq!(
+            cpcv_dsr_reliability(walkforward::MIN_RELIABLE_TRADES_PER_FOLD, 0.5),
+            Ok(0.5),
+        );
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_rejects_the_exact_production_incidents() {
+        // The two real production values this fix was written to catch --
+        // both cleared the trade-count floor and still slipped through as
+        // the job's final, persisted DSR before this fix existed.
+        for extreme in [1e-118, 1e-141, 1.0 - 1e-118] {
+            let err = cpcv_dsr_reliability(50, extreme)
+                .expect_err("an astronomically extreme DSR must be rejected even with plenty of trades per fold");
+            assert_eq!(err, CpcvDsrUnreliable::ImplausiblyExtreme);
+        }
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_accepts_ordinary_values_across_the_full_plausible_range() {
+        // Deliberately excludes exact 0.0/1.0 -- the codebase's own erfc
+        // clamping (see the "[DSR] erfc saturated ... clamping to avoid a
+        // deceptive exact 0.0/1.0" production log line) means the real
+        // formula should never actually produce those two values; an exact
+        // 0.0 or 1.0 reaching this gate is itself a sign something upstream
+        // degenerated, not an "ordinary" result.
+        for ordinary in [0.001, 0.05, 0.5, 0.95, 0.999] {
+            assert_eq!(
+                cpcv_dsr_reliability(50, ordinary),
+                Ok(ordinary),
+                "an ordinary DSR of {ordinary} should never be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_boundary_is_inclusive() {
+        const FLOOR: f64 = 1e-6;
+        assert_eq!(cpcv_dsr_reliability(50, FLOOR), Ok(FLOOR));
+        assert_eq!(cpcv_dsr_reliability(50, 1.0 - FLOOR), Ok(1.0 - FLOOR));
+        assert_eq!(
+            cpcv_dsr_reliability(50, FLOOR * 0.999999).unwrap_err(),
+            CpcvDsrUnreliable::ImplausiblyExtreme,
+        );
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_reproduces_the_exact_live_replay_finding() {
+        // job efca77b0-style replay (2026-09-08): a real production strategy
+        // re-run end-to-end with the DSR sigma-scaling fix already in place
+        // still persisted deflated_sharpe=7.7e-141 as the job's headline DSR,
+        // because CPCV's override -- not the sigma-scaling bug -- had final
+        // say. This is that exact observed value.
+        let observed_in_production = 0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007718581228466977_f64;
+        assert_eq!(
+            cpcv_dsr_reliability(50, observed_in_production).unwrap_err(),
+            CpcvDsrUnreliable::ImplausiblyExtreme,
+        );
+    }
 
     #[test]
     fn exceeds_param_complexity_gate_passes_a_well_sampled_candidate() {
