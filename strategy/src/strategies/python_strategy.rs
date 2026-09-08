@@ -486,6 +486,14 @@ pub struct PythonStrategy {
     /// (opens/highs/lows). Detected once at initialization via signature
     /// inspection. When false the engine skips building/passing those arrays.
     compute_signals_accepts_ohlc: bool,
+    /// Which of the optional OHLC keyword arguments (`opens`, `highs`,
+    /// `lows`, in that order) the user's `compute_signals` actually accepts.
+    /// All three when it takes `**kwargs`. Detected alongside
+    /// `compute_signals_accepts_ohlc` (2026-09-07 fix): a strategy declaring
+    /// only `highs=None, lows=None` used to be passed `opens=` too and fail
+    /// with "unexpected keyword argument 'opens'" -- 10 real production jobs
+    /// hit exactly that shape.
+    compute_signals_ohlc_kwargs: [bool; 3],
     /// Cross-exchange strategy support (2026-07-22): whether the user's
     /// Python class defines `compute_signals_multi_venue`. Detected once at
     /// initialization (a simple `hasattr` check — no signature introspection
@@ -567,6 +575,7 @@ impl PythonStrategy {
             cached_np_float64: None,
             cached_np_int64: None,
             compute_signals_accepts_ohlc: false,
+            compute_signals_ohlc_kwargs: [false; 3],
             accepts_multi_venue: false,
             accepts_position_sizes: false,
             defines_generate_signals: false,
@@ -1838,8 +1847,10 @@ impl Strategy for PythonStrategy {
             // arrays (opens/highs/lows). We read the function's __code__ directly
             // rather than importing `inspect` (keeps us off the sandbox import path).
             // OHLC is passed as keyword args, so we accept when: a param is named
-            // opens/highs/lows, OR the function takes **kwargs.
-            self.compute_signals_accepts_ohlc = {
+            // opens/highs/lows, OR the function takes **kwargs. Each name is
+            // tracked separately so the call site only forwards the kwargs the
+            // function can actually take -- see `compute_signals_ohlc_kwargs`.
+            self.compute_signals_ohlc_kwargs = {
                 let strat = py_obj.bind(py);
                 strat
                     .getattr("compute_signals")
@@ -1866,13 +1877,13 @@ impl Strategy for PythonStrategy {
                         // Only the first (argcount + kwonly) entries are parameters;
                         // the rest are local variables and must be ignored.
                         let nparams = (argcount + kwonly).min(names.len());
-                        let named_ohlc = names[..nparams]
-                            .iter()
-                            .any(|n| n == "opens" || n == "highs" || n == "lows");
-                        named_ohlc || has_varkw
+                        let params = &names[..nparams];
+                        let accepts = |name: &str| has_varkw || params.iter().any(|n| n == name);
+                        [accepts("opens"), accepts("highs"), accepts("lows")]
                     })
-                    .unwrap_or(false)
+                    .unwrap_or([false; 3])
             };
+            self.compute_signals_accepts_ohlc = self.compute_signals_ohlc_kwargs.iter().any(|&b| b);
 
             // Cross-exchange strategy support (2026-07-22): does the user's
             // class define compute_signals_multi_venue at all? Simple
@@ -2310,22 +2321,30 @@ _thread.start_new_thread(_persistent_watchdog, ())
             })?;
 
             // Single Python call for all N ticks ─────────────────────────────
-            // When the strategy opted into OHLC, pass opens/highs/lows as keyword
-            // arguments (works for both explicit params and **kwargs forms).
+            // When the strategy opted into OHLC, pass ONLY the opens/highs/lows
+            // keyword arguments its signature actually declares (all three for
+            // the **kwargs form) -- passing an undeclared one is a TypeError.
             let call_result = if pass_ohlc {
-                let opens_arr = build_f64_array(&opens_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("opens array build error: {}", e))
-                })?;
-                let highs_arr = build_f64_array(&highs_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("highs array build error: {}", e))
-                })?;
-                let lows_arr = build_f64_array(&lows_vec).map_err(|e| {
-                    StrategyError::MarketDataError(format!("lows array build error: {}", e))
-                })?;
+                let [wants_opens, wants_highs, wants_lows] = self.compute_signals_ohlc_kwargs;
                 let kwargs = pyo3::types::PyDict::new_bound(py);
-                let _ = kwargs.set_item("opens", opens_arr);
-                let _ = kwargs.set_item("highs", highs_arr);
-                let _ = kwargs.set_item("lows", lows_arr);
+                if wants_opens {
+                    let opens_arr = build_f64_array(&opens_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("opens array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("opens", opens_arr);
+                }
+                if wants_highs {
+                    let highs_arr = build_f64_array(&highs_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("highs array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("highs", highs_arr);
+                }
+                if wants_lows {
+                    let lows_arr = build_f64_array(&lows_vec).map_err(|e| {
+                        StrategyError::MarketDataError(format!("lows array build error: {}", e))
+                    })?;
+                    let _ = kwargs.set_item("lows", lows_arr);
+                }
                 strategy.call_method(
                     "compute_signals",
                     (prices_arr, volumes_arr, timestamps_arr),
@@ -3558,6 +3577,84 @@ class Strategy(BaseStrategy):
             "float64 1.0 entries must be read as BUY (1), not silently dropped to HOLD (0) -- \
              this is the exact bug that made a real production strategy trade 0 times",
         );
+    }
+
+    /// 10 real production jobs (e.g. `c6d71d61-26ff-4da0-8200-93faf20bb602`)
+    /// declared `compute_signals(self, prices, volumes, timestamps,
+    /// highs=None, lows=None)` -- highs/lows but NOT opens -- and failed
+    /// Stage 1 with "TypeError: ... got an unexpected keyword argument
+    /// 'opens'", because OHLC opt-in was detected as a single yes/no and
+    /// the harness then passed all three kwargs regardless.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_passes_only_the_ohlc_kwargs_the_strategy_declares() {
+        use crate::Strategy;
+
+        const HIGHS_LOWS_ONLY: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "HighsLowsOnly"
+
+    def compute_signals(self, prices, volumes, timestamps, highs=None, lows=None):
+        sig = np.zeros(len(prices), dtype=np.int8)
+        if highs is not None and lows is not None and len(prices) > 2:
+            sig[2:] = 1
+        return sig
+"#;
+
+        let mut strategy = PythonStrategy::new(HIGHS_LOWS_ONLY.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+        assert!(strategy.compute_signals_accepts_ohlc(), "highs/lows params are an OHLC opt-in");
+        assert_eq!(
+            strategy.compute_signals_ohlc_kwargs, [false, true, true],
+            "must track opens/highs/lows acceptance separately",
+        );
+
+        let signals = strategy
+            .compute_all_signals(&[1.0; 5], &[1.0; 5], &[0i64; 5], &[1.0; 5], &[2.0; 5], &[0.5; 5])
+            .await
+            .expect("must not pass an undeclared `opens=` kwarg (TypeError)")
+            .expect("compute_signals is implemented -- should return Some(signals)");
+        assert_eq!(
+            signals, vec![0, 0, 1, 1, 1],
+            "highs/lows must actually have been forwarded, not silently dropped",
+        );
+    }
+
+    /// The `**kwargs` form must still receive all three.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_var_kwargs_form_still_receives_all_three_ohlc_arrays() {
+        use crate::Strategy;
+
+        const VAR_KWARGS: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "VarKwargs"
+
+    def compute_signals(self, prices, volumes, timestamps, **kwargs):
+        sig = np.zeros(len(prices), dtype=np.int8)
+        if all(k in kwargs for k in ("opens", "highs", "lows")):
+            sig[:] = -1
+        return sig
+"#;
+
+        let mut strategy = PythonStrategy::new(VAR_KWARGS.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+        assert_eq!(strategy.compute_signals_ohlc_kwargs, [true, true, true]);
+
+        let signals = strategy
+            .compute_all_signals(&[1.0; 3], &[1.0; 3], &[0i64; 3], &[1.0; 3], &[2.0; 3], &[0.5; 3])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(signals, vec![-1, -1, -1]);
     }
 
     // ── compute_position_sizes() / accepts_position_sizes() ─────────
