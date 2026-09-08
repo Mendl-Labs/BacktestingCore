@@ -2709,6 +2709,45 @@ _thread.start_new_thread(_persistent_watchdog, ())
             let items: Vec<pyo3::Bound<'_, PyAny>> =
                 if let Ok(lst) = py_list.downcast::<pyo3::types::PyList>() {
                     lst.iter().collect()
+                } else if let Ok(dict) = result.downcast::<pyo3::types::PyDict>() {
+                    // Defensive coercion (2026-09-07): AI-generated pairs/basket
+                    // strategies repeatedly returned a per-leg dict (mirroring
+                    // pair_spec()/basket_spec()'s own per-leg shape) instead of
+                    // the documented single joint-signal array, despite prompt
+                    // guidance already giving the exact contract and a minimal
+                    // correct example. Rather than keep re-wording the prompt
+                    // (see feedback_prefer_defensive_fix_over_prompt_iteration),
+                    // treat one leg's array as the joint signal — consistent
+                    // with the ordinary multi-venue path's existing "compute
+                    // jointly, execute against one primary venue only"
+                    // convention (see pair_simulation.rs's module doc comment).
+                    // `venues_owned`'s order comes from iterating the input
+                    // HashMap, which is NOT deterministic across runs, so the
+                    // "which leg" choice is made over a sorted copy of the
+                    // known venue keys instead — otherwise the same strategy
+                    // could non-deterministically flip which (opposite-signed)
+                    // leg's signal gets used from run to run.
+                    let mut leg_keys: Vec<&String> = venues_owned.iter().map(|(k, _)| k).collect();
+                    leg_keys.sort();
+                    let leg_value = leg_keys
+                        .into_iter()
+                        .find_map(|key| dict.get_item(key).ok().flatten())
+                        .ok_or_else(|| StrategyError::CalculationError(
+                            "compute_signals_multi_venue() returned a dict but none of its keys matched a known venue".to_string()
+                        ))?;
+                    let leg_list = leg_value
+                        .call_method0("tolist")
+                        .or_else(|_| Ok::<pyo3::Bound<'_, PyAny>, StrategyError>(leg_value.clone()))
+                        .map_err(|e: StrategyError| StrategyError::CalculationError(
+                            format!("compute_signals_multi_venue(): failed to convert per-leg output: {}", e)
+                        ))?;
+                    leg_list
+                        .downcast::<pyo3::types::PyList>()
+                        .map_err(|_| StrategyError::CalculationError(
+                            "compute_signals_multi_venue() must return an ndarray or list of int8".to_string()
+                        ))?
+                        .iter()
+                        .collect()
                 } else {
                     return Err(StrategyError::CalculationError(
                         "compute_signals_multi_venue() must return an ndarray or list of int8".to_string()
@@ -3557,6 +3596,79 @@ class Strategy(BaseStrategy):
             &signals[5..], &[1, 1, 1, 1, 1],
             "float64 1.0 entries must be read as BUY (1), not silently dropped to HOLD (0) -- \
              this is the exact bug that made a real production strategy trade 0 times",
+        );
+    }
+
+    /// Real production pairs/basket strategies repeatedly returned a
+    /// per-leg dict from `compute_signals_multi_venue()` (mirroring
+    /// `pair_spec()`/`basket_spec()`'s own per-leg shape) instead of the
+    /// documented single joint-signal array, despite explicit prompt
+    /// guidance and a minimal correct example -- confirmed live in
+    /// production across multiple independently-generated pairs and
+    /// basket_arb strategies (job `efca77b0-5627-4f3e-948c-b4cf757b69bc`
+    /// among them). Rather than keep re-wording the prompt, the harness
+    /// now treats the first leg's array (in caller-provided venue order)
+    /// as the joint signal.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_multi_venue_coerces_a_per_leg_dict_return() {
+        use crate::Strategy;
+
+        const PER_LEG_DICT_STRATEGY: &str = r#"
+import numpy as np
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "PerLegDictPairs"
+
+    def pair_spec(self):
+        return {
+            'symbol_a': 'WBTC-USD', 'exchange_a': 'kraken',
+            'symbol_b': 'BTC-USD', 'exchange_b': 'kraken',
+            'hedge_ratio_mode': 'fixed', 'hedge_ratio': 1.0,
+        }
+
+    def compute_signals_multi_venue(self, venues, volumes=None, timestamps=None):
+        key_a = 'kraken:WBTC-USD'
+        key_b = 'kraken:BTC-USD'
+        n = len(venues[key_a]['prices'])
+        signals_a = np.zeros(n, dtype=np.int8)
+        signals_b = np.zeros(n, dtype=np.int8)
+        signals_a[3:] = 1
+        signals_b[3:] = -1
+        return {key_a: signals_a, key_b: signals_b}
+"#;
+
+        let mut strategy = PythonStrategy::new(PER_LEG_DICT_STRATEGY.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+        assert!(strategy.accepts_multi_venue(), "pair_spec() + compute_signals_multi_venue() should be detected");
+
+        let series = VenueSeries {
+            prices: vec![100.0; 6],
+            volumes: vec![1.0; 6],
+            timestamps: (0..6).collect(),
+            opens: vec![100.0; 6],
+            highs: vec![100.0; 6],
+            lows: vec![100.0; 6],
+        };
+        let mut venues = std::collections::HashMap::new();
+        venues.insert(("WBTC-USD".to_string(), "kraken".to_string()), series.clone());
+        venues.insert(("BTC-USD".to_string(), "kraken".to_string()), series);
+
+        let signals = strategy
+            .compute_all_signals_multi_venue(&venues)
+            .await
+            .expect("a per-leg dict return must not be treated as a hard failure")
+            .expect("compute_signals_multi_venue is implemented -- should return Some(signals)");
+
+        assert_eq!(signals.len(), 6);
+        assert_eq!(&signals[..3], &[0, 0, 0], "warmup bars should stay HOLD");
+        assert_eq!(
+            &signals[3..], &[-1, -1, -1],
+            "should deterministically coerce to the alphabetically-first leg \
+             (kraken:BTC-USD, sorting before kraken:WBTC-USD) rather than fail outright \
+             or pick a leg non-deterministically based on HashMap iteration order",
         );
     }
 
