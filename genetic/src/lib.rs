@@ -1307,6 +1307,18 @@ pub struct AdaptiveGeneticOptimizer<C: Chromosome> {
     /// silently under-reporting by orders of magnitude. Read after `run()`
     /// returns.
     pub pool_evaluations: Arc<std::sync::atomic::AtomicUsize>,
+    /// Real (non-hard-gated) IS Sharpe ratio for every candidate evaluated
+    /// across the whole run -- mirrors `backtest::engine`'s own `trial_sharpes`
+    /// accumulation (`!fitness_result.hard_gated` gate) but for THIS optimizer,
+    /// which is what every Python-executed strategy's GA actually runs
+    /// through. Bailey & López de Prado's Deflated Sharpe Ratio needs the
+    /// standard deviation of the Sharpe ratios across the trials that were
+    /// actually tried (`σ_SR`) to convert its expected-max-under-null figure
+    /// from a dimensionless z-score into an actual Sharpe-ratio bar -- without
+    /// this, that conversion has nowhere to source `σ_SR` from on the Python
+    /// path, which is why it was skipped there (2026-09-08 DSR fix). Read
+    /// after `run()` returns, same as `pool_evaluations`/`final_population`.
+    pub trial_sharpes: Arc<std::sync::Mutex<Vec<f64>>>,
 }
 
 impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
@@ -1328,6 +1340,7 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
             strategy_registry: None,
             tenant_id: None,
             pool_evaluations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            trial_sharpes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1485,9 +1498,24 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
             };
             
             let gen_elapsed = generation_start.elapsed().as_secs_f64();
-            log_info!("{}Gen {}/{}: Fitness evaluation complete in {:.1}s ({:.2} chromosomes/sec)", 
+            log_info!("{}Gen {}/{}: Fitness evaluation complete in {:.1}s ({:.2} chromosomes/sec)",
                 job_tag, generation + 1, self.config.generations, gen_elapsed, population.len() as f64 / gen_elapsed);
-            
+
+            // Record real (non-hard-gated) IS Sharpe for every viable candidate
+            // this generation -- see `trial_sharpes`'s doc comment. Recorded
+            // from the raw per-candidate FitnessResult, before any
+            // population-level post-processing (normalization/sharing/
+            // crowding/parsimony) below touches `fitness_results`/`fitnesses`,
+            // since those adjust the composite `fitness` score, not the
+            // candidate's own backtest Sharpe.
+            if let Ok(mut guard) = self.trial_sharpes.lock() {
+                guard.extend(
+                    fitness_results.iter()
+                        .filter(|r| !r.hard_gated)
+                        .map(|r| r.sharpe_ratio),
+                );
+            }
+
             // Optional population-level fitness post-processing (e.g. z-score
             // normalization) -- see `fitness_normalizer`'s doc comment.
             let mut fitness_results = fitness_results;

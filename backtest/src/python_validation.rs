@@ -1912,6 +1912,13 @@ pub async fn run_validation_pipeline(
 
         // --- Decide single-objective vs multi-objective ---
         let mut nsga2_result: Option<NsgaIIResult> = None;
+        // Real (non-hard-gated) IS Sharpe across every candidate the GA/NSGA-II
+        // actually evaluated -- the sigma (standard deviation of trial
+        // Sharpes) the Deflated Sharpe Ratio needs to convert its
+        // expected-max-under-null figure into an actual Sharpe bar (2026-09-08
+        // DSR fix). Stays empty for the Bayesian-optimization branch, which
+        // has no population/generation loop to source this from.
+        let mut ga_trial_sharpes: Vec<f64> = Vec::new();
 
         let (best_chromosome, best_fitness) = match &ga_config.optimization_mode {
             config::OptimizationMode::MultiObjective { objectives } => {
@@ -1935,11 +1942,13 @@ pub async fn run_validation_pipeline(
                     fitness_fn: fitness_fn.clone(),
                     sampling_config: AdaptiveSamplingConfig::default(),
                     force_sequential: ga_config.force_sequential,
+                    trial_sharpes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
 
                 let (result, knee_chromo, knee_fitness) = nsga_optimizer.run().await;
                 log_info!(BACKTEST_LOGGER, "[VALIDATION] NSGA-II complete: pareto_front={} solutions, hypervolume={:.4}",
                     result.pareto_front.len(), result.hypervolume);
+                ga_trial_sharpes = nsga_optimizer.trial_sharpes.lock().map(|g| g.clone()).unwrap_or_default();
                 nsga2_result = Some(result);
                 (knee_chromo, knee_fitness)
             }
@@ -1981,7 +1990,9 @@ pub async fn run_validation_pipeline(
                 ).await
             }
             config::OptimizationMode::SingleObjective => {
-                optimizer.run().await
+                let result = optimizer.run().await;
+                ga_trial_sharpes = optimizer.trial_sharpes.lock().map(|g| g.clone()).unwrap_or_default();
+                result
             }
         };
 
@@ -2360,7 +2371,26 @@ pub async fn run_validation_pipeline(
                 }
             };
 
-            if let Ok(opt_br) = run_single_backtest(market_data, &opt_config).await {
+            if let Ok(mut opt_br) = run_single_backtest(market_data, &opt_config).await {
+                // IS Sharpe distribution across viable (non-hard-gated) GA/
+                // NSGA-II candidates -- mirrors backtest::engine's native-path
+                // computation exactly (engine.rs run_genetic_optimization).
+                // This is the sigma the Deflated Sharpe Ratio needs to turn
+                // its expected-max-under-null figure into an actual Sharpe
+                // bar instead of a dimensionless z-score (2026-09-08 DSR fix)
+                // -- previously only ever computed on the native path, never
+                // here on the Python-execution path that ~100% of production
+                // GA runs actually go through.
+                if !ga_trial_sharpes.is_empty() {
+                    let n = ga_trial_sharpes.len() as f64;
+                    let mean = ga_trial_sharpes.iter().sum::<f64>() / n;
+                    let variance = ga_trial_sharpes.iter().map(|&s| (s - mean).powi(2)).sum::<f64>() / n;
+                    let pct_above = ga_trial_sharpes.iter().filter(|&&s| s >= 1.0).count() as f64 / n;
+                    opt_br.ga_is_sharpe_mean = Some(mean);
+                    opt_br.ga_is_sharpe_std = Some(variance.sqrt());
+                    opt_br.ga_is_sharpe_pct_above_threshold = Some(pct_above);
+                }
+
                 // Defensive guard: a GA "winner" that produces zero trades on
                 // the full dataset is a degenerate parameter set (e.g.
                 // min_position_size > max_position_size). Surface it loudly

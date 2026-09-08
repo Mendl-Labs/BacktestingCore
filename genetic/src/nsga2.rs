@@ -76,6 +76,17 @@ pub struct NsgaIIOptimizer<C: Chromosome> {
     pub fitness_fn: AsyncContextFitnessFn<C>,
     pub sampling_config: AdaptiveSamplingConfig,
     pub force_sequential: bool,
+    /// Real (non-hard-gated) IS Sharpe ratio for every candidate evaluated
+    /// across the whole run -- same purpose and gate as
+    /// `AdaptiveGeneticOptimizer::trial_sharpes` (see that field's doc
+    /// comment): this is the σ_SR source the Deflated Sharpe Ratio's
+    /// expected-max-under-null figure needs to become an actual Sharpe bar
+    /// instead of a dimensionless z-score. NSGA-II is the DEFAULT
+    /// optimization mode for Python custom-strategy validation
+    /// (`python_validation.rs`'s `ga_config.unwrap_or_else` default), so
+    /// without this, most production GA runs would have no σ_SR source at
+    /// all even after `AdaptiveGeneticOptimizer` got one.
+    pub trial_sharpes: Arc<std::sync::Mutex<Vec<f64>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +332,16 @@ impl<C: Chromosome + 'static> NsgaIIOptimizer<C> {
                     handle.block_on(fitness_fn(chromo, ctx))
                 }).collect()
             };
+
+            // Record real (non-hard-gated) IS Sharpe for every viable
+            // candidate this generation -- see `trial_sharpes`'s doc comment.
+            if let Ok(mut guard) = self.trial_sharpes.lock() {
+                guard.extend(
+                    fitness_results.iter()
+                        .filter(|r| !r.hard_gated)
+                        .map(|r| r.sharpe_ratio),
+                );
+            }
 
             // Extract objective values
             let pop_objectives: Vec<Vec<f64>> = fitness_results.iter().map(|r| {
