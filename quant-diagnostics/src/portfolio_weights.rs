@@ -258,6 +258,163 @@ pub fn black_litterman_weights(
     Some(clipped.iter().map(|w| w / total).collect())
 }
 
+/// Hierarchical Risk Parity (López de Prado 2016) -- breadth Phase 3, 2026-09
+/// quant council, alongside `black_litterman_weights`. Unlike
+/// `min_variance_weights` (a single closed-form solve over the FULL
+/// covariance matrix, sensitive to inversion error on a near-singular or
+/// heavily correlated matrix) HRP never inverts the covariance matrix at
+/// all: it clusters constituents by correlation structure, orders them so
+/// similar constituents sit adjacent (quasi-diagonalization), then
+/// recursively bisects that ordering top-down, splitting capital between
+/// each half in inverse proportion to the half's own cluster variance. This
+/// is the standard argument for HRP as a THIRD option (not a replacement)
+/// alongside min-variance and Black-Litterman: it stays well-behaved when
+/// the correlation matrix is ill-conditioned (many highly-correlated
+/// constituents, or more constituents than return observations), at the
+/// cost of being a heuristic rather than a provably-optimal solve the way
+/// min-variance is under its own assumptions. Naturally long-only (no
+/// projection/clipping step needed, unlike the other two techniques here).
+///
+/// Two documented simplifications, matching this module's own established
+/// convention (see module doc):
+/// 1. **Single-linkage clustering** via a straightforward O(n^3) nearest-
+///    cluster scan -- the textbook choice for HRP and adequate for the
+///    small constituent counts this is sized for (see
+///    `MAX_CANDIDATE_POOL`); a large-n optimized implementation (e.g.
+///    SciPy's `scipy.cluster.hierarchy.linkage`) is unnecessary machinery
+///    for a v1.
+/// 2. **Correlation-based distance** `d(i,j) = sqrt(0.5*(1 - corr(i,j)))`,
+///    the standard HRP distance metric (bounded in [0, 1], zero for
+///    perfectly correlated pairs) -- not a distance-of-distances matrix
+///    (López de Prado's own optional refinement), which adds clustering
+///    stability at the cost of real complexity for a marginal v1 benefit.
+pub fn hrp_weights(cov: &[Vec<f64>]) -> Vec<f64> {
+    let n = cov.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+
+    let sigmas: Vec<f64> = (0..n).map(|i| cov[i][i].max(0.0).sqrt()).collect();
+    let mut distance = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            let corr = if sigmas[i] > 1e-12 && sigmas[j] > 1e-12 {
+                (cov[i][j] / (sigmas[i] * sigmas[j])).clamp(-1.0, 1.0)
+            } else if i == j {
+                1.0
+            } else {
+                0.0
+            };
+            distance[i][j] = (0.5 * (1.0 - corr)).max(0.0).sqrt();
+        }
+    }
+
+    let order = quasi_diagonal_order(&distance);
+
+    let mut weights = vec![1.0; n];
+    let mut clusters: Vec<Vec<usize>> = vec![order];
+    while clusters.iter().any(|c| c.len() > 1) {
+        let mut next_clusters = Vec::with_capacity(clusters.len() * 2);
+        for cluster in clusters {
+            if cluster.len() <= 1 {
+                next_clusters.push(cluster);
+                continue;
+            }
+            let mid = cluster.len() / 2;
+            let left = cluster[..mid].to_vec();
+            let right = cluster[mid..].to_vec();
+            let var_left = cluster_variance(cov, &left);
+            var_split_weights(&mut weights, &left, &right, var_left, cluster_variance(cov, &right));
+            next_clusters.push(left);
+            next_clusters.push(right);
+        }
+        clusters = next_clusters;
+    }
+    weights
+}
+
+/// Applies one HRP bisection split: capital is allocated between `left` and
+/// `right` in INVERSE proportion to each side's own cluster variance (the
+/// lower-variance side gets the larger share), multiplied into whatever
+/// share each side's constituents already carry from earlier (coarser)
+/// splits -- this is what makes the recursion produce a genuine top-down
+/// allocation rather than resetting at each level.
+fn var_split_weights(weights: &mut [f64], left: &[usize], right: &[usize], var_left: f64, var_right: f64) {
+    let total_var = var_left + var_right;
+    let alloc_left = if total_var > 1e-18 { 1.0 - var_left / total_var } else { 0.5 };
+    let alloc_right = 1.0 - alloc_left;
+    for &i in left {
+        weights[i] *= alloc_left;
+    }
+    for &i in right {
+        weights[i] *= alloc_right;
+    }
+}
+
+/// Inverse-variance-weighted variance of a cluster (López de Prado's own
+/// `cluster_var`): the cluster's members are weighted by their own inverse
+/// variance (`1/cov[i][i]`, normalized to sum to 1) -- a cheap, diagonal-
+/// only proxy for "this cluster's own internal minimum-variance portfolio,"
+/// avoiding a second matrix inversion inside the recursion -- then that
+/// weight vector's quadratic form `w' Cov w` against the FULL covariance
+/// (including cross-terms within the cluster) is the cluster's variance.
+fn cluster_variance(cov: &[Vec<f64>], members: &[usize]) -> f64 {
+    let inv_var: Vec<f64> = members.iter().map(|&i| 1.0 / cov[i][i].max(1e-12)).collect();
+    let total: f64 = inv_var.iter().sum();
+    let w: Vec<f64> = if total > 1e-18 {
+        inv_var.iter().map(|v| v / total).collect()
+    } else {
+        vec![1.0 / members.len() as f64; members.len()]
+    };
+    let mut var = 0.0;
+    for (a, &i) in members.iter().enumerate() {
+        for (b, &j) in members.iter().enumerate() {
+            var += w[a] * w[b] * cov[i][j];
+        }
+    }
+    var.max(0.0)
+}
+
+/// Single-linkage agglomerative clustering, returning the leaf order from
+/// an in-order traversal of the resulting dendrogram (the "quasi-diagonal"
+/// order -- adjacent indices in the returned `Vec` are the most similar
+/// pairs/clusters, exactly what the recursive bisection needs to split
+/// along real cluster boundaries rather than an arbitrary index order).
+fn quasi_diagonal_order(distance: &[Vec<f64>]) -> Vec<usize> {
+    let n = distance.len();
+    // Each active cluster: its own leaf-order-preserving member list (for
+    // the final traversal) alongside the same members again (for computing
+    // single-linkage distance to every other active cluster).
+    let mut clusters: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+
+    while clusters.len() > 1 {
+        let mut best = (0usize, 1usize, f64::INFINITY);
+        for a in 0..clusters.len() {
+            for b in (a + 1)..clusters.len() {
+                let d = clusters[a]
+                    .iter()
+                    .flat_map(|&i| clusters[b].iter().map(move |&j| distance[i][j]))
+                    .fold(f64::INFINITY, f64::min);
+                if d < best.2 {
+                    best = (a, b, d);
+                }
+            }
+        }
+        let (a, b, _) = best;
+        // Remove the higher index first so the lower index's position
+        // (and thus `a`'s slot) is never invalidated by the first removal.
+        let members_b = clusters.remove(b);
+        let mut members_a = clusters.remove(a);
+        members_a.extend(members_b);
+        clusters.push(members_a);
+    }
+
+    clusters.into_iter().next().unwrap_or_default()
+}
+
 /// Cap how far each weight may move from `prior_weights` in one rebalance
 /// (post-hoc turnover control -- see module doc), then renormalize so the
 /// capped weights still sum to 1.0. `max_change` is the maximum absolute
@@ -441,6 +598,96 @@ mod tests {
         let w = black_litterman_weights(&cov, &[0.5, 0.5], &[-0.3, 0.3], &[1e-6, 1e-6], 2.5, 0.025).unwrap();
         assert!(w.iter().all(|&x| x >= 0.0), "got {:?}", w);
         assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-6);
+    }
+
+    // ── hrp_weights ─────────────────────────────────────────────────
+
+    #[test]
+    fn hrp_weights_handles_degenerate_sizes() {
+        assert_eq!(hrp_weights(&[]), Vec::<f64>::new());
+        assert_eq!(hrp_weights(&[vec![0.0004]]), vec![1.0]);
+    }
+
+    #[test]
+    fn hrp_two_assets_reduces_to_the_classic_inverse_variance_formula() {
+        // Analytically-derived invariant: with exactly 2 (singleton)
+        // clusters, cluster_variance of a single-member cluster is just
+        // that member's own variance (inverse-variance-normalized weight
+        // on ONE member is trivially 1.0) -- so HRP's single bisection is
+        // exactly the textbook 2-asset inverse-variance-parity formula:
+        // w_i = (1/var_i) / sum(1/var_j).
+        let var_a = 0.0001;
+        let var_b = 0.0009;
+        let cov = vec![
+            vec![var_a, 0.0],
+            vec![0.0, var_b],
+        ];
+        let w = hrp_weights(&cov);
+        let expected_a = (1.0 / var_a) / (1.0 / var_a + 1.0 / var_b);
+        assert!((w[0] - expected_a).abs() < 1e-9, "got {:?}, expected w[0]={}", w, expected_a);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hrp_favors_the_lower_variance_uncorrelated_constituent() {
+        let cov = vec![
+            vec![0.0001, 0.0],
+            vec![0.0, 0.01],
+        ];
+        let w = hrp_weights(&cov);
+        assert!(w[0] > w[1], "expected the calmer constituent to get more weight, got {:?}", w);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hrp_weights_are_always_non_negative_and_sum_to_one_for_a_realistic_basket() {
+        // 4 assets, mixed correlation structure and variances -- a case
+        // real enough to exercise more than one level of the recursion.
+        let cov = vec![
+            vec![0.0004, 0.00030, 0.00005, -0.00002],
+            vec![0.00030, 0.0004, 0.00003, -0.00001],
+            vec![0.00005, 0.00003, 0.0009, 0.0002],
+            vec![-0.00002, -0.00001, 0.0002, 0.0009],
+        ];
+        let w = hrp_weights(&cov);
+        assert_eq!(w.len(), 4);
+        assert!(w.iter().all(|&x| x >= 0.0), "HRP is naturally long-only, got {:?}", w);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-9, "got {:?}", w);
+    }
+
+    #[test]
+    fn quasi_diagonal_order_places_the_most_correlated_pair_adjacent() {
+        // Assets 0 and 1 are near-identical (distance ~0); asset 2 is
+        // uncorrelated with both (distance ~1 = sqrt(0.5)). The returned
+        // order must place 0 and 1 next to each other, wherever 2 falls.
+        let distance = vec![
+            vec![0.0, 0.02, 0.70],
+            vec![0.02, 0.0, 0.70],
+            vec![0.70, 0.70, 0.0],
+        ];
+        let order = quasi_diagonal_order(&distance);
+        assert_eq!(order.len(), 3);
+        let pos0 = order.iter().position(|&x| x == 0).unwrap();
+        let pos1 = order.iter().position(|&x| x == 1).unwrap();
+        assert_eq!((pos0 as i64 - pos1 as i64).abs(), 1, "0 and 1 must be adjacent in {:?}", order);
+    }
+
+    #[test]
+    fn cluster_variance_of_a_singleton_is_its_own_variance() {
+        let cov = vec![
+            vec![0.0004, 0.0001],
+            vec![0.0001, 0.0009],
+        ];
+        assert!((cluster_variance(&cov, &[0]) - 0.0004).abs() < 1e-12);
+        assert!((cluster_variance(&cov, &[1]) - 0.0009).abs() < 1e-12);
+    }
+
+    #[test]
+    fn var_split_weights_gives_more_capital_to_the_lower_variance_side() {
+        let mut weights = vec![1.0, 1.0];
+        var_split_weights(&mut weights, &[0], &[1], 0.0001, 0.0009);
+        assert!(weights[0] > weights[1], "got {:?}", weights);
+        assert!((weights[0] + weights[1] - 1.0).abs() < 1e-9);
     }
 
     #[test]
