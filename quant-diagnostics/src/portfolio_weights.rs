@@ -37,6 +37,23 @@
 
 use crate::linalg::invert_matrix;
 
+/// Standard textbook default risk-aversion coefficient (Black & Litterman's
+/// own 1992 worked example uses ~2.5). A platform-wide constant, never
+/// agent-chosen: letting an agent pick among optimization techniques, or
+/// tune either technique's own internal knobs, would reintroduce exactly
+/// the data-snooping-one-layer-up risk the "fixed, stated decision rule"
+/// design principle (2026-09 quant council) exists to prevent.
+pub const BLACK_LITTERMAN_RISK_AVERSION: f64 = 2.5;
+/// Standard practitioner default for `tau`, the scalar controlling how much
+/// weight the PRIOR (equilibrium) return estimate itself carries relative
+/// to the views (He & Litterman 1999 and most implementations use a small
+/// value in the 0.01-0.05 range). Also a fixed constant, not agent-chosen.
+pub const BLACK_LITTERMAN_TAU: f64 = 0.025;
+
+fn mat_vec_mul(m: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+    m.iter().map(|row| row.iter().zip(v.iter()).map(|(a, b)| a * b).sum()).collect()
+}
+
 /// Sample covariance matrix (N x N) of N return series, each of length T.
 /// `returns[i]` is series `i`'s T observations. Uses the unbiased (T-1)
 /// divisor. Returns `None` if fewer than 2 observations or fewer than 2
@@ -149,6 +166,98 @@ pub fn min_variance_weights(shrunk_cov: &[Vec<f64>]) -> Vec<f64> {
     clipped.iter().map(|w| w / total).collect()
 }
 
+/// Black-Litterman posterior weights (breadth Phase 3, 2026-09 quant
+/// council): blends an equilibrium prior implied by the portfolio's own
+/// current/reference allocation with per-constituent "views" -- for this
+/// platform's meta-portfolio (a portfolio of already-validated STRATEGIES,
+/// not raw assets), the view for constituent `i` is that strategy's own
+/// backtest-derived expected return and the view's uncertainty is that same
+/// strategy's own statistical uncertainty (e.g. Sharpe standard error
+/// scaled to a return), NEVER an agent-supplied number -- consistent with
+/// the "no agent discretion among optimization techniques or their inputs"
+/// design principle. There is no true "market portfolio" for a set of
+/// strategies the way there is for public equities, so `prior_weights` is
+/// the portfolio's own last-known (or equal, if none yet) allocation --
+/// reverse-optimizing THAT into an implied prior return is the standard,
+/// principled Black-Litterman substitute for a market-cap prior when one
+/// doesn't exist.
+///
+/// - `cov`: N x N covariance matrix of constituent returns.
+/// - `prior_weights`: the reference allocation to reverse-optimize into an
+///   implied equilibrium return (`pi = risk_aversion * cov * prior_weights`).
+/// - `view_returns[i]`: constituent `i`'s own stated absolute expected
+///   return (an absolute view on every constituent, i.e. the view "pick"
+///   matrix P is implicitly the identity -- the simplest, most common BL
+///   application, and the only one that needs no additional agent-supplied
+///   structure).
+/// - `view_uncertainty[i]`: constituent `i`'s own view variance (larger =
+///   less confident in that view, pulling the posterior further toward the
+///   prior for that constituent). Clamped to a small positive floor so a
+///   caller passing 0.0 (perfect confidence) can never divide by zero or
+///   produce an infinitely-confident view.
+/// - `risk_aversion` / `tau`: pass `BLACK_LITTERMAN_RISK_AVERSION` /
+///   `BLACK_LITTERMAN_TAU` unless a caller has a specific, non-agent-chosen
+///   reason to override (parameterized for testability).
+///
+/// Returns `None` on mismatched input lengths or a singular covariance
+/// matrix -- callers decide their own fallback (e.g. `min_variance_weights`
+/// or equal weight), mirroring `unconstrained_min_variance_weights`'s own
+/// contract rather than silently substituting one here.
+pub fn black_litterman_weights(
+    cov: &[Vec<f64>],
+    prior_weights: &[f64],
+    view_returns: &[f64],
+    view_uncertainty: &[f64],
+    risk_aversion: f64,
+    tau: f64,
+) -> Option<Vec<f64>> {
+    let n = cov.len();
+    if n == 0
+        || prior_weights.len() != n
+        || view_returns.len() != n
+        || view_uncertainty.len() != n
+        || cov.iter().any(|row| row.len() != n)
+    {
+        return None;
+    }
+
+    // Implied equilibrium excess returns from reverse-optimizing the prior
+    // allocation: pi = delta * Sigma * w_prior.
+    let pi: Vec<f64> = mat_vec_mul(cov, prior_weights).iter().map(|x| x * risk_aversion).collect();
+
+    let tau_cov: Vec<Vec<f64>> = cov.iter().map(|row| row.iter().map(|&v| v * tau).collect()).collect();
+    let tau_cov_inv = invert_matrix(&tau_cov)?;
+
+    // P = identity (one absolute view per constituent), so P' * Omega^-1 * P
+    // reduces to a diagonal matrix of 1/omega_i.
+    let omega_inv_diag: Vec<f64> = view_uncertainty.iter().map(|&u| 1.0 / u.max(1e-10)).collect();
+
+    let mut precision = tau_cov_inv.clone();
+    for i in 0..n {
+        precision[i][i] += omega_inv_diag[i];
+    }
+    let posterior_cov = invert_matrix(&precision)?;
+
+    let tau_cov_inv_pi = mat_vec_mul(&tau_cov_inv, &pi);
+    let rhs: Vec<f64> = (0..n).map(|i| tau_cov_inv_pi[i] + omega_inv_diag[i] * view_returns[i]).collect();
+    let mu_bl = mat_vec_mul(&posterior_cov, &rhs);
+
+    // Unconstrained mean-variance weights from the posterior returns:
+    // w = (delta * Sigma)^-1 * mu_BL.
+    let cov_inv = invert_matrix(cov)?;
+    let raw: Vec<f64> = mat_vec_mul(&cov_inv, &mu_bl).iter().map(|x| x / risk_aversion).collect();
+
+    // Long-only projection + renormalize, same convention as
+    // min_variance_weights (see module doc for why this is a documented
+    // approximation of the exact non-negativity-constrained QP).
+    let clipped: Vec<f64> = raw.iter().map(|w| w.max(0.0)).collect();
+    let total: f64 = clipped.iter().sum();
+    if total < 1e-12 {
+        return Some(vec![1.0 / n as f64; n]);
+    }
+    Some(clipped.iter().map(|w| w / total).collect())
+}
+
 /// Cap how far each weight may move from `prior_weights` in one rebalance
 /// (post-hoc turnover control -- see module doc), then renormalize so the
 /// capped weights still sum to 1.0. `max_change` is the maximum absolute
@@ -259,6 +368,79 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!((w[0] - 0.5).abs() < 1e-9);
         assert!((w[1] - 0.5).abs() < 1e-9);
+    }
+
+    // ── black_litterman_weights ────────────────────────────────────
+
+    #[test]
+    fn black_litterman_returns_none_on_mismatched_lengths_or_singular_cov() {
+        let cov = vec![vec![0.0001, 0.0], vec![0.0, 0.0001]];
+        assert!(black_litterman_weights(&cov, &[0.5], &[0.1, 0.1], &[0.01, 0.01], 2.5, 0.025).is_none());
+        assert!(black_litterman_weights(&cov, &[0.5, 0.5], &[0.1], &[0.01, 0.01], 2.5, 0.025).is_none());
+        assert!(black_litterman_weights(&cov, &[0.5, 0.5], &[0.1, 0.1], &[0.01], 2.5, 0.025).is_none());
+        let singular = vec![vec![0.0001, 0.0001], vec![0.0001, 0.0001]];
+        assert!(black_litterman_weights(&singular, &[0.5, 0.5], &[0.1, 0.1], &[0.01, 0.01], 2.5, 0.025).is_none());
+    }
+
+    #[test]
+    fn black_litterman_with_infinite_view_uncertainty_reduces_to_the_prior_weights() {
+        // When Omega -> infinity (no confidence in any view), mu_BL -> pi
+        // exactly, and the mean-variance solve on pi alone reproduces
+        // prior_weights exactly: w = (delta*Sigma)^-1 * (delta*Sigma*w_prior) / delta = w_prior.
+        let cov = vec![
+            vec![0.0004, 0.00005],
+            vec![0.00005, 0.0009],
+        ];
+        let prior = vec![0.3, 0.7];
+        // View returns are deliberately wild/wrong -- they must not move the
+        // result at all given near-infinite uncertainty.
+        let wild_views = vec![5.0, -5.0];
+        let huge_uncertainty = vec![1e12, 1e12];
+        let w = black_litterman_weights(&cov, &prior, &wild_views, &huge_uncertainty, 2.5, 0.025).unwrap();
+        assert!((w[0] - 0.3).abs() < 1e-6, "got {:?}", w);
+        assert!((w[1] - 0.7).abs() < 1e-6, "got {:?}", w);
+    }
+
+    #[test]
+    fn black_litterman_confident_view_shifts_weight_toward_the_favored_constituent() {
+        // Two uncorrelated, equal-variance constituents starting from an
+        // equal prior. A strong, confident (low-uncertainty) view that
+        // constituent 0 has a much higher expected return than constituent 1
+        // must shift the posterior weight toward constituent 0.
+        let cov = vec![
+            vec![0.0004, 0.0],
+            vec![0.0, 0.0004],
+        ];
+        let prior = vec![0.5, 0.5];
+        let views = vec![0.20, 0.02]; // constituent 0 stated far more promising
+        let confident = vec![1e-6, 1e-6]; // both views held with high confidence
+        let w = black_litterman_weights(&cov, &prior, &views, &confident, 2.5, 0.025).unwrap();
+        assert!(w[0] > w[1], "expected the favored constituent to get more weight, got {:?}", w);
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn black_litterman_symmetric_inputs_produce_equal_weights() {
+        let cov = vec![
+            vec![0.0004, 0.0],
+            vec![0.0, 0.0004],
+        ];
+        let w = black_litterman_weights(&cov, &[0.5, 0.5], &[0.1, 0.1], &[0.02, 0.02], 2.5, 0.025).unwrap();
+        assert!((w[0] - 0.5).abs() < 1e-9, "got {:?}", w);
+        assert!((w[1] - 0.5).abs() < 1e-9, "got {:?}", w);
+    }
+
+    #[test]
+    fn black_litterman_weights_are_never_negative_and_sum_to_one() {
+        // A strongly negative view on one leg combined with high correlation
+        // can push the unconstrained solve negative -- must clip, not short.
+        let cov = vec![
+            vec![0.0004, 0.00038],
+            vec![0.00038, 0.0004],
+        ];
+        let w = black_litterman_weights(&cov, &[0.5, 0.5], &[-0.3, 0.3], &[1e-6, 1e-6], 2.5, 0.025).unwrap();
+        assert!(w.iter().all(|&x| x >= 0.0), "got {:?}", w);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-6);
     }
 
     #[test]
