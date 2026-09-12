@@ -299,6 +299,46 @@ pub async fn run_sim_ticks(
     run_with_input(MarketDataInput::SimTicks { ticks, symbol, exchange }, config).await
 }
 
+/// Compute a strategy's `compute_features()` output over `data` with NO
+/// trading simulation -- no signals, no fills, no portfolio, no walk-forward.
+/// The rule-first discovery flow's signal-test stage uses this to check
+/// whether a strategy's underlying feature predicts forward returns at all
+/// before spending a single real backtest on it: build the executor exactly
+/// as `run_with_input` does, extract the same price/volume/timestamp arrays
+/// `compute_all_features` expects, and return whatever the strategy computes
+/// alongside the aligned prices/timestamps a caller needs to build forward
+/// returns from. `Ok((None, ..))` when the strategy has no `compute_features()`
+/// override (not an error -- see `compute_all_features`'s own contract) or
+/// when the hook is disabled via `ENABLE_COMPUTE_FEATURES=0`.
+pub async fn compute_strategy_features(
+    python_source: &str,
+    parameters: HashMap<String, ParameterValue>,
+    data: &[MarketData],
+) -> Result<(Option<HashMap<String, Vec<f64>>>, Vec<f64>, Vec<i64>)> {
+    if data.is_empty() {
+        anyhow::bail!("No market data provided for feature computation");
+    }
+    let (mut executor, _tier_analysis) = executor::build_executor(python_source, parameters)
+        .await
+        .context("Failed to build strategy executor")?;
+
+    let mut prices = Vec::with_capacity(data.len());
+    let mut volumes = Vec::with_capacity(data.len());
+    let mut timestamps = Vec::with_capacity(data.len());
+    for md in data {
+        let (p, v, ts) = extract_price_volume_ts(md);
+        prices.push(p);
+        volumes.push(v);
+        timestamps.push(ts.timestamp_millis());
+    }
+
+    let (features, error) = executor.compute_all_features(&prices, &volumes, &timestamps).await;
+    if let Some(e) = error {
+        log_warn!(BACKTEST_LOGGER, "compute_features() failed in compute_strategy_features: {}", e);
+    }
+    Ok((features, prices, timestamps))
+}
+
 async fn run_with_input(
     input: MarketDataInput<'_>,
     config: PythonSimConfig,
