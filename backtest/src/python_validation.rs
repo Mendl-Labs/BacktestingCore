@@ -2758,6 +2758,71 @@ async fn run_single_backtest(
         Ok(result.backtest_result)
 }
 
+/// Fixed-parameter evaluation entry points for the rule-first discovery
+/// flow. Both take `config.parameters` as given -- no Stage 0/1 pre-checks,
+/// no GA, no Monte Carlo -- so a caller evaluating one frozen rule across a
+/// wide instrument universe pays for exactly the simulations it needs and
+/// gets back the raw per-asset material it pools itself.
+///
+/// One full-span simulation. For a rule with no fitted parameters the entire
+/// span is legitimately out-of-sample, which is why this exists separately
+/// from the walk-forward wrapper below: its train slices fit nothing and
+/// would discard `WF_TRAIN_FRAC` of the usable history for no gain.
+#[cfg(feature = "python")]
+pub async fn run_fixed_parameter_backtest(
+    data: &[MarketData],
+    config: &ValidationConfig,
+) -> Result<BacktestResult> {
+    run_single_backtest(data, config).await
+}
+
+/// Purged walk-forward on one frozen parameter set. `num_windows == 0`
+/// resolves the count exactly as `run_validation_pipeline` does (see
+/// `resolve_fixed_parameter_wf_windows`). The per-window consistency and
+/// profitability statistics are the useful output here; the stitched OOS
+/// material is in `oos_combined_result`.
+#[cfg(feature = "python")]
+pub async fn run_fixed_parameter_walk_forward(
+    data: &[MarketData],
+    config: &ValidationConfig,
+    num_windows: usize,
+) -> Result<WalkForwardResult> {
+    let num_windows = resolve_fixed_parameter_wf_windows(data, num_windows);
+    run_walk_forward(data, config, num_windows, |_, _| {}).await
+}
+
+/// `requested` when non-zero, otherwise the pipeline's own auto count for
+/// this data (calendar span + regime count, `resolve_auto_wf_windows`).
+/// Fewer than two bars can't span a calendar range, so that degenerate
+/// input returns the same floor `resolve_auto_wf_windows` clamps to.
+pub fn resolve_fixed_parameter_wf_windows(data: &[MarketData], requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    if data.len() < 2 {
+        return 3;
+    }
+    let calendar_days = data.first()
+        .zip(data.last())
+        .map(|(first, last)| ((market_data_timestamp_ms(last) - market_data_timestamp_ms(first)) / 86_400_000).max(0) as usize)
+        .unwrap_or(0);
+    let close_prices = close_prices_from_market_data(data);
+    resolve_auto_wf_windows(calendar_days, data.len(), Some(&close_prices))
+}
+
+/// Unix-millisecond timestamp of one `MarketData` element. Unlike
+/// `market_data_timestamp` this needs no `DateTime` import, so it is usable
+/// (and testable) without the `python` feature.
+pub fn market_data_timestamp_ms(md: &MarketData) -> i64 {
+    match md {
+        MarketData::Trade(t) => t.timestamp.timestamp_millis(),
+        MarketData::Candle(c) => c.timestamp.timestamp_millis(),
+        MarketData::PoolSwap(s) => s.timestamp.timestamp_millis(),
+        MarketData::Generic(g) => g.timestamp_ms,
+        MarketData::OptionCandle(c) => c.timestamp.timestamp_millis(),
+    }
+}
+
 /// Evaluate one FIXED parameter set (`config.parameters`) across `num_folds`
 /// purged in-sample/out-of-sample window pairs, reusing the same window-
 /// placement (`resolve_wf_window_offsets`, uniform placement -- no regime
@@ -3765,6 +3830,45 @@ pub fn compute_tick_divergence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_fixed_parameter_wf_windows — rule-first discovery flow ──
+
+    fn synthetic_daily_candles(n: usize) -> Vec<MarketData> {
+        use chrono::TimeZone;
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        (0..n)
+            .map(|i| MarketData::Candle(dataloader::Candle {
+                timestamp: start + chrono::Duration::days(i as i64),
+                symbol: "TEST".into(),
+                exchange: "test".into(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0 + (i as f64 * 0.37).sin(),
+                volume: 1000.0,
+                trade_count: 10,
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_honours_an_explicit_request() {
+        assert_eq!(resolve_fixed_parameter_wf_windows(&synthetic_daily_candles(400), 5), 5);
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_auto_matches_the_pipeline_rule() {
+        let data = synthetic_daily_candles(400);
+        let expected = resolve_auto_wf_windows(399, data.len(), Some(&close_prices_from_market_data(&data)));
+        assert_eq!(resolve_fixed_parameter_wf_windows(&data, 0), expected);
+        assert!((3..=12).contains(&expected));
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_degenerate_data_returns_the_floor() {
+        assert_eq!(resolve_fixed_parameter_wf_windows(&[], 0), 3);
+        assert_eq!(resolve_fixed_parameter_wf_windows(&synthetic_daily_candles(1), 0), 3);
+    }
 
     // ── cpcv_dsr_reliability — 2026-09-08 fix ──────────────────────────
 
