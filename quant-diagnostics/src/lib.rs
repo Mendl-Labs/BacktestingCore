@@ -37,6 +37,6 @@ pub use cointegration::{
 pub use johansen::{johansen_test, normalize_cointegrating_vector, JohansenResult};
 pub use spread::corwin_schultz_spread;
 pub use portfolio_weights::{
-    black_litterman_weights, cap_turnover, min_variance_weights, sample_covariance,
+    black_litterman_weights, cap_turnover, hrp_weights, min_variance_weights, sample_covariance,
     shrink_toward_constant_correlation, BLACK_LITTERMAN_RISK_AVERSION, BLACK_LITTERMAN_TAU,
 };
