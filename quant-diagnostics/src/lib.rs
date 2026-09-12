@@ -20,7 +20,7 @@ pub mod vrp;
 pub mod portfolio_weights;
 
 pub use variance_ratio::{variance_ratio as compute_variance_ratio, VrResult};
-pub use ic::{compute_ic, IcResult};
+pub use ic::{compute_ic, pooled_ic, IcResult, PooledIcResult};
 pub use quantile::{quantile_analysis, QuantileBucket};
 pub use volatility_regime::{rolling_volatility, volatility_tercile_regimes, VolatilityRegime};
 pub use vrp::{vrp_significance, VrpResult};
