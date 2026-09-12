@@ -161,6 +161,26 @@ pub struct TradeRecord {
     pub legs: Vec<TradeLeg>,
 }
 
+/// Count trades force-closed by a margin call during the simulation.
+///
+/// The single-asset (`python_simulation.rs`), pair (`pair_simulation.rs`) and
+/// basket (`basket_simulation.rs`) engines each record a liquidated position's
+/// forced exit as an ordinary `TradeRecord` whose `exit_reason` starts with
+/// `"margin_call_liquidation"` (the pair/basket engines append the triggering
+/// leg(s), e.g. `"margin_call_liquidation (BTC-USD leg)"`) -- `starts_with`
+/// rather than an exact match so all three variants count. Cross-sectional
+/// backtests model no leverage at all, so this is always 0 there. Used to
+/// populate `VerdictInputs.had_liquidation`: a backtest that blew through its
+/// maintenance margin should never be Promising regardless of how good its
+/// other metrics look, mirroring the Rust-native GA path's existing
+/// `total_liquidations > 0` hard-reject (`genetic::fitness`).
+pub fn count_liquidations(trade_log: &[TradeRecord]) -> usize {
+    trade_log
+        .iter()
+        .filter(|t| t.exit_reason.as_deref().is_some_and(|r| r.starts_with("margin_call_liquidation")))
+        .count()
+}
+
 /// One venue's fill within a multi-venue trade. See `TradeRecord::legs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeLeg {
@@ -670,6 +690,78 @@ mod tests {
             "exit_reason":null,"mae":null,"mfe":null}"#;
         let decoded: TradeRecord = serde_json::from_str(json).unwrap();
         assert!(decoded.legs.is_empty());
+    }
+
+    // ========================================================================
+    // count_liquidations tests
+    // ========================================================================
+
+    fn mk_trade_with_exit_reason(exit_reason: Option<&str>) -> TradeRecord {
+        TradeRecord {
+            trade_id: 1,
+            side: "long".to_string(),
+            entry_signal_price: 100.0,
+            entry_fill_price: 100.05,
+            exit_signal_price: Some(90.0),
+            exit_fill_price: Some(89.9),
+            quantity: 1.0,
+            pnl: Some(-10.1),
+            pnl_pct: Some(-0.1),
+            commission: 0.1,
+            slippage_cost: 0.1,
+            entry_time: Utc::now(),
+            exit_time: Some(Utc::now()),
+            duration_secs: Some(3600),
+            entry_liquidity: "taker".to_string(),
+            exit_liquidity: Some("taker".to_string()),
+            entry_reason: "signal_buy".to_string(),
+            exit_reason: exit_reason.map(String::from),
+            mae: Some(-0.1),
+            mfe: Some(0.0),
+            legs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn count_liquidations_is_zero_with_no_trades() {
+        assert_eq!(count_liquidations(&[]), 0);
+    }
+
+    #[test]
+    fn count_liquidations_ignores_ordinary_exits() {
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("signal_sell")),
+            mk_trade_with_exit_reason(Some("stop_loss")),
+            mk_trade_with_exit_reason(None),
+        ];
+        assert_eq!(count_liquidations(&trades), 0);
+    }
+
+    #[test]
+    fn count_liquidations_matches_the_single_asset_python_engine_reason() {
+        let trades = vec![mk_trade_with_exit_reason(Some("margin_call_liquidation"))];
+        assert_eq!(count_liquidations(&trades), 1);
+    }
+
+    #[test]
+    fn count_liquidations_matches_the_pair_and_basket_engines_suffixed_reason() {
+        // pair_simulation.rs / basket_simulation.rs append the triggering
+        // leg(s) to the reason string -- must still count as a prefix match.
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("margin_call_liquidation (BTC-USD leg)")),
+            mk_trade_with_exit_reason(Some("margin_call_liquidation (ETH-USD+SOL-USD leg)")),
+        ];
+        assert_eq!(count_liquidations(&trades), 2);
+    }
+
+    #[test]
+    fn count_liquidations_counts_only_the_matching_subset() {
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("signal_sell")),
+            mk_trade_with_exit_reason(Some("margin_call_liquidation")),
+            mk_trade_with_exit_reason(Some("take_profit")),
+        ];
+        assert_eq!(count_liquidations(&trades), 1);
     }
 
     #[test]

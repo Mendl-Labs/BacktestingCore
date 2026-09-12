@@ -68,6 +68,17 @@ pub struct VerdictInputs {
     pub result_quality: Option<String>,
     pub is_statistically_significant: Option<bool>,
     pub is_overfit: Option<bool>,
+    /// True when a margin call force-closed one or more positions during the
+    /// backtest (`types::count_liquidations` > 0 on the result's trade log).
+    /// Mirrors the Rust-native GA path's existing hard-reject
+    /// (`genetic::fitness`'s `total_liquidations > 0` -> `LIQUIDATION_FITNESS`,
+    /// "beats everything, even with great metrics") -- a strategy that blew
+    /// through its maintenance margin proved its leverage was too high for
+    /// the price move it actually experienced, regardless of how good its
+    /// other metrics look. `None` when liquidation tracking isn't available
+    /// for the path that produced this result (never gates in that case,
+    /// same as every other gate here).
+    pub had_liquidation: Option<bool>,
 
     // --- Quant-hardening gates ---
     pub analysis_mode: Option<String>,
@@ -195,6 +206,12 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
     }
     if inputs.is_statistically_significant == Some(false) {
         return Some("results are not statistically significant".to_string());
+    }
+    if inputs.had_liquidation == Some(true) {
+        return Some(
+            "a margin call force-closed one or more positions during the backtest -- leverage \
+             was too high for the price move actually experienced".to_string(),
+        );
     }
 
     // Minimum track record length gate (Bailey & López de Prado): checked
@@ -623,6 +640,33 @@ mod tests {
         };
         assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
         assert!(promotion_block_reason(&inputs).unwrap().contains("significant"));
+    }
+
+    #[test]
+    fn demotes_promising_to_inconclusive_when_liquidated() {
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            ..promising_base()
+        };
+        assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
+        assert!(promotion_block_reason(&inputs).unwrap().contains("margin call"));
+    }
+
+    #[test]
+    fn does_not_block_when_liquidation_tracking_is_unavailable() {
+        // `None` (the path that produced this result doesn't track
+        // liquidations) must never gate -- only an explicit `Some(true)` does,
+        // same convention as every other gate in this function.
+        let inputs = VerdictInputs {
+            had_liquidation: None,
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).is_none());
+        let explicit_false = VerdictInputs {
+            had_liquidation: Some(false),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&explicit_false).is_none());
     }
 
     #[test]
