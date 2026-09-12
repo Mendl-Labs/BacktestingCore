@@ -33,6 +33,26 @@ pub enum Verdict {
 /// Inputs the verdict logic needs. All fields optional so callers can pass
 /// partial results without pre-filtering -- mirrors `VerdictInputs` in
 /// `verdict.ts`.
+///
+/// PR6 (2026-09) removed `information_ratio`, dead on every real caller: no
+/// field anywhere in the Rust pipeline or the API response JSON ever
+/// populated the `oos_information_ratio` `verdict.ts` read it from --
+/// gui/src/lib/verdict.ts mirrors this removal, including its own
+/// downstream consumers (iterate.ts, teardownText.ts,
+/// research-interview-prompt.ts). A gate that can never fire because
+/// nothing ever populates its input is not defense-in-depth, it's a false
+/// promise of rigor.
+///
+/// `num_assets_failing_gate` was briefly considered for the same removal
+/// but is NOT dead -- `ResultsVisualization.tsx` genuinely computes it in
+/// the browser (re-running `promotionBlockReason` per portfolio asset
+/// against real `portfolio_metrics.symbol_results` data) for the Results
+/// page's own verdict display, so it stays. It IS dead specifically on
+/// BacktestingEngine's server-side Rust caller
+/// (`executor.rs::verdict_inputs_from_result` hardcodes `None`, comment:
+/// "per-asset gate data not present in SymbolResult") -- a real gap in the
+/// autonomous workflow's own stop/continue decision, left open as a
+/// follow-up rather than fixed here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerdictInputs {
     pub oos_sharpe_ratio: Option<f64>,
@@ -56,7 +76,6 @@ pub struct VerdictInputs {
     pub num_strategies_tested: Option<i64>,
     pub sharpe_std_error: Option<f64>,
     pub expected_max_sharpe_under_null: Option<f64>,
-    pub information_ratio: Option<f64>,
     pub bb_p5_total_pnl: Option<f64>,
     pub wf_consistency_score: Option<f64>,
     pub oos_num_trades: Option<i64>,
@@ -84,6 +103,16 @@ pub struct VerdictInputs {
     pub portfolio_sharpe: Option<f64>,
     pub portfolio_max_drawdown: Option<f64>,
     pub worst_asset_max_drawdown: Option<f64>,
+    /// Number of portfolio assets that would independently fail their own
+    /// promotion gate (`promotion_block_reason` re-run per asset). PR6
+    /// (2026-09) note: genuinely live on the browser side -- `verdict.ts`'s
+    /// caller in `ResultsVisualization.tsx` computes this for real from
+    /// `portfolio_metrics.symbol_results`, so this stays. It IS dead on the
+    /// server-side Rust caller specifically -- BacktestingEngine's
+    /// `executor.rs::verdict_inputs_from_result` currently hardcodes `None`
+    /// (its comment: "per-asset gate data not present in SymbolResult") --
+    /// a real gap for the autonomous workflow's own stop/continue decision,
+    /// left open as a follow-up rather than fixed here.
     pub num_assets_failing_gate: Option<i64>,
     pub pooled_deflated_sharpe_ratio: Option<f64>,
 
@@ -130,8 +159,6 @@ impl VerdictThresholds {
     pub const INSUFFICIENT_MIN_TRADES: i64 = 30;
     /// DSR threshold below which the GA likely over-fitted (Bailey et al. 2014).
     pub const PROMISING_MIN_DSR: f64 = 0.95;
-    /// Information Ratio threshold: strategy must beat the risk-free rate on OOS data.
-    pub const PROMISING_MIN_IR: f64 = 0.0;
 }
 
 /// The DSR bar actually enforced for this run: the platform's own fixed
@@ -227,16 +254,6 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
         }
     }
 
-    // Information Ratio gate.
-    if let Some(ir) = inputs.information_ratio {
-        if ir < VerdictThresholds::PROMISING_MIN_IR {
-            return Some(
-                "information ratio negative — strategy did not generate excess return above the risk-free rate on OOS data"
-                    .to_string(),
-            );
-        }
-    }
-
     // Block-bootstrap gate: preserves trade-return autocorrelation.
     if let Some(bb) = inputs.bb_p5_total_pnl {
         if bb < 0.0 {
@@ -275,7 +292,8 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
         );
     }
 
-    // Portfolio gate.
+    // Portfolio gate: restored (was briefly, incorrectly, considered dead --
+    // see num_assets_failing_gate's own doc comment).
     if inputs.is_portfolio == Some(true) {
         if let Some(n) = inputs.num_assets_failing_gate {
             if n > 0 {
