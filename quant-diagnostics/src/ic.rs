@@ -122,6 +122,163 @@ pub fn compute_ic(feature: &[f64], forward_returns: &[f64], horizon: usize) -> O
     })
 }
 
+/// Pool per-asset `IcResult`s into one significance test, correcting for
+/// cross-asset correlation via `effective_breadth` -- summing raw t-stats
+/// (or naively averaging Fisher-z scores) across N assets overstates power
+/// by treating them as N independent samples when correlated assets share
+/// much of the same information. Uses a Fisher z-transform (the standard
+/// way to average correlations, since raw ICs don't add linearly), weighted
+/// by each asset's own sample size, then inflates the combined variance by
+/// `N / effective_breadth` so the pooled t-stat reflects the REAL number of
+/// independent bets, not the nominal asset count.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PooledIcResult {
+    /// Weighted-average IC across assets (Fisher-z averaged, then inverted).
+    pub pooled_ic: f64,
+    pub t_stat: f64,
+    pub p_value: f64,
+    pub significant: bool,
+    /// Total (feature, forward_return) pairs summed across every asset.
+    pub n_total: usize,
+    /// Number of assets pooled.
+    pub n_assets: usize,
+    pub effective_breadth: f64,
+}
+
+/// `per_asset` must be non-empty; an IC of exactly +-1.0 (zero-variance
+/// Fisher z) is clamped away from the singularity rather than rejected, so
+/// one perfectly-correlated asset can't blow up the whole pool. Returns
+/// `None` for an empty slice or when every asset's IC is unusable (each
+/// `1 - ic^2 <= 0`, which only happens for a length-0 input in practice
+/// since `compute_ic` itself already guards near-zero variance).
+pub fn pooled_ic(per_asset: &[IcResult], effective_breadth: f64) -> Option<PooledIcResult> {
+    if per_asset.is_empty() {
+        return None;
+    }
+    let n_assets = per_asset.len();
+    let effective_breadth = effective_breadth.clamp(1.0, n_assets as f64);
+
+    let mut sum_weight = 0.0;
+    let mut sum_weighted_z = 0.0;
+    let mut n_total = 0usize;
+    for r in per_asset {
+        let weight = (r.n as f64 - 3.0).max(1.0);
+        let ic_clamped = r.ic.clamp(-0.999999, 0.999999);
+        let z = ic_clamped.atanh();
+        sum_weighted_z += weight * z;
+        sum_weight += weight;
+        n_total += r.n;
+    }
+    if sum_weight <= 0.0 {
+        return None;
+    }
+    let z_bar = sum_weighted_z / sum_weight;
+    // Naive pooled variance is 1/sum_weight (independent-samples Fisher-z
+    // variance); inflate by N/N_eff so correlated assets don't manufacture
+    // significance out of redundant observations.
+    let pooled_variance = (1.0 / sum_weight) * (n_assets as f64 / effective_breadth);
+    let t_stat = z_bar / pooled_variance.sqrt();
+    let p_value = two_sided_p_value(t_stat);
+
+    Some(PooledIcResult {
+        pooled_ic: z_bar.tanh(),
+        t_stat,
+        p_value,
+        significant: p_value < 0.05,
+        n_total,
+        n_assets,
+        effective_breadth,
+    })
+}
+
+#[cfg(test)]
+mod pooled_ic_tests {
+    use super::*;
+
+    fn ic(ic: f64, n: usize) -> IcResult {
+        // t_stat/p_value/significant are recomputed by compute_ic in real
+        // use; pooled_ic only reads .ic and .n, so hand-building a fixture
+        // with plausible-but-unused values for the rest is fine here.
+        IcResult { horizon: 1, ic, t_stat: 0.0, p_value: 1.0, significant: false, n }
+    }
+
+    /// A moderate, well-conditioned IC (~0.3, not a perfect monotonic
+    /// relationship) -- deliberately NOT near +-1.0, since both the raw
+    /// t-stat formula (1/(1-ic^2) blowup) and the Fisher-z transform
+    /// (atanh singularity) become numerically extreme near a perfect
+    /// correlation, in DIFFERENT ways, which breaks any comparison between
+    /// them. A realistic small-IC fixture is also the actually-relevant
+    /// case for this platform's own signal tests.
+    fn moderate_ic_fixture() -> IcResult {
+        let feature: Vec<f64> = (0..60).map(|i| ((i * 37) % 23) as f64).collect();
+        let forward_return: Vec<f64> = feature.iter().enumerate()
+            .map(|(i, f)| 0.3 * f + ((i * 17) % 11) as f64 * 2.0)
+            .collect();
+        compute_ic(&feature, &forward_return, 1).expect("enough data for a moderate fixture")
+    }
+
+    #[test]
+    fn identical_series_collapse_effective_breadth_toward_one_asset() {
+        // N copies of the SAME asset's IC: effective_breadth=1 should give a
+        // t-stat close to what a single asset with the same n would produce,
+        // not one inflated by pretending there are N independent samples.
+        let single = moderate_ic_fixture();
+        let per_asset = vec![single; 5];
+        let pooled = pooled_ic(&per_asset, 1.0).unwrap();
+        assert_eq!(pooled.n_assets, 5);
+        assert!((pooled.pooled_ic - single.ic).abs() < 1e-6, "pooled {} vs single {}", pooled.pooled_ic, single.ic);
+        // Same z, same weight-per-asset -> pooled t roughly equals the
+        // single-asset t once N/N_eff cancels the N-fold weight sum. Compared
+        // against the Fisher-z t-stat compute_ic itself would report for the
+        // same (ic, n), not compute_ic's own raw-Pearson t-stat, which uses a
+        // different formula and does not agree with the atanh-based one even
+        // at moderate IC.
+        let z = single.ic.atanh();
+        let single_fisher_t = z / (1.0 / (single.n as f64 - 3.0)).sqrt();
+        assert!((pooled.t_stat - single_fisher_t).abs() / single_fisher_t.abs() < 0.05,
+            "pooled t {} should be close to single-asset Fisher t {}", pooled.t_stat, single_fisher_t);
+    }
+
+    #[test]
+    fn full_effective_breadth_scales_t_stat_with_sqrt_n() {
+        // Same per-asset IC values, but effective_breadth == n_assets (fully
+        // independent): pooled t should grow roughly like sqrt(N) relative
+        // to the single-asset Fisher-z t-stat, the classic power gain from
+        // real breadth.
+        let single = moderate_ic_fixture();
+        let z = single.ic.atanh();
+        let single_fisher_t = z / (1.0 / (single.n as f64 - 3.0)).sqrt();
+        let n = 4;
+        let per_asset = vec![single; n];
+        let pooled = pooled_ic(&per_asset, n as f64).unwrap();
+        let ratio = pooled.t_stat / single_fisher_t;
+        assert!((ratio - (n as f64).sqrt()).abs() < 0.05, "expected ~sqrt({n}) scaling, got ratio {ratio}");
+    }
+
+    #[test]
+    fn effective_breadth_is_clamped_into_one_to_n_assets() {
+        let per_asset = vec![ic(0.1, 40), ic(0.1, 40)];
+        // Caller-supplied breadth outside [1, n_assets] must not produce a
+        // negative or explosive variance.
+        let too_high = pooled_ic(&per_asset, 100.0).unwrap();
+        let too_low = pooled_ic(&per_asset, 0.0).unwrap();
+        assert_eq!(too_high.effective_breadth, 2.0);
+        assert_eq!(too_low.effective_breadth, 1.0);
+    }
+
+    #[test]
+    fn empty_input_returns_none() {
+        assert!(pooled_ic(&[], 1.0).is_none());
+    }
+
+    #[test]
+    fn n_total_sums_every_assets_observation_count() {
+        let per_asset = vec![ic(0.1, 40), ic(-0.2, 60)];
+        let pooled = pooled_ic(&per_asset, 2.0).unwrap();
+        assert_eq!(pooled.n_total, 100);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
