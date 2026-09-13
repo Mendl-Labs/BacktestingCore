@@ -270,6 +270,21 @@ fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &D
 /// account-level `risk_manager` drawdown gate is the applicable backstop
 /// instead). `false` for futures/perps (2026-09-02 fix): unlike options,
 /// they use the exact leveraged-margin accounting `is_liquidated` models.
+/// Where a liquidation fills once a position's isolated-margin level has
+/// been breached intrabar: the level itself, clamped to the bar's traded
+/// range. A bar that gapped entirely past the level fills at the nearest
+/// price that bar actually traded (its high for a long, its low for a
+/// short). Filling at the bar's CLOSE instead -- the previous behavior --
+/// let a daily bar sit far past the level and book a loss several times
+/// the posted margin, which is precisely what a liquidation exists to
+/// prevent. `fallback` is used when the bar has no OHLC (tick data).
+fn liquidation_fill_price(liq_level: f64, high_low: Option<(f64, f64)>, fallback: f64) -> f64 {
+    match high_low {
+        Some((high, low)) if low <= high => liq_level.max(low).min(high),
+        _ => fallback,
+    }
+}
+
 fn is_exempt_from_leverage_liquidation_check(position: &portfoliomanager::Position) -> bool {
     position.close_time.is_some()
         || position.instrument.as_ref().map(|i| i.instrument_kind.is_option()).unwrap_or(false)
@@ -982,57 +997,87 @@ async fn run_with_input(
         // plain leveraged spot position), so they're no longer exempt.
         if leverage > 1.0 {
             let ohlc = extract_candle_ohlcv(data);
-            let triggered = portfolio.positions.iter().any(|p| {
-                if is_exempt_from_leverage_liquidation_check(p) {
-                    return false;
-                }
-                let intrabar_extreme = match (p.side, ohlc) {
-                    (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
-                    (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
-                    (_, None) => current_price,
-                };
-                portfoliomanager::margin::is_liquidated(
-                    intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
-                )
-            });
-            if triggered {
-                let equity = portfolio.equity_at(current_price);
-                let margin_used = portfolio.margin_used();
-                let maintenance_margin = portfoliomanager::margin::maintenance_margin(
-                    portfolio.net_position.abs() * current_price,
-                    maintenance_margin_ratio,
-                );
-                if matches!(
-                    riskmanager::check_margin(equity, margin_used, maintenance_margin),
-                    riskmanager::RiskAction::CloseAllPositions(_)
-                ) {
-                    let liquidation_side = if portfolio.net_position > 0.0 {
-                        portfoliomanager::PositionSide::Long
-                    } else {
-                        portfoliomanager::PositionSide::Short
+            // Two independent triggers, either of which liquidates:
+            //  1. Per-position isolated-margin level breached intrabar
+            //     (`is_liquidated`). `breached_level` is the FIRST level
+            //     price would have hit this bar -- the highest for longs,
+            //     the lowest for shorts -- and is where the fill books.
+            //  2. Account-level margin call (`check_margin`: equity at or
+            //     below maintenance margin).
+            // These were previously ANDed. At high leverage that made (1)
+            // unreachable in practice -- the level breach fired but the
+            // account check (maintenance margin is 0.5% of notional) only
+            // confirmed once equity was already near zero, so a 100x
+            // position rode a daily bar straight through zero and booked a
+            // loss several times its posted margin. A liquidation exists
+            // precisely to cap the loss at the margin; see
+            // `liquidation_fill_price` for the fill.
+            let breached_level: Option<(f64, portfoliomanager::PositionSide)> = portfolio.positions.iter()
+                .filter(|p| !is_exempt_from_leverage_liquidation_check(p))
+                .filter_map(|p| {
+                    let intrabar_extreme = match (p.side, ohlc) {
+                        (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
+                        (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
+                        (_, None) => current_price,
                     };
-                    let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
-                        current_price, liquidation_side, liquidation_penalty_bps,
-                    );
-                    log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, liq_exit_price);
-                    close_all_positions(
-                        &mut portfolio,
-                        liq_exit_price,
-                        &mut total_commission,
-                        taker_fee,
-                        &mut num_trades,
-                        &mut trade_returns,
-                        &mut trade_maes,
-                        &mut trade_log,
-                        &mut open_lot_meta,
-                        max_trade_log_size,
-                        timestamp,
-                        slippage_bps,
-                        ohlc,
-                        synthetic_book_cfg.as_ref(),
-                        "margin_call_liquidation",
-                    );
-                }
+                    portfoliomanager::margin::is_liquidated(
+                        intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
+                    ).then(|| (
+                        portfoliomanager::margin::liquidation_price(p.entry_price, p.side, leverage, maintenance_margin_ratio),
+                        p.side,
+                    ))
+                })
+                .fold(None, |best, (level, side)| match best {
+                    None => Some((level, side)),
+                    Some((best_level, best_side)) => {
+                        let first_hit = match side {
+                            portfoliomanager::PositionSide::Long => level > best_level,
+                            portfoliomanager::PositionSide::Short => level < best_level,
+                        };
+                        Some(if first_hit { (level, side) } else { (best_level, best_side) })
+                    }
+                });
+            let equity = portfolio.equity_at(current_price);
+            let margin_used = portfolio.margin_used();
+            let maintenance_margin = portfoliomanager::margin::maintenance_margin(
+                portfolio.net_position.abs() * current_price,
+                maintenance_margin_ratio,
+            );
+            let account_margin_call = matches!(
+                riskmanager::check_margin(equity, margin_used, maintenance_margin),
+                riskmanager::RiskAction::CloseAllPositions(_)
+            );
+            if breached_level.is_some() || account_margin_call {
+                let liquidation_side = if portfolio.net_position > 0.0 {
+                    portfoliomanager::PositionSide::Long
+                } else {
+                    portfoliomanager::PositionSide::Short
+                };
+                let fill_basis = match breached_level {
+                    Some((level, _)) => liquidation_fill_price(level, ohlc.map(|(_, high, low, _)| (high, low)), current_price),
+                    None => current_price,
+                };
+                let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
+                    fill_basis, liquidation_side, liquidation_penalty_bps,
+                );
+                log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} level_breached={:?} account_call={} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, breached_level.map(|(l, _)| l), account_margin_call, liq_exit_price);
+                close_all_positions(
+                    &mut portfolio,
+                    liq_exit_price,
+                    &mut total_commission,
+                    taker_fee,
+                    &mut num_trades,
+                    &mut trade_returns,
+                    &mut trade_maes,
+                    &mut trade_log,
+                    &mut open_lot_meta,
+                    max_trade_log_size,
+                    timestamp,
+                    slippage_bps,
+                    ohlc,
+                    synthetic_book_cfg.as_ref(),
+                    "margin_call_liquidation",
+                );
             }
         }
 
@@ -3620,6 +3665,35 @@ mod tests {
             greeks: None,
             margin_posted: 0.0,
         }
+    }
+
+    // -- liquidation fill price (liquidation_fill_price) --
+
+    #[test]
+    fn liquidation_fill_price_fills_at_the_level_when_the_bar_traded_through_it() {
+        // Long at 100 @ 100x: level 99.5; bar low 98, high 101 -> fill at 99.5,
+        // not at wherever the bar closed.
+        assert_eq!(liquidation_fill_price(99.5, Some((101.0, 98.0)), 98.2), 99.5);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_high_when_the_bar_gapped_below_a_long_level() {
+        // The whole bar traded below the level: best available fill is the
+        // bar's high, never a price above what actually traded.
+        assert_eq!(liquidation_fill_price(99.5, Some((97.0, 95.0)), 96.0), 97.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_low_when_the_bar_gapped_above_a_short_level() {
+        // Short level 100.5; whole bar traded above it -> fill at the bar low.
+        assert_eq!(liquidation_fill_price(100.5, Some((104.0, 102.0)), 103.0), 102.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_falls_back_to_the_current_price_without_ohlc() {
+        assert_eq!(liquidation_fill_price(99.5, None, 98.2), 98.2);
+        // Malformed bar (low > high) is treated like no OHLC rather than panicking.
+        assert_eq!(liquidation_fill_price(99.5, Some((95.0, 97.0)), 98.2), 98.2);
     }
 
     // -- leverage liquidation exemption (is_exempt_from_leverage_liquidation_check) --
