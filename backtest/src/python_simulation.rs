@@ -1089,7 +1089,15 @@ async fn run_with_input(
                     max_trade_log_size,
                     timestamp,
                     slippage_bps,
-                    ohlc,
+                    // NOT `ohlc`: with a bar and a synthetic-book config,
+                    // `execute_taker_fill` rebuilds the fill from a book
+                    // anchored at the bar's CLOSE and ignores the price it
+                    // was given. A liquidation is an intrabar event at a
+                    // known level -- on a bar that breached the level and
+                    // then rallied, the close-anchored fill booked the
+                    // "liquidation" as a PROFIT (confirmed live). Passing
+                    // no bar makes the fill honor `liq_exit_price`.
+                    None,
                     synthetic_book_cfg.as_ref(),
                     "margin_call_liquidation",
                 );
