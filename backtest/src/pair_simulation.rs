@@ -409,12 +409,14 @@ pub fn run_pair_backtest(
         // ordinary signal handling -- a margin call is an involuntary,
         // exchange-forced event that can happen regardless of what the
         // strategy's signal says this bar (mirrors `candle_sim.rs`'s exact
-        // placement/priority). No-op at `leverage<=1.0` (the outer gate
-        // below makes this whole block dead code, matching every other
-        // leveraged engine's no-op contract). Any one leg breaching forces
-        // an atomic close of the whole pair -- see this module's top-level
-        // doc note on why partial/unhedged survivors are never simulated.
-        if config.leverage > 1.0 {
+        // placement/priority). Runs at every leverage: a pair always carries
+        // a SHORT leg, and a 1x short's posted margin is exhausted once its
+        // price doubles (`margin::liquidation_price`; the long leg's level
+        // is 0.0 at 1x, so it still never triggers). Any one leg breaching
+        // forces an atomic close of the whole pair -- see this module's
+        // top-level doc note on why partial/unhedged survivors are never
+        // simulated.
+        {
             if let Some(pos_ref) = open.as_ref() {
                 let (low_a, high_a) = (venue_a.lows[t], venue_a.highs[t]);
                 let (low_b, high_b) = (venue_b.lows[t], venue_b.highs[t]);

@@ -29,22 +29,27 @@ pub fn maintenance_margin(notional_at_mark: f64, maintenance_margin_ratio: f64) 
 ///   long:  entry * (1 - 1/leverage + maintenance_margin_ratio)
 ///   short: entry * (1 + 1/leverage - maintenance_margin_ratio)
 ///
-/// `leverage <= 1.0` disables liquidation entirely: longs return `0.0`
-/// (price can never go negative, so this never triggers) and shorts return
-/// `f64::INFINITY` (likewise never triggers) -- leverage-off semantics fall
-/// out of the formula with no special-casing at call sites.
+/// `leverage <= 1.0` is floored to 1.0. A 1x LONG can never be liquidated
+/// (its loss is bounded by the price reaching zero, which is exactly where
+/// the formula lands: `0.0`). A 1x SHORT can: it has posted 100% margin, and
+/// that margin is exhausted once price has doubled against it, which is
+/// where the formula lands (`entry * (2 - maintenance_margin_ratio)`).
+/// Previously shorts returned `f64::INFINITY` here ("leverage-off = no
+/// liquidation"), which let an unleveraged short lose several hundred
+/// percent of its capital -- confirmed live on a 15-asset momentum
+/// robustness job where one short leg lost 364% and every pooled statistic
+/// downstream became meaningless. No real venue lets a short's loss exceed
+/// its posted margin, at any leverage.
 pub fn liquidation_price(
     entry_price: f64,
     side: PositionSide,
     leverage: f64,
     maintenance_margin_ratio: f64,
 ) -> f64 {
-    if leverage <= 1.0 {
-        return match side {
-            PositionSide::Long => 0.0,
-            PositionSide::Short => f64::INFINITY,
-        };
+    if leverage <= 1.0 && side == PositionSide::Long {
+        return 0.0;
     }
+    let leverage = leverage.max(1.0);
     match side {
         PositionSide::Long => entry_price * (1.0 - 1.0 / leverage + maintenance_margin_ratio),
         PositionSide::Short => entry_price * (1.0 + 1.0 / leverage - maintenance_margin_ratio),
@@ -63,9 +68,6 @@ pub fn is_liquidated(
     leverage: f64,
     maintenance_margin_ratio: f64,
 ) -> bool {
-    if leverage <= 1.0 {
-        return false;
-    }
     let liq_price = liquidation_price(entry_price, side, leverage, maintenance_margin_ratio);
     match side {
         PositionSide::Long => intrabar_extreme_price <= liq_price,
@@ -336,12 +338,16 @@ mod tests {
     // -- liquidation_price --------------------------------------------------
 
     #[test]
-    fn liquidation_price_leverage_one_never_triggers() {
+    fn liquidation_price_leverage_one_long_never_triggers_short_triggers_at_double() {
+        // A 1x long's loss is bounded by price reaching zero: no level.
         assert_eq!(liquidation_price(100.0, PositionSide::Long, 1.0, 0.005), 0.0);
-        assert_eq!(liquidation_price(100.0, PositionSide::Short, 1.0, 0.005), f64::INFINITY);
-        // Also below 1.0 (clamped the same way).
         assert_eq!(liquidation_price(100.0, PositionSide::Long, 0.5, 0.005), 0.0);
-        assert_eq!(liquidation_price(100.0, PositionSide::Short, 0.5, 0.005), f64::INFINITY);
+        // A 1x short has posted 100% margin, exhausted once price doubles
+        // (less the maintenance ratio). Previously INFINITY -- an unbounded
+        // loss no venue would actually allow.
+        assert!((liquidation_price(100.0, PositionSide::Short, 1.0, 0.005) - 199.5).abs() < 1e-9);
+        // Below 1.0 is floored to 1.0, same level.
+        assert!((liquidation_price(100.0, PositionSide::Short, 0.5, 0.005) - 199.5).abs() < 1e-9);
     }
 
     #[test]
@@ -404,9 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn is_liquidated_leverage_one_never_triggers_regardless_of_price() {
+    fn is_liquidated_leverage_one_long_never_short_at_double() {
         assert!(!is_liquidated(0.01, 100.0, PositionSide::Long, 1.0, 0.005));
-        assert!(!is_liquidated(1_000_000.0, 100.0, PositionSide::Short, 1.0, 0.005));
+        assert!(!is_liquidated(150.0, 100.0, PositionSide::Short, 1.0, 0.005));
+        assert!(is_liquidated(199.5, 100.0, PositionSide::Short, 1.0, 0.005));
+        assert!(is_liquidated(1_000_000.0, 100.0, PositionSide::Short, 1.0, 0.005));
     }
 
     // -- size_leveraged_order --------------------------------------------------

@@ -170,6 +170,7 @@ mod tests {
             output: OutputConfig::default(),
             analysis: AnalysisConfig::default(),
             lp: None,
+            warmup_bars: 0,
         };
         
         assert_eq!(config.data.default_timeframe, "1h");

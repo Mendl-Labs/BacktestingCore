@@ -2738,9 +2738,23 @@ async fn run_single_backtest(
     data: &[MarketData],
     config: &ValidationConfig,
 ) -> Result<BacktestResult> {
+    run_single_backtest_with_warmup(data, config, 0).await
+}
+
+/// `run_single_backtest` with the first `warmup_bars` ticks of `data`
+/// visible to the strategy but not tradable -- see
+/// `BacktestConfig::warmup_bars`. Used by walk-forward test windows.
+#[cfg(feature = "python")]
+async fn run_single_backtest_with_warmup(
+    data: &[MarketData],
+    config: &ValidationConfig,
+    warmup_bars: usize,
+) -> Result<BacktestResult> {
+        let mut backtest_config = config.backtest_config.clone();
+        backtest_config.warmup_bars = warmup_bars;
         let sim_config = crate::PythonSimConfig {
             python_source: config.python_source.clone(),
-            backtest_config: config.backtest_config.clone(),
+            backtest_config,
             fee_config: config.fee_config.clone(),
             supplementary_data: config.supplementary_data.clone(),
             parameters: config.parameters.clone(),
@@ -3149,9 +3163,19 @@ async fn run_walk_forward(
             }
         };
 
-        // Run on test period (subsampled)
-        let test_data = subsample_slice(&data[test_start..test_end]);
-        let test_result = match run_single_backtest(&test_data, config).await {
+        // Run on test period (subsampled). The slice handed to the strategy
+        // starts at `train_start`, not `test_start`, with the preceding
+        // train+purge span marked as warmup (`BacktestConfig::warmup_bars`):
+        // the strategy's vectorized `compute_signals` sees that history so
+        // lookback indicators are warm on the first test bar, but no trade
+        // or equity sample is recorded before `test_start`. Without this, any
+        // rule whose lookback exceeds the test window (a 180-bar momentum
+        // rule inside a 146-bar window) produced zero trades in EVERY window
+        // -- and a consistency score of 0.0 that looked like evidence.
+        let test_slice = &data[train_start..test_end];
+        let test_data = subsample_slice(test_slice);
+        let warmup_bars = (test_start - train_start) / (test_slice.len() / 500_000).max(1);
+        let test_result = match run_single_backtest_with_warmup(&test_data, config, warmup_bars).await {
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF] Window {} test backtest failed, skipping: {}", windows.len() + 1, e);
