@@ -716,26 +716,7 @@ fn run_monte_carlo_simulation_internal(
     // ========================================================================
     // Fan chart: per-trade-step percentile bands [p5, p25, p50, p75, p95]
     // ========================================================================
-    let path_len = num_trades + 1;
-    let mut fan_chart = Vec::with_capacity(path_len);
-    for step in 0..path_len {
-        let mut step_equities: Vec<f64> = all_equity_paths.iter()
-            .filter_map(|path| path.get(step).copied())
-            .collect();
-        step_equities.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        if step_equities.is_empty() {
-            fan_chart.push([initial_capital; 5]);
-        } else {
-            fan_chart.push([
-                percentile_from_sorted(&step_equities, 5.0),
-                percentile_from_sorted(&step_equities, 25.0),
-                percentile_from_sorted(&step_equities, 50.0),
-                percentile_from_sorted(&step_equities, 75.0),
-                percentile_from_sorted(&step_equities, 95.0),
-            ]);
-        }
-    }
+    let fan_chart = fan_chart_from_paths(&all_equity_paths, num_trades + 1, initial_capital);
 
     // ========================================================================
     // VaR / CVaR
@@ -868,8 +849,10 @@ pub fn run_block_bootstrap_simulation(
     let n = equity_deltas.len();
     let base_seed = trade_fingerprint_seed(base_result);
 
-    // Run block bootstrap in parallel
-    let results: Vec<(f64, f64, f64)> = (0..num_runs)
+    // Run block bootstrap in parallel. Each run also returns its equity
+    // path so the fan chart can be built from real resampled paths, the
+    // same way the shuffle path does.
+    let results: Vec<(f64, f64, f64, Vec<f64>)> = (0..num_runs)
         .into_par_iter()
         .map(|run_idx| {
             let mut rng = StdRng::seed_from_u64(base_seed ^ run_idx as u64);
@@ -933,6 +916,8 @@ pub fn run_block_bootstrap_simulation(
             let mut equity = initial_capital;
             let mut peak = equity;
             let mut max_dd = 0.0;
+            let mut equity_path = Vec::with_capacity(n + 1);
+            equity_path.push(equity);
             for (i, &frac) in bootstrap_sample.iter().enumerate() {
                 let mae_val = bootstrap_mae_sample[i];
                 let ret = equity * frac;
@@ -943,6 +928,7 @@ pub fn run_block_bootstrap_simulation(
                     if dd > max_dd { max_dd = dd; }
                 }
                 equity += ret;
+                equity_path.push(equity);
                 if equity > peak {
                     peak = equity;
                 }
@@ -952,16 +938,22 @@ pub fn run_block_bootstrap_simulation(
                 }
             }
             let net_profit = equity - initial_capital;
-            
-            (net_profit, sharpe, max_dd)
+
+            (net_profit, sharpe, max_dd, equity_path)
         })
         .collect();
-    
+
     // Aggregate results
     let all_net_profits: Vec<f64> = results.iter().map(|r| r.0).collect();
     let all_sharpes: Vec<f64> = results.iter().map(|r| r.1).collect();
     let all_drawdowns: Vec<f64> = results.iter().map(|r| r.2).collect();
-    
+    let all_equity_paths: Vec<Vec<f64>> = results.into_iter().map(|r| r.3).collect();
+    // Fan chart from the resampled paths -- previously left empty here
+    // ("uses main MC for that"), which meant a result produced by this path
+    // alone, such as the pooled daily-series Monte Carlo, had bands and
+    // percentiles but no fan.
+    let fan_chart = fan_chart_from_paths(&all_equity_paths, n + 1, base_result.initial_capital);
+
     // Build result using helper functions
     build_monte_carlo_result(
         base_result,
@@ -969,6 +961,7 @@ pub fn run_block_bootstrap_simulation(
         all_net_profits,
         all_sharpes,
         all_drawdowns,
+        fan_chart,
     )
 }
 
@@ -1114,14 +1107,41 @@ pub fn run_regime_aware_simulation(
     let all_net_profits: Vec<f64> = results.iter().map(|r| r.0).collect();
     let all_sharpes: Vec<f64> = results.iter().map(|r| r.1).collect();
     let all_drawdowns: Vec<f64> = results.iter().map(|r| r.2).collect();
-    
+
+    // Regime-aware runs don't retain equity paths; no fan chart here.
     build_monte_carlo_result(
         base_result,
         num_runs,
         all_net_profits,
         all_sharpes,
         all_drawdowns,
+        Vec::new(),
     )
+}
+
+/// Per-step percentile bands `[p5, p25, p50, p75, p95]` across simulated
+/// equity paths -- the fan chart. Steps with no path data (shorter paths)
+/// fall back to a flat band at `initial_capital`.
+fn fan_chart_from_paths(paths: &[Vec<f64>], path_len: usize, initial_capital: f64) -> Vec<[f64; 5]> {
+    let mut fan_chart = Vec::with_capacity(path_len);
+    for step in 0..path_len {
+        let mut step_equities: Vec<f64> = paths.iter()
+            .filter_map(|path| path.get(step).copied())
+            .collect();
+        step_equities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if step_equities.is_empty() {
+            fan_chart.push([initial_capital; 5]);
+        } else {
+            fan_chart.push([
+                percentile_from_sorted(&step_equities, 5.0),
+                percentile_from_sorted(&step_equities, 25.0),
+                percentile_from_sorted(&step_equities, 50.0),
+                percentile_from_sorted(&step_equities, 75.0),
+                percentile_from_sorted(&step_equities, 95.0),
+            ]);
+        }
+    }
+    fan_chart
 }
 
 /// Helper to build MonteCarloResult from simulation outputs
@@ -1131,6 +1151,7 @@ fn build_monte_carlo_result(
     all_net_profits: Vec<f64>,
     all_sharpes: Vec<f64>,
     all_drawdowns: Vec<f64>,
+    fan_chart: Vec<[f64; 5]>,
 ) -> anyhow::Result<MonteCarloResult> {
     let mean_net_profit = mean(&all_net_profits);
     let std_net_profit = std_dev(&all_net_profits);
@@ -1237,7 +1258,7 @@ fn build_monte_carlo_result(
         cvar_95,
         data_points,
         var_unreliable: data_points < 30,
-        fan_chart: Vec::new(), // Block bootstrap doesn't generate fan chart (uses main MC for that)
+        fan_chart,
         base_source: String::new(),
         mc_rng_seed: 0,
         bb_p5_total_pnl: None,
@@ -1475,6 +1496,26 @@ mod tests {
     /// each window independently started from $10K, so the per-trade DOLLAR
     /// P&Ls summed additively would blow the account past zero, while the
     /// per-trade FRACTIONAL returns compounded stay bounded above zero.
+    #[test]
+    fn block_bootstrap_builds_a_fan_chart_from_resampled_paths() {
+        // Previously the block-bootstrap path left fan_chart empty ("uses main
+        // MC for that"), so a result produced by this path alone -- the
+        // pooled daily-series Monte Carlo -- had bands but no fan.
+        let base = stitched_oos_base();
+        let n = base.trade_returns.len();
+        let result = run_block_bootstrap_simulation(&base, 200, BlockBootstrapConfig::default())
+            .expect("block bootstrap should run");
+        assert_eq!(result.fan_chart.len(), n + 1, "one band per step plus the starting point");
+        assert!((result.fan_chart[0][2] - base.initial_capital).abs() < 1e-6, "fan starts at initial capital");
+        for band in &result.fan_chart {
+            assert!(band[0] <= band[1] && band[1] <= band[2] && band[2] <= band[3] && band[3] <= band[4],
+                "percentile bands must be ordered: {:?}", band);
+            for &equity in band {
+                assert!(equity.is_finite() && equity > 0.0, "fan chart produced non-positive equity {}", equity);
+            }
+        }
+    }
+
     fn stitched_oos_base() -> BacktestResult {
         let initial_capital = 10_000.0;
         let mut trade_pct_returns = Vec::new();
