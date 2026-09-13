@@ -730,6 +730,11 @@ async fn run_with_input(
     // into a `SignalCounts` after the dispatch loop completes (see below).
     let mut signal_counts = signal_counts;
     let risk_free_rate = config.backtest_config.trading.risk_free_rate;
+    // See `BacktestConfig::warmup_bars`: the strategy's vectorized signals
+    // were computed over the WHOLE slice above (so lookback indicators are
+    // warm by the time trading starts), but nothing is traded or recorded
+    // before this index.
+    let warmup_bars = config.backtest_config.warmup_bars.min(total_ticks);
 
     for (tick_idx, data_cow) in input.iter().enumerate() {
         let data = &*data_cow;
@@ -738,11 +743,14 @@ async fn run_with_input(
         if current_price <= 0.0 {
             continue;
         }
+        last_price = current_price;
+        price_series.push(current_price);
+        if tick_idx < warmup_bars {
+            continue;
+        }
         if first_price.is_none() {
             first_price = Some(current_price);
         }
-        last_price = current_price;
-        price_series.push(current_price);
 
         // Update MAE/MFE for all open positions, reading side/entry price
         // from the portfolio's own real ledger (correct for shorts) rather
@@ -995,7 +1003,14 @@ async fn run_with_input(
         // leveraged-margin accounting `is_liquidated` models (real
         // `margin_posted`, same `entry_price`/`leverage` semantics as a
         // plain leveraged spot position), so they're no longer exempt.
-        if leverage > 1.0 {
+        // Also runs at 1x whenever a SHORT is open: a 1x short's posted
+        // margin is exhausted once price doubles against it, and
+        // `margin::liquidation_price` now yields that level (previously
+        // INFINITY, letting unleveraged shorts lose several hundred percent
+        // of capital). 1x longs still never trigger (level 0.0).
+        let has_open_short = portfolio.positions.iter()
+            .any(|p| p.close_time.is_none() && p.side == PositionSide::Short);
+        if leverage > 1.0 || has_open_short {
             let ohlc = extract_candle_ohlcv(data);
             // Two independent triggers, either of which liquidates:
             //  1. Per-position isolated-margin level breached intrabar

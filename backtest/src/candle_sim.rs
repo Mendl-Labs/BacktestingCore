@@ -397,9 +397,10 @@ impl CandleSimulator {
             // bar high for shorts) BEFORE the strategy's own stop-loss/
             // take-profit below, since a margin call is an involuntary,
             // exchange-forced event that takes priority over a voluntary
-            // exit rule. No-op at leverage=1.0 (`margin::is_liquidated`
-            // always returns false, so this whole block is skipped).
-            if position_qty != 0.0 && self.leverage > 1.0 {
+            // exit rule. At leverage=1.0 only a SHORT can trigger (its posted
+            // margin is exhausted once price doubles -- `margin::liquidation_price`);
+            // a 1x long's level is 0.0 and never triggers, so it is skipped.
+            if position_qty != 0.0 && (self.leverage > 1.0 || position_qty < 0.0) {
                 let side = if position_qty > 0.0 {
                     portfoliomanager::PositionSide::Long
                 } else {

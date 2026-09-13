@@ -263,8 +263,11 @@ pub fn run_basket_backtest(
         // Margin-call liquidation check, evaluated before this tick's
         // ordinary signal handling -- mirrors `pair_simulation.rs`'s exact
         // placement/priority and atomic-close-of-every-leg reasoning (see
-        // that module's doc note). No-op at `leverage<=1.0`.
-        if config.leverage > 1.0 {
+        // that module's doc note). Runs at every leverage: a basket carries
+        // short legs, and a 1x short's posted margin is exhausted once its
+        // price doubles (`margin::liquidation_price`; 1x long legs never
+        // trigger).
+        {
             if let Some(pos_ref) = open.as_ref() {
                 let extremes: Vec<(f64, f64)> = leg_venues.iter().map(|v| (v.lows[t], v.highs[t])).collect();
                 let extremes_valid = extremes.iter().all(|(l, h)| l.is_finite() && h.is_finite());
@@ -749,12 +752,13 @@ mod tests {
         assert!(reason.contains("CCC"), "reason={reason}");
     }
 
-    #[test]
-    fn liquidation_never_triggers_at_leverage_one_regardless_of_price() {
+    /// Runs the 3-leg basket at 1x with leg C (a SHORT leg, weight -0.5 in
+    /// `simple_basket_spec`) spiking intrabar to `c_spike_high`.
+    fn run_leverage_one_short_leg_spike(c_spike_high: f64) -> BasketBacktestResult {
         let a_prices = vec![100.0, 100.0];
         let b_prices = vec![50.0, 50.0];
         let c_prices = vec![30.0, 30.0];
-        let c_highs = vec![30.0, 1000.0]; // catastrophic intrabar spike
+        let c_highs = vec![30.0, c_spike_high];
 
         let mut venues = HashMap::new();
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series_with_range(a_prices.clone(), a_prices.clone(), a_prices));
@@ -764,8 +768,25 @@ mod tests {
         let fees = vec![zero_fee(); 3];
         let config = BasketBacktestConfig { max_net_exposure_pct: 1.0, leverage: 1.0, ..BasketBacktestConfig::default() };
         let signals = vec![1i8, 0];
-        let result = run_basket_backtest(&venues, &simple_basket_spec(), &signals, &fees, config).unwrap();
+        run_basket_backtest(&venues, &simple_basket_spec(), &signals, &fees, config).unwrap()
+    }
 
+    #[test]
+    fn leverage_one_short_leg_liquidates_once_its_price_doubles() {
+        // Previously asserted ZERO liquidations for this exact 33x spike --
+        // "leverage-off = no liquidation" -- which let an unleveraged short
+        // lose an unbounded multiple of its posted margin. A 1x short has
+        // posted 100% margin; it is gone once price doubles.
+        let result = run_leverage_one_short_leg_spike(1000.0);
+        assert_eq!(result.liquidations, 1);
+        let reason = result.trades[0].exit_reason.as_ref().unwrap();
+        assert!(reason.contains("margin_call_liquidation"), "reason={reason}");
+    }
+
+    #[test]
+    fn leverage_one_short_leg_survives_an_adverse_move_short_of_doubling() {
+        // +67% against the short leg: painful, but its 100% margin covers it.
+        let result = run_leverage_one_short_leg_spike(50.0);
         assert_eq!(result.liquidations, 0);
     }
 

@@ -43,6 +43,17 @@ pub struct BacktestConfig {
     /// Liquidity provision config — when present, runs the LP simulation loop instead of directional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lp: Option<LpConfig>,
+    /// Leading bars of the data slice the strategy may SEE (its vectorized
+    /// `compute_signals` receives them, so lookback indicators are warm) but
+    /// may not TRADE on: no orders, risk checks, or equity samples are
+    /// recorded for ticks before this index, and the buy-and-hold benchmark
+    /// starts at it. Walk-forward test windows set this to the length of the
+    /// preceding train+purge span so a rule whose lookback exceeds the test
+    /// window (e.g. a 180-bar momentum rule inside a 146-bar window) is not
+    /// silently reduced to zero trades. `0` (the default) is byte-for-byte the
+    /// pre-existing behavior.
+    #[serde(default)]
+    pub warmup_bars: usize,
 }
 
 /// Database connection configuration
