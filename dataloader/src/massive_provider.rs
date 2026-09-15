@@ -333,6 +333,60 @@ impl MassiveDataProvider {
     ///
     /// Forex examples:
     /// - `"EUR-USD"` → `"C:EURUSD"`
+    /// Swap the base/quote currency codes of a Polygon forex ticker, e.g.
+    /// `"C:SGDUSD"` -> `"C:USDSGD"`. `None` for anything that isn't exactly
+    /// `"C:"` + 6 letters (defensive -- never guess on a shape this
+    /// function doesn't recognize).
+    ///
+    /// 2026-09-15: confirmed live in production -- `symbol_to_ticker`'s
+    /// forex branch never reorders, it only strips separators
+    /// (`"SGD-USD"` -> `"C:SGDUSD"`). Real FX market convention quotes
+    /// several currencies (JPY, CHF, SGD, NOK, SEK among them) with USD as
+    /// the base (`USD/SGD`, not `SGD/USD`) -- confirmed against this
+    /// platform's own canonical majors list (`api/metadata.rs`'s
+    /// `FOREX_MAJORS`, which stores `"USD-CHF"`, never `"CHF-USD"`). A
+    /// caller that submits the reversed order (e.g. an AI-authored
+    /// `portfolio_assets` entry that got the convention backwards) silently
+    /// produces a Polygon ticker with no real data behind it, which
+    /// `fetch()` used to report as a flat "no data" error with no hint
+    /// that a working reversed-order ticker existed the whole time. Mirrors
+    /// `broker_tradability_service.rs`'s `reversed_oanda_pair` fallback,
+    /// which already solves the identical problem for the (separate)
+    /// tradability-check path.
+    fn reverse_forex_ticker(ticker: &str) -> Option<String> {
+        let code = ticker.strip_prefix("C:")?;
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let (base, quote) = code.split_at(3);
+        Some(format!("C:{}{}", quote, base))
+    }
+
+    /// Invert a forex bar's OHLC prices to express the RECIPROCAL currency
+    /// pair -- e.g. turn a real `USD/SGD` bar into the implied `SGD/USD`
+    /// bar. Reciprocal is monotonically DEcreasing for positive prices, so
+    /// the bar's high and low swap under inversion (the period's highest
+    /// `USD/SGD` price is the period's LOWEST `SGD/USD` price), not just
+    /// open/close. Volume and trade count are venue/instrument metadata,
+    /// not a price, so they pass through unchanged. Used only as a
+    /// fallback when the originally-requested ticker had no data of its
+    /// own but its reversed counterpart does -- returning the reversed
+    /// ticker's RAW prices directly (instead of inverting them) would
+    /// silently hand the caller a price series moving in the opposite
+    /// direction from what they asked for, corrupting any strategy signal
+    /// computed on it.
+    fn invert_forex_bar(bar: &AggBar) -> AggBar {
+        AggBar {
+            o: 1.0 / bar.o,
+            h: 1.0 / bar.l,
+            l: 1.0 / bar.h,
+            c: 1.0 / bar.c,
+            v: bar.v,
+            n: bar.n,
+            t: bar.t,
+        }
+    }
+
     fn symbol_to_ticker(symbol: &str, asset_class: Option<&str>) -> String {
         let symbol = Self::strip_polygon_prefix(symbol.trim());
         match asset_class {
@@ -920,6 +974,32 @@ impl MarketDataProvider for MassiveDataProvider {
             .await
             .map_err(ProviderError::from)?;
 
+        // Forex reversed-base/quote fallback (2026-09-15) -- see
+        // `reverse_forex_ticker`/`invert_forex_bar`'s doc comments for the
+        // live production case this closes. Only attempted for forex, and
+        // only when the primary-order ticker genuinely had nothing.
+        let (bars, inverted) = if bars.is_empty() && request.asset_class.as_deref() == Some("forex") {
+            match Self::reverse_forex_ticker(&ticker) {
+                Some(reversed_ticker) => {
+                    match self.fetch_bars(&reversed_ticker, request.from, request.to, granularity).await {
+                        Ok(reversed_bars) if !reversed_bars.is_empty() => {
+                            log_info_structured!(DATALOADER_LOGGER, "DATA_FETCH_REVERSED_PAIR_FALLBACK",
+                                "symbol" => &request.symbol,
+                                "primary_ticker" => &ticker,
+                                "reversed_ticker" => &reversed_ticker,
+                                "bars" => reversed_bars.len(),
+                            );
+                            (reversed_bars, true)
+                        }
+                        _ => (Vec::new(), false),
+                    }
+                }
+                None => (Vec::new(), false),
+            }
+        } else {
+            (bars, false)
+        };
+
         if bars.is_empty() {
             log_error_structured!(DATALOADER_LOGGER, "DATA_FETCH_ERROR",
                 "symbol" => &request.symbol,
@@ -932,6 +1012,11 @@ impl MarketDataProvider for MassiveDataProvider {
                 to: request.to.to_string(),
             });
         }
+        let bars: Vec<AggBar> = if inverted {
+            bars.iter().map(Self::invert_forex_bar).collect()
+        } else {
+            bars
+        };
 
         let symbol: Arc<str> = Arc::from(request.symbol.as_str());
         let exchange: Arc<str> = Arc::from("massive");
@@ -1271,5 +1356,64 @@ mod symbol_to_ticker_tests {
         // incorrectly formatted" error for that.
         assert_eq!(MassiveDataProvider::symbol_to_ticker("C:EURUSD", Some("forex")), "C:EURUSD");
         assert_eq!(MassiveDataProvider::symbol_to_ticker("X:BTCUSD", Some("crypto")), "X:BTCUSD");
+    }
+}
+
+#[cfg(test)]
+mod reversed_forex_pair_fallback_tests {
+    use super::{AggBar, MassiveDataProvider};
+
+    #[test]
+    fn reverse_forex_ticker_swaps_base_and_quote() {
+        // The exact live production case: a submitted "SGD-USD" produces
+        // ticker "C:SGDUSD", which has no real data -- the reversed
+        // "C:USDSGD" is the ticker that actually exists.
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:SGDUSD"), Some("C:USDSGD".to_string()));
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:USDSGD"), Some("C:SGDUSD".to_string()));
+    }
+
+    #[test]
+    fn reverse_forex_ticker_rejects_non_forex_shapes() {
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("X:BTCUSD"), None, "not a forex prefix");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("AAPL"), None, "no prefix at all");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:EURUSDX"), None, "not exactly 6 letters");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:EU1USD"), None, "contains a digit");
+    }
+
+    fn bar(o: f64, h: f64, l: f64, c: f64) -> AggBar {
+        AggBar { o, h, l, c, v: 1234.0, n: Some(56), t: 789 }
+    }
+
+    #[test]
+    fn invert_forex_bar_takes_reciprocals_and_swaps_high_low() {
+        // Real USD/SGD-shaped bar: opened 1.30, ranged 1.28-1.32, closed 1.31.
+        let usd_sgd = bar(1.30, 1.32, 1.28, 1.31);
+        let sgd_usd = MassiveDataProvider::invert_forex_bar(&usd_sgd);
+        assert!((sgd_usd.o - 1.0 / 1.30).abs() < 1e-12);
+        assert!((sgd_usd.c - 1.0 / 1.31).abs() < 1e-12);
+        // The period's highest USD/SGD price (1.32) is the LOWEST implied
+        // SGD/USD price, and vice versa -- reciprocal is decreasing.
+        assert!((sgd_usd.h - 1.0 / 1.28).abs() < 1e-12, "high must come from the original LOW");
+        assert!((sgd_usd.l - 1.0 / 1.32).abs() < 1e-12, "low must come from the original HIGH");
+        assert!(sgd_usd.h > sgd_usd.l, "an inverted bar must still have high >= low");
+        // Volume and trade count are metadata, not price -- unchanged.
+        assert_eq!(sgd_usd.v, usd_sgd.v);
+        assert_eq!(sgd_usd.n, usd_sgd.n);
+        assert_eq!(sgd_usd.t, usd_sgd.t);
+    }
+
+    #[test]
+    fn invert_forex_bar_is_its_own_inverse() {
+        // Inverting twice must recover the original bar (up to float
+        // precision) -- this is the real mathematical guarantee the whole
+        // fallback depends on: the platform must see the SAME implied
+        // price series whichever order the real data actually came back
+        // in.
+        let original = bar(1.30, 1.32, 1.28, 1.31);
+        let twice = MassiveDataProvider::invert_forex_bar(&MassiveDataProvider::invert_forex_bar(&original));
+        assert!((twice.o - original.o).abs() < 1e-9);
+        assert!((twice.h - original.h).abs() < 1e-9);
+        assert!((twice.l - original.l).abs() < 1e-9);
+        assert!((twice.c - original.c).abs() < 1e-9);
     }
 }
