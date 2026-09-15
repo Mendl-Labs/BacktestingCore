@@ -1430,14 +1430,26 @@ result = scan(_source_code)
     /// (the documented/native case), then f64 (the common case in
     /// practice), rounding rather than truncating so floating-point noise
     /// (e.g. `0.9999999999`) doesn't silently drop to 0.
-    fn extract_signal_i8(item: &pyo3::Bound<'_, pyo3::PyAny>) -> i8 {
+    ///
+    /// 2026-09-15: the float64 fix above left one gap -- anything that's
+    /// NEITHER an int NOR a float (a Python string, e.g. a strategy that
+    /// returns `"HOLD"`/`"BUY"`/`"SELL"` instead of numeric codes) still
+    /// silently fell through to `0`. Confirmed live: an AI-generated
+    /// `stat_arb_pairs` strategy returning string signals produced a
+    /// "completed" backtest with 0 trades and no visible error anywhere --
+    /// indistinguishable from a legitimately flat strategy. Unlike the
+    /// float64 case, there is no correct numeric value to coerce a string
+    /// to, so this returns `None` (mirroring `extract_size_f64`'s already-
+    /// correct pattern just below) and the caller surfaces a real error
+    /// instead of a second silent default.
+    fn extract_signal_i8(item: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<i8> {
         if let Ok(v) = item.extract::<i64>() {
-            return v.clamp(-128, 127) as i8;
+            return Some(v.clamp(-128, 127) as i8);
         }
         if let Ok(v) = item.extract::<f64>() {
-            return v.round().clamp(-128.0, 127.0) as i8;
+            return Some(v.round().clamp(-128.0, 127.0) as i8);
         }
-        0
+        None
     }
 
     /// Convert one `compute_position_sizes()` output element to `f64`.
@@ -2376,8 +2388,17 @@ _thread.start_new_thread(_persistent_watchdog, ())
                 };
 
             let mut sigs = Vec::with_capacity(items.len());
-            for item in &items {
-                sigs.push(Self::extract_signal_i8(item));
+            for (i, item) in items.iter().enumerate() {
+                match Self::extract_signal_i8(item) {
+                    Some(v) => sigs.push(v),
+                    None => {
+                        return Err(StrategyError::CalculationError(format!(
+                            "compute_signals() returned a non-numeric value at index {}: {:?} -- \
+                            expected int8 (-1=SELL, 0=HOLD, 1=BUY, 2=CLOSE)",
+                            i, item
+                        )));
+                    }
+                }
             }
 
             log_debug!(
@@ -2716,8 +2737,17 @@ _thread.start_new_thread(_persistent_watchdog, ())
                 };
 
             let mut sigs = Vec::with_capacity(items.len());
-            for item in &items {
-                sigs.push(Self::extract_signal_i8(item));
+            for (i, item) in items.iter().enumerate() {
+                match Self::extract_signal_i8(item) {
+                    Some(v) => sigs.push(v),
+                    None => {
+                        return Err(StrategyError::CalculationError(format!(
+                            "compute_signals_multi_venue() returned a non-numeric value at index {}: {:?} -- \
+                            expected int8 (-1=SELL, 0=HOLD, 1=BUY, 2=CLOSE)",
+                            i, item
+                        )));
+                    }
+                }
             }
 
             log_debug!(
@@ -3557,6 +3587,56 @@ class Strategy(BaseStrategy):
             &signals[5..], &[1, 1, 1, 1, 1],
             "float64 1.0 entries must be read as BUY (1), not silently dropped to HOLD (0) -- \
              this is the exact bug that made a real production strategy trade 0 times",
+        );
+    }
+
+    /// Regression test (2026-09-15): the float64 fix above left one gap --
+    /// a strategy whose `compute_signals()` returns STRINGS instead of
+    /// numeric codes (confirmed live in an AI-generated `stat_arb_pairs`
+    /// strategy: `["HOLD"] * n`, `"BUY"`/`"SELL"`/`"CLOSE"` elsewhere) used
+    /// to fall through `extract_signal_i8`'s old unconditional `0` default,
+    /// producing a "completed" backtest with 0 trades and no error --
+    /// indistinguishable from a legitimately flat strategy. Must now fail
+    /// loudly instead.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_rejects_non_numeric_signal_values() {
+        use crate::Strategy;
+
+        const STRING_SIGNAL_STRATEGY: &str = r#"
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "StringSignalBug"
+
+    def compute_signals(self, prices, volumes, timestamps):
+        # The exact live bug shape -- strings instead of int8 codes.
+        return ["HOLD"] * len(prices)
+"#;
+
+        let mut strategy = PythonStrategy::new(STRING_SIGNAL_STRATEGY.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+
+        let signals = strategy
+            .compute_all_signals(
+                &[1.0; 10],
+                &[1.0; 10],
+                &[0i64; 10],
+                &[],
+                &[],
+                &[],
+            )
+            .await;
+
+        assert!(
+            signals.is_err(),
+            "a strategy returning string signals must fail loudly, not silently complete with 0 trades"
+        );
+        let msg = format!("{}", signals.err().unwrap());
+        assert!(
+            msg.contains("non-numeric"),
+            "error message should name the actual problem, got: {msg}"
         );
     }
 
