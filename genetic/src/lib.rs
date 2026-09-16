@@ -987,8 +987,17 @@ impl<C: Chromosome + 'static> GeneticOptimizer<C> {
                 .zip(fitness_results.iter())
                 .map(|(((idx, c), &fit), result)| (idx, c, fit, result))
                 .collect();
-            indexed_population.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-            
+            // total_cmp, not partial_cmp().unwrap() -- a degenerate
+            // chromosome (e.g. 0 trades -> a NaN Sharpe-based fitness) used
+            // to panic this generation outright on a bare unwrap; a sibling
+            // pattern (partial_cmp().unwrap_or(Equal), which fails
+            // differently but for the same underlying reason) crashed the
+            // BacktestingEngine job-coordinator in a self-perpetuating
+            // restart loop, blocking every queued job for ~5 hours
+            // (2026-09-16 production incident). total_cmp defines a genuine
+            // total order over every f64 including NaN.
+            indexed_population.sort_by(|a, b| b.2.total_cmp(&a.2));
+
             // Track best fitness BEFORE updating (for convergence check)
             let previous_best_fitness = best_fitness;
             
@@ -1133,7 +1142,9 @@ impl<C: Chromosome + 'static> GeneticOptimizer<C> {
     fn apply_robustness_penalty(&self, fitnesses: &mut [f64], results: &[FitnessResult]) {
         // Find fitness threshold for top N%
         let mut sorted = fitnesses.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup earlier in this file.
+        sorted.sort_by(|a, b| b.total_cmp(a));
         let threshold_idx = ((1.0 - self.config.top_percentile_threshold) * sorted.len() as f64) as usize;
         let fitness_threshold = sorted[threshold_idx.min(sorted.len().saturating_sub(1))];
         
@@ -1599,7 +1610,9 @@ impl<C: Chromosome + 'static> AdaptiveGeneticOptimizer<C> {
                 .zip(fitness_results.iter())
                 .map(|(((idx, c), &fit), result)| (idx, c, fit, result))
                 .collect();
-            indexed_population.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            // total_cmp, not partial_cmp().unwrap() -- see the matching fix
+            // earlier in this file for why (2026-09-16 production incident).
+            indexed_population.sort_by(|a, b| b.2.total_cmp(&a.2));
 
             // Bug #29 — snapshot the sorted (chromosome, fitness) pairs so that
             // after `run()` returns the caller can derive `top_n_params`. We

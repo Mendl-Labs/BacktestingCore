@@ -224,7 +224,10 @@ impl HiddenMarkovModel {
     fn initialize_emissions_from_data(&mut self, observations: &[f64]) {
         let n = self.config.num_regimes;
         let mut sorted = observations.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup (BacktestingEngine's
+        // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+        sorted.sort_by(f64::total_cmp);
         
         let overall_mean: f64 = observations.iter().sum::<f64>() / observations.len() as f64;
         let overall_var: f64 = observations.iter()

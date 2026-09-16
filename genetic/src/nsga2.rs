@@ -278,7 +278,10 @@ fn hypervolume_2d(front: &[ParetoSolution], objectives: &[ObjectiveDef]) -> f64 
     }).collect();
 
     // Sort by first objective descending
-    pts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the 2026-09-16
+    // production-incident writeup (BacktestingEngine's
+    // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+    pts.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     // Sweep
     let ref_x = 0.0;
@@ -366,7 +369,7 @@ impl<C: Chromosome + 'static> NsgaIIOptimizer<C> {
             let mut sorted: Vec<usize> = (0..population.len()).collect();
             sorted.sort_by(|&a, &b| {
                 rank[a].cmp(&rank[b])
-                    .then(crowd[b].partial_cmp(&crowd[a]).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(crowd[b].total_cmp(&crowd[a]))
             });
 
             // Per-generation summary

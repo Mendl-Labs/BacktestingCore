@@ -891,7 +891,10 @@ pub fn extract_top_n(
 
     // Sort by fitness descending
     let mut sorted: Vec<_> = population.to_vec();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the 2026-09-16
+    // production-incident writeup (BacktestingEngine's
+    // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+    sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     // Take top 2N candidates
     let candidates: Vec<_> = sorted.into_iter().take(n * 2).collect();
