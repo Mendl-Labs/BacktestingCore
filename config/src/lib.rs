@@ -1167,7 +1167,7 @@ impl ExchangeFeeConfig {
     /// Supports all major CEX exchanges, prop firms, and DEX protocols.
     pub fn for_exchange(exchange: &str) -> Self {
         match exchange.to_lowercase().as_str() {
-            "massive" | "exchange" => Self::kraken(), // Massive aggregates multiple venues; use kraken-like fee model as baseline
+            "exchange" => Self::kraken(),
             "kraken" | "krkn" => Self::kraken(),
             "kraken_colocated" | "kraken-colocated" => Self::kraken_colocated(),
             "kraken_established" | "kraken-established" => Self::kraken_established(),
@@ -1187,7 +1187,12 @@ impl ExchangeFeeConfig {
             "oanda" | "oanda_forex" | "forex" | "fx" => Self::oanda(),
             // US equities: "consolidated" (NBBO) and the individual listing
             // venues all execute through Alpaca's commission-free model.
-            "alpaca" | "alpaca_stocks" | "stocks" | "equities"
+            // "massive" is the market-data VENDOR (Polygon.io), never a real
+            // tradable exchange -- every historical use of it in this
+            // codebase was for equities, so it aliases to Alpaca's fee
+            // model here rather than the unrelated kraken baseline it used
+            // to fall back to (2026-09-16, alpaca/massive labeling fix).
+            "alpaca" | "alpaca_stocks" | "stocks" | "equities" | "massive"
             | "consolidated" | "nasdaq" | "nyse" | "nyse_arca" | "nyse-arca" | "amex" => Self::alpaca(),
             "breakout" => Self::breakout(),
             "deepbook" | "sui" => Self::deepbook(),
@@ -2492,8 +2497,14 @@ mod tests {
 
     #[test]
     fn test_fee_routing_stocks_use_alpaca() {
-        // Stock asset class uses "consolidated"; individual venues also appear
-        for id in ["consolidated", "nasdaq", "nyse", "nyse_arca", "nyse-arca", "amex"] {
+        // Stock asset class uses "consolidated"; individual venues also
+        // appear. "massive" (2026-09-16, alpaca/massive labeling fix) is
+        // included here deliberately -- it's the market-data vendor, not a
+        // real exchange, but every historical use of it in this codebase
+        // was for equities, so a stray occurrence must still resolve to
+        // Alpaca's real fee schedule, not the unrelated kraken baseline it
+        // used to silently fall back to.
+        for id in ["consolidated", "nasdaq", "nyse", "nyse_arca", "nyse-arca", "amex", "massive"] {
             let cfg = ExchangeFeeConfig::for_exchange(id);
             assert_eq!(cfg.exchange, "alpaca", "stock id '{}' must route to alpaca", id);
             assert_eq!(cfg.maker_fee, 0.0, "equities are commission-free");
