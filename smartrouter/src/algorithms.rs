@@ -138,7 +138,7 @@ pub fn route_multi_venue(
         })
         .collect();
     
-    scored_venues.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    scored_venues.sort_by(|a, b| b.2.total_cmp(&a.2));
     
     // Take top N venues
     let venues_to_use: Vec<_> = scored_venues.into_iter()

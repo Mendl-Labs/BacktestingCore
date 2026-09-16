@@ -1253,7 +1253,7 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         avg_trade_return: Some(avg_return),
         median_trade_return: if n > 0 {
             let mut sorted = stat_returns.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| a.total_cmp(b));
             Some(sorted[n / 2])
         } else { None },
         avg_trade_duration: {

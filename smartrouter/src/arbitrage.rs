@@ -227,7 +227,7 @@ impl ArbitrageRouter {
         }
         
         // Sort by profit (best first)
-        opportunities.sort_by(|a, b| b.net_profit_bps.partial_cmp(&a.net_profit_bps).unwrap());
+        opportunities.sort_by(|a, b| b.net_profit_bps.total_cmp(&a.net_profit_bps));
         
         opportunities
     }

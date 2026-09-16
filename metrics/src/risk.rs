@@ -351,7 +351,7 @@ pub fn conditional_drawdown_at_risk(equity_curve: &[f64], confidence: f64) -> Op
 		return None;
 	}
 	let mut dd = drawdown_series(equity_curve);
-	dd.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
+	dd.sort_by(|a, b| b.total_cmp(a)); // descending
 	let tail_count = ((1.0 - confidence) * dd.len() as f64).ceil().max(1.0) as usize;
 	let tail_count = tail_count.min(dd.len());
 	let tail_sum: f64 = dd[..tail_count].iter().sum();

@@ -150,7 +150,7 @@ fn cross_sectional_rank_spread_by(
         let mut signal: Vec<(usize, f64)> = (0..n_symbols)
             .map(|i| (i, signal_fn(&returns[i][period_start..rank_end])))
             .collect();
-        signal.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        signal.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let winner_indices: Vec<usize> = signal[..half].iter().map(|(i, _)| *i).collect();
         let loser_indices: Vec<usize> = signal[n_symbols - half..].iter().map(|(i, _)| *i).collect();
@@ -310,7 +310,7 @@ pub fn cross_sectional_rank_spread_by_class(
             .collect();
 
         let mut signal = z_signal;
-        signal.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        signal.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let winner_indices: Vec<usize> = signal[..half].iter().map(|(i, _)| *i).collect();
         let loser_indices: Vec<usize> = signal[n_symbols - half..].iter().map(|(i, _)| *i).collect();

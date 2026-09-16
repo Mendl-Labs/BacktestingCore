@@ -226,7 +226,7 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
         return 0.0;
     }
 
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(|a, b| a.total_cmp(b));
     let index = (p / 100.0 * (values.len() - 1) as f64).round() as usize;
     values[index.min(values.len() - 1)]
 }
@@ -686,10 +686,10 @@ fn run_monte_carlo_simulation_internal(
     let std_win_rate = std_dev(&all_win_rates);
 
     // Sort for percentiles
-    all_net_profits.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_sharpe_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_max_drawdowns.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    all_win_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    all_net_profits.sort_by(|a, b| a.total_cmp(b));
+    all_sharpe_ratios.sort_by(|a, b| a.total_cmp(b));
+    all_max_drawdowns.sort_by(|a, b| a.total_cmp(b));
+    all_win_rates.sort_by(|a, b| a.total_cmp(b));
 
     let mut percentiles = HashMap::new();
     for &p in &[5, 25, 50, 75, 95] {
@@ -1128,7 +1128,7 @@ fn fan_chart_from_paths(paths: &[Vec<f64>], path_len: usize, initial_capital: f6
         let mut step_equities: Vec<f64> = paths.iter()
             .filter_map(|path| path.get(step).copied())
             .collect();
-        step_equities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        step_equities.sort_by(|a, b| a.total_cmp(b));
         if step_equities.is_empty() {
             fan_chart.push([initial_capital; 5]);
         } else {
@@ -1192,7 +1192,7 @@ fn build_monte_carlo_result(
     
     // VaR and CVaR
     let mut sorted_profits = all_net_profits.clone();
-    sorted_profits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_profits.sort_by(|a, b| a.total_cmp(b));
     let var_95_index = (0.05 * sorted_profits.len() as f64) as usize;
     let percentile_5_profit = sorted_profits[var_95_index];
     

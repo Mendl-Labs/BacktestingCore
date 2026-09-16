@@ -2834,7 +2834,10 @@ fn build_backtest_result(
 
     let median_trade_return = if !actual_returns.is_empty() {
         let mut sorted = actual_returns.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup (BacktestingEngine's
+        // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+        sorted.sort_by(f64::total_cmp);
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 0 {
             Some((sorted[mid - 1] + sorted[mid]) / 2.0)

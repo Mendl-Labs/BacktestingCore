@@ -458,7 +458,7 @@ fn percentile(data: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }

@@ -16,7 +16,7 @@ pub fn benjamini_hochberg(p_values: &[f64]) -> Vec<f64> {
     }
 
     let mut indexed: Vec<(usize, f64)> = p_values.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     // Standard BH construction: q_(i) = min_{k=i}^{m} min(1, m/k * p_(k)),
     // computed from the largest rank down so each adjusted value is never
@@ -89,7 +89,7 @@ mod tests {
         let raw = vec![0.2, 0.001, 0.15, 0.04, 0.09];
         let adjusted = benjamini_hochberg(&raw);
         let mut pairs: Vec<(f64, f64)> = raw.iter().copied().zip(adjusted.iter().copied()).collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
         for w in pairs.windows(2) {
             assert!(w[1].1 >= w[0].1 - 1e-12, "BH q-values must be non-decreasing in p-value rank");
         }

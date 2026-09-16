@@ -430,7 +430,7 @@ impl MetricCollector for ExecutionQualityCollector {
 
         let median_ttf = if !self.time_to_fill_samples.is_empty() {
             let mut sorted = self.time_to_fill_samples.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| a.total_cmp(b));
             let mid = sorted.len() / 2;
             if sorted.len() % 2 == 0 && sorted.len() > 1 { (sorted[mid-1] + sorted[mid]) / 2.0 } else { sorted[mid] }
         } else { 0.0 };

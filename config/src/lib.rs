@@ -2038,7 +2038,7 @@ impl ExchangeFeeConfig {
         let applicable_tier = self.volume_tiers
             .iter()
             .filter(|tier| volume_30d >= tier.min_volume_30d)
-            .max_by(|a, b| a.min_volume_30d.partial_cmp(&b.min_volume_30d).unwrap())
+            .max_by(|a, b| a.min_volume_30d.total_cmp(&b.min_volume_30d))
             .unwrap_or(&fallback_tier);
 
         if is_maker {

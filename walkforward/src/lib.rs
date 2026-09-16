@@ -725,7 +725,7 @@ impl WalkForwardAnalyzer {
         let mut is_ranked: Vec<(usize, f64)> = in_sample.iter().enumerate()
             .map(|(i, &v)| (i, v))
             .collect();
-        is_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        is_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         
         let median_rank = n / 2;
         
@@ -752,7 +752,7 @@ impl WalkForwardAnalyzer {
             return 0.0;
         }
         let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| a.total_cmp(b));
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 0 {
             (sorted[mid - 1] + sorted[mid]) / 2.0

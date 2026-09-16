@@ -52,7 +52,7 @@ pub fn quantile_analysis(
     }
 
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| feature[a].partial_cmp(&feature[b]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| feature[a].total_cmp(&feature[b]));
 
     let mut buckets = Vec::with_capacity(bucket_count);
     let base_size = n / bucket_count;

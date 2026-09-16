@@ -23,7 +23,7 @@ pub struct IcResult {
 fn rank(values: &[f64]) -> Vec<f64> {
     let n = values.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| values[a].partial_cmp(&values[b]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
 
     let mut ranks = vec![0.0; n];
     let mut i = 0;
