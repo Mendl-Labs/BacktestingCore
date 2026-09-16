@@ -156,10 +156,11 @@ pub fn crowding_distance_assignment(
     for m in 0..num_objectives {
         // Sort front members by objective m
         let mut sorted_indices: Vec<usize> = (0..l).collect();
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 repo-wide NaN-comparator sweep's own rationale; this
+        // occurrence was missed by that sweep.
         sorted_indices.sort_by(|&a, &b| {
-            pop_objectives[front[a]][m]
-                .partial_cmp(&pop_objectives[front[b]][m])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            pop_objectives[front[a]][m].total_cmp(&pop_objectives[front[b]][m])
         });
 
         // Boundary points get infinite distance
