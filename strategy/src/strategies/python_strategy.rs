@@ -1486,6 +1486,54 @@ result = scan(_source_code)
         Ok(dict)
     }
 
+    /// Give a strategy that has no usable SDK `initialize(parameters)` the
+    /// same parameter semantics `BaseStrategy.initialize` provides: keep an
+    /// existing `self.params` dict, seed `parameter_space()` defaults that
+    /// aren't already set, then apply the engine-supplied values on top.
+    /// Best effort -- a class that forbids attribute assignment keeps its
+    /// old (parameterless) behavior, with a warning instead of a failure.
+    fn apply_params_without_sdk_initialize(
+        py: Python<'_>,
+        strategy: &Bound<'_, PyAny>,
+        params: &Bound<'_, PyDict>,
+    ) {
+        const APPLY_PARAMS: &str = r#"
+def _tp_apply_params(obj, parameters):
+    params = getattr(obj, "params", None)
+    if not isinstance(params, dict):
+        params = {}
+    space_fn = getattr(obj, "parameter_space", None)
+    if callable(space_fn):
+        try:
+            space = space_fn()
+        except Exception:
+            space = None
+        if isinstance(space, dict):
+            for key, spec in space.items():
+                if key not in params and isinstance(spec, dict) and "default" in spec:
+                    params[key] = spec["default"]
+    if parameters:
+        params.update(parameters)
+    obj.params = params
+"#;
+        let globals = PyDict::new_bound(py);
+        let result = py
+            .run_bound(APPLY_PARAMS, Some(&globals), None)
+            .and_then(|_| {
+                globals
+                    .get_item("_tp_apply_params")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("_tp_apply_params missing"))
+            })
+            .and_then(|f| f.call1((strategy, params)).map(|_| ()));
+        if let Err(e) = result {
+            log_warn!(
+                STRATEGY_LOGGER,
+                "Strategy has no SDK initialize(parameters); could not apply parameters to self.params: {}",
+                e
+            );
+        }
+    }
+
     // ── Derivatives helpers ──────────────────────────────────────────
 
     /// Extract `DerivativeMetadata` from the Python signal dict's `metadata.instrument`.
@@ -1799,17 +1847,30 @@ impl Strategy for PythonStrategy {
         Python::with_gil(|py| {
             let strategy = py_obj.bind(py);
 
-            if !strategy.hasattr("initialize").unwrap_or(false) {
-                return Ok::<(), StrategyError>(());
-            }
-
             let params_dict = Self::params_to_py(py, &parameters).map_err(|e| {
                 StrategyError::ConfigurationError(format!("Parameter conversion error: {}", e))
             })?;
 
-            if let Err(e) = strategy.call_method1("initialize", (params_dict,)) {
+            // 2026-09-16: both malformed shapes used to DROP every
+            // parameter silently -- self.params stayed whatever __init__
+            // left it ({} for the common `__init__(self, params=None)`), so
+            // tuned parameter_space() values never reached compute_signals
+            // and pooled pairs/baskets could never read their per-member
+            // symbol_a/exchange_a identity. Confirmed in production: every
+            // pair_spec() identity rejection in eval-harness baseline
+            // a9772a86 was a plain `class Strategy:` that already read
+            // self.params.get("symbol_a", ...) exactly as instructed, and
+            // switching to self.params["symbol_a"] raised KeyError. Apply
+            // BaseStrategy.initialize()'s own semantics instead.
+            if !strategy.hasattr("initialize").unwrap_or(false) {
+                Self::apply_params_without_sdk_initialize(py, strategy, &params_dict);
+                return Ok::<(), StrategyError>(());
+            }
+
+            if let Err(e) = strategy.call_method1("initialize", (params_dict.clone(),)) {
                 let arity_mismatch = e.to_string().contains("positional argument");
                 if arity_mismatch && strategy.call_method0("initialize").is_ok() {
+                    Self::apply_params_without_sdk_initialize(py, strategy, &params_dict);
                     return Ok(());
                 }
                 return Err(StrategyError::ConfigurationError(format!(
@@ -3530,6 +3591,49 @@ class Strategy(BaseStrategy):
              parameter, got: {:?}",
             signals.err()
         );
+    }
+
+    /// Production eval-harness baseline a9772a86: a plain `class Strategy:`
+    /// (no BaseStrategy, so no `initialize`) with the common
+    /// `__init__(self, params=None)` shape silently lost every engine-
+    /// supplied parameter -- pooled pairs couldn't read their per-member
+    /// identity and `self.params["symbol_a"]` raised KeyError.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn initialize_applies_parameters_to_a_class_without_sdk_initialize() {
+        use crate::Strategy;
+
+        const PLAIN_CLASS_READING_PARAMS: &str = r#"
+import numpy as np
+
+class Strategy:
+    def __init__(self, params=None):
+        self.params = params or {}
+
+    def name(self):
+        return "PlainClassPairs"
+
+    def parameter_space(self):
+        return {"lookback_bars": {"type": "int", "default": 60, "min": 20, "max": 120}}
+
+    def compute_signals(self, prices, volumes, timestamps):
+        # Direct indexing: both the engine-supplied identity and the
+        # declared default must be present.
+        assert self.params["symbol_a"] == "CAD-SGD", self.params
+        assert self.params["lookback_bars"] == 60, self.params
+        return np.zeros(len(prices), dtype=np.int8)
+"#;
+
+        let mut parameters = std::collections::HashMap::new();
+        parameters.insert("symbol_a".to_string(), ParameterValue::String("CAD-SGD".to_string()));
+        let mut strategy = PythonStrategy::new(PLAIN_CLASS_READING_PARAMS.to_string());
+        let init = strategy.initialize(parameters).await;
+        assert!(init.is_ok(), "initialize() failed: {:?}", init.err());
+
+        let signals = strategy
+            .compute_all_signals(&[1.0, 2.0, 3.0], &[1.0; 3], &[0i64; 3], &[], &[], &[])
+            .await;
+        assert!(signals.is_ok(), "parameters were not applied to self.params: {:?}", signals.err());
     }
 
     /// Regression test for production jobs `9e1ce0e1`/`5db4828c` (2026-07-24):
