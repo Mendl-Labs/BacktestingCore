@@ -41,6 +41,26 @@ use strategy::traits::{HedgeRatioMode, PairSpec, VenueSeries};
 pub struct PairLegFeeConfig {
     pub taker_fee: f64,
     pub slippage_bps: f64,
+    /// Overnight financing charged on this leg's notional per calendar day
+    /// held, as a fraction (e.g. `0.0000274` = 1%/year). Applied to BOTH
+    /// long and short legs as a COST, never a credit: this models the
+    /// broker's financing markup, not the interest-rate differential a real
+    /// carry position earns or pays.
+    ///
+    /// 2026-09-17: was not modelled at all. `ExchangeFeeConfig::oanda()` set
+    /// `swap_fee_daily: 0.0` with the comment "handled separately by forex
+    /// swap logic" -- no such logic existed anywhere, and the value was read
+    /// only to report it to the agent. That let a held FX position cost
+    /// nothing beyond spread, which matters most exactly where this
+    /// platform's first Promising verdict landed (job a6dcf6e6: EM crosses
+    /// on TRY/ZAR/MXN, where the rate differential dwarfs the price moves
+    /// being traded).
+    ///
+    /// The real differential is NOT modelled here -- doing that honestly
+    /// needs an interest-rate series this platform does not have, so the
+    /// submission path refuses FX legs whose carry is large and unmodelled
+    /// rather than inventing a number.
+    pub swap_fee_daily: f64,
 }
 
 /// Configuration for `run_pair_backtest`.
@@ -292,10 +312,13 @@ fn close_pair_position(
     exit_time: DateTime<Utc>,
     exit_reason: &str,
     trade_id: usize,
+    // Overnight financing accrued over the whole holding period, both legs
+    // -- see PairLegFeeConfig::swap_fee_daily.
+    swap_charge: f64,
 ) -> (TradeRecord, f64) {
     let leg_a_pnl = signed_pnl(&pos.leg_a, exit_fill_a) - pos.leg_a.entry_commission - exit_comm_a;
     let leg_b_pnl = signed_pnl(&pos.leg_b, exit_fill_b) - pos.leg_b.entry_commission - exit_comm_b;
-    let net_pnl = leg_a_pnl + leg_b_pnl;
+    let net_pnl = leg_a_pnl + leg_b_pnl - swap_charge;
 
     let entry_notional = pos.leg_a.entry_price * pos.leg_a.quantity * leg_multiplier(pos.leg_a.option_instrument.as_ref())
         + pos.leg_b.entry_price * pos.leg_b.quantity * leg_multiplier(pos.leg_b.option_instrument.as_ref());
@@ -475,9 +498,16 @@ pub fn run_pair_backtest(
                         };
                         let exit_reason = format!("margin_call_liquidation ({} leg)", triggered);
 
+                        let swap_charge = swap_cost(
+                            leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                            fee_a, pos.entry_time, exit_time,
+                        ) + swap_cost(
+                            leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                            fee_b, pos.entry_time, exit_time,
+                        );
                         let (record, net_pnl) = close_pair_position(
                             pos, exit_fill_a, exit_fill_b, exit_comm_a, exit_comm_b, exit_slip_a, exit_slip_b,
-                            exit_time, &exit_reason, next_trade_id,
+                            exit_time, &exit_reason, next_trade_id, swap_charge,
                         );
                         realized_pnl += net_pnl;
                         trades.push(record);
@@ -612,9 +642,16 @@ pub fn run_pair_backtest(
                     let (exit_fill_a, exit_comm_a, exit_slip_a) = taker_fill(price_a, pos.leg_a.quantity, pos.leg_a.side == "short", fee_a, pos.leg_a.option_instrument.as_ref());
                     let (exit_fill_b, exit_comm_b, exit_slip_b) = taker_fill(price_b, pos.leg_b.quantity, pos.leg_b.side == "short", fee_b, pos.leg_b.option_instrument.as_ref());
 
+                    let swap_charge = swap_cost(
+                        leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                        fee_a, pos.entry_time, exit_time,
+                    ) + swap_cost(
+                        leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                        fee_b, pos.entry_time, exit_time,
+                    );
                     let (record, net_pnl) = close_pair_position(
                         pos, exit_fill_a, exit_fill_b, exit_comm_a, exit_comm_b, exit_slip_a, exit_slip_b,
-                        exit_time, "pair close signal", next_trade_id,
+                        exit_time, "pair close signal", next_trade_id, swap_charge,
                     );
                     realized_pnl += net_pnl;
                     trades.push(record);
@@ -632,8 +669,17 @@ pub fn run_pair_backtest(
             if !prices_valid {
                 0.0
             } else {
+                let now = timestamp_from_millis(venue_a.timestamps[t]);
                 signed_pnl(&pos.leg_a, price_a) + signed_pnl(&pos.leg_b, price_b)
                     - pos.leg_a.entry_commission - pos.leg_b.entry_commission
+                    - swap_cost(
+                        leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                        fee_a, pos.entry_time, now,
+                    )
+                    - swap_cost(
+                        leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                        fee_b, pos.entry_time, now,
+                    )
             }
         }).unwrap_or(0.0);
         equity_curve.push(config.initial_capital + realized_pnl + unrealized);
@@ -651,6 +697,23 @@ pub fn run_pair_backtest(
 /// Mark-to-market P&L for one leg at `current_price`, sign-adjusted for side
 /// and scaled by the leg's contract multiplier (1.0 for a plain spot leg;
 /// an option contract's own multiplier otherwise -- see `leg_multiplier`).
+/// Financing cost accrued on one open leg between `entry_time` and `now`,
+/// as a positive number to subtract from P&L. Charged on the leg's entry
+/// notional at `fee.swap_fee_daily` per calendar day, pro-rated for partial
+/// days, on both long and short legs -- see `PairLegFeeConfig::swap_fee_daily`.
+pub(crate) fn swap_cost(leg_notional: f64, fee: PairLegFeeConfig, entry_time: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    if fee.swap_fee_daily <= 0.0 || leg_notional <= 0.0 {
+        return 0.0;
+    }
+    let days = (now - entry_time).num_seconds().max(0) as f64 / 86_400.0;
+    fee.swap_fee_daily * leg_notional.abs() * days
+}
+
+/// One leg's entry notional (price x quantity x contract multiplier).
+pub(crate) fn leg_notional(entry_price: f64, quantity: f64, instrument: Option<&DerivativeMetadata>) -> f64 {
+    entry_price * quantity * leg_multiplier(instrument)
+}
+
 fn signed_pnl(leg: &OpenLeg, current_price: f64) -> f64 {
     let raw = (current_price - leg.entry_price) * leg.quantity * leg_multiplier(leg.option_instrument.as_ref());
     if leg.side == "long" { raw } else { -raw }
@@ -737,11 +800,11 @@ mod tests {
     }
 
     fn default_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.001, slippage_bps: 1.0 }
+        PairLegFeeConfig { taker_fee: 0.001, slippage_bps: 1.0, swap_fee_daily: 0.0 }
     }
 
     fn zero_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 }
     }
 
     fn simple_pair_spec() -> PairSpec {
@@ -801,6 +864,75 @@ mod tests {
         assert_eq!(result.equity_curve.len(), 5);
     }
 
+    /// Daily timestamps, so a holding period is measured in days rather than
+    /// the minute-spaced `venue_series` grid.
+    fn daily_venue_series(prices: Vec<f64>) -> VenueSeries {
+        let n = prices.len();
+        VenueSeries {
+            timestamps: (0..n).map(|i| i as i64 * 86_400_000).collect(),
+            volumes: vec![1.0; n],
+            opens: prices.clone(),
+            highs: prices.clone(),
+            lows: prices.clone(),
+            prices,
+        }
+    }
+
+    #[test]
+    fn overnight_financing_reduces_pnl_in_proportion_to_days_held() {
+        // The gap this closes: a held FX position used to cost nothing
+        // beyond spread, which is exactly where the platform's first
+        // Promising verdict landed (EM crosses on TRY/ZAR/MXN).
+        let prices_a = vec![100.0; 11];
+        let prices_b = vec![50.0; 11];
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), daily_venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), daily_venue_series(prices_b));
+
+        let run = |close_at: usize, swap: f64| {
+            let mut signals = vec![0i8; 11];
+            signals[0] = 1;
+            signals[close_at] = 2;
+            let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: swap };
+            let result = run_pair_backtest(&venues, &simple_pair_spec(), &signals, fee, fee, PairBacktestConfig::default())
+                .expect("should run");
+            result.trades[0].pnl.unwrap()
+        };
+
+        // Flat prices and zero trading costs: without financing the trade is
+        // exactly break-even.
+        assert!((run(5, 0.0)).abs() < 1e-9);
+
+        // 1%/day for 5 days on both legs, each sized from the same capital.
+        let five_days = run(5, 0.01);
+        let ten_days = run(10, 0.01);
+        assert!(five_days < 0.0, "financing must be a cost, got {five_days}");
+        assert!(ten_days < five_days, "10 days must cost more than 5: {ten_days} vs {five_days}");
+        assert!(
+            (ten_days / five_days - 2.0).abs() < 0.01,
+            "cost must scale with days held: 5d={five_days}, 10d={ten_days}",
+        );
+    }
+
+    #[test]
+    fn overnight_financing_is_charged_on_short_legs_too() {
+        // Both directions pay: this models the broker's financing markup,
+        // not an interest-rate differential that one side would earn.
+        let prices_a = vec![100.0; 6];
+        let prices_b = vec![50.0; 6];
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), daily_venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), daily_venue_series(prices_b));
+        let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.01 };
+
+        let long_spread = run_pair_backtest(&venues, &simple_pair_spec(), &[1, 0, 0, 0, 0, 2], fee, fee, PairBacktestConfig::default())
+            .expect("should run").trades[0].pnl.unwrap();
+        let short_spread = run_pair_backtest(&venues, &simple_pair_spec(), &[-1, 0, 0, 0, 0, 2], fee, fee, PairBacktestConfig::default())
+            .expect("should run").trades[0].pnl.unwrap();
+        assert!(long_spread < 0.0 && short_spread < 0.0, "long={long_spread}, short={short_spread}");
+        assert!((long_spread - short_spread).abs() < 1e-9, "both directions pay the same markup");
+    }
+
     #[test]
     fn short_spread_pnl_has_expected_sign() {
         // symbol A rises relative to B -- a long-spread position should
@@ -811,7 +943,7 @@ mod tests {
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
         venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
 
-        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 };
+        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
         let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
 
         let long_spread_signals = vec![1i8, 2];
@@ -1096,7 +1228,7 @@ mod tests {
 
         // taker_fee: 0.0 would zero out a plain leg's commission entirely --
         // an option leg must still be charged via OptionsFeeConfig.
-        let zero_pct_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 };
+        let zero_pct_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
         let signals = vec![1i8, 2];
         let result = run_pair_backtest(&venues, &spec, &signals, zero_pct_fee, zero_pct_fee, config).unwrap();
 
@@ -1204,7 +1336,7 @@ mod tests {
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
         venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
 
-        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 };
+        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
         let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
         // Winning long-spread trade (t0->t1: A rises), then a losing one (t2->t3: A falls).
         let signals = vec![1i8, 2, 1, 2];

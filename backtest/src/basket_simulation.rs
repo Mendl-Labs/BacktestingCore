@@ -156,7 +156,15 @@ fn close_basket_position(
         let (exit_fill, exit_comm, exit_slip) = crate::pair_simulation::taker_fill(exit_prices[i], leg.quantity, leg.side == "short", fees[i], leg.option_instrument.as_ref());
         let multiplier = leg_multiplier(leg.option_instrument.as_ref());
         let raw = (exit_fill - leg.entry_price) * leg.quantity * multiplier;
-        let leg_pnl = (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission - exit_comm;
+        // Overnight financing over the holding period -- see
+        // PairLegFeeConfig::swap_fee_daily.
+        let financing = crate::pair_simulation::swap_cost(
+            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+            fees[i],
+            pos.entry_time,
+            exit_time,
+        );
+        let leg_pnl = (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission - exit_comm - financing;
         net_pnl += leg_pnl;
         total_commission += leg.entry_commission + exit_comm;
         total_slippage += leg.entry_slippage + exit_slip;
@@ -406,9 +414,16 @@ pub fn run_basket_backtest(
             if !prices_valid {
                 0.0
             } else {
+                let now = timestamp_from_millis(leg_venues[0].timestamps[t]);
                 pos.legs.iter().enumerate().map(|(i, leg)| {
                     let raw = (prices[i] - leg.entry_price) * leg.quantity * leg_multiplier(leg.option_instrument.as_ref());
                     (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission
+                        - crate::pair_simulation::swap_cost(
+                            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+                            fees[i],
+                            pos.entry_time,
+                            now,
+                        )
                 }).sum()
             }
         }).unwrap_or(0.0);
@@ -494,7 +509,7 @@ mod tests {
     }
 
     fn zero_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 }
     }
 
     fn test_call_instrument(symbol: &str, underlying: &str, strike: f64) -> DerivativeMetadata {

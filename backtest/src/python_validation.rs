@@ -4600,19 +4600,21 @@ mod tests {
         assert!(result.margin.is_infinite());
     }
 
+    /// Both env-var cases in ONE test (2026-09-17). They were two tests
+    /// mutating the same process-wide `ENABLE_CROSS_SECTIONAL_CHECK` on
+    /// different threads, so whichever lost the race read the other's value
+    /// and failed -- a real flake that surfaced as soon as unrelated new
+    /// tests shifted the scheduling.
     #[test]
-    fn cross_sectional_check_disabled_by_default() {
+    fn cross_sectional_check_reads_its_env_var() {
         std::env::remove_var("ENABLE_CROSS_SECTIONAL_CHECK");
         assert!(!cross_sectional_check_enabled());
-    }
-
-    #[test]
-    fn cross_sectional_check_enabled_via_env_var() {
         std::env::set_var("ENABLE_CROSS_SECTIONAL_CHECK", "true");
         assert!(cross_sectional_check_enabled());
         std::env::set_var("ENABLE_CROSS_SECTIONAL_CHECK", "1");
         assert!(cross_sectional_check_enabled());
         std::env::remove_var("ENABLE_CROSS_SECTIONAL_CHECK");
+        assert!(!cross_sectional_check_enabled());
     }
 
     #[test]

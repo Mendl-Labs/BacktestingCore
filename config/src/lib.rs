@@ -1090,9 +1090,19 @@ impl ExchangeFeeConfig {
             // No funding rate — forex uses overnight swap rates instead
             funding_rate_8h: 0.0,
             funding_interval_ms: 24 * 60 * 60 * 1000, // Daily rollover
-            // Overnight swap/rollover fee varies by pair; use approximate average
-            // Actual swap depends on interest rate differential between currencies
-            swap_fee_daily: 0.0,  // Set to 0 — handled separately by forex swap logic
+            // Broker financing MARKUP only: Oanda charges roughly 1%/year
+            // over the interbank rate on both sides of a position, so this
+            // is 0.01/365 per day, applied as a cost to long and short legs
+            // alike (`PairLegFeeConfig::swap_fee_daily`).
+            //
+            // 2026-09-17: was 0.0 with the comment "handled separately by
+            // forex swap logic" -- no such logic existed, so a held FX
+            // position cost nothing beyond spread. What is still NOT modelled
+            // is the interest-rate DIFFERENTIAL (the real carry), which needs
+            // a rate series this platform does not have and which dominates
+            // on EM crosses: the submission path refuses those rather than
+            // inventing a number.
+            swap_fee_daily: 0.01 / 365.0,
             // Verified 2026-07: CFTC/NFA caps US retail forex leverage at
             // 50:1 on major pairs, 20:1 on others; Oanda's US entity follows
             // this exactly. Lower under ESMA/ASIC rules, higher in some
