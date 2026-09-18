@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 
 use crate::types::{TradeLeg, TradeRecord};
 use derivatives::DerivativeMetadata;
@@ -56,11 +56,34 @@ pub struct PairLegFeeConfig {
     /// on TRY/ZAR/MXN, where the rate differential dwarfs the price moves
     /// being traded).
     ///
-    /// The real differential is NOT modelled here -- doing that honestly
-    /// needs an interest-rate series this platform does not have, so the
-    /// submission path refuses FX legs whose carry is large and unmodelled
-    /// rather than inventing a number.
+    /// The real differential rides in `carry_annual_by_year` alongside this.
     pub swap_fee_daily: f64,
+    /// Signed annual carry on a LONG position in this leg, per year covered
+    /// by `config::POLICY_RATES` (index `year - config::POLICY_RATE_BASE_YEAR`).
+    /// Positive means holding long EARNS (the base currency out-yields the
+    /// quote); a short leg earns the negative. All zeros for anything that
+    /// isn't an FX cross, and for FX when the caller had no rate data.
+    ///
+    /// 2026-09-18: added because a flat markup cannot stand in for a real
+    /// differential. Turkish rates ran 15-50% across 2021-2026 while the
+    /// markup charged 1%, and even the G10 yen crosses carried 4-5% a year
+    /// with the BOJ near zero and the RBNZ above 5% -- which is precisely
+    /// what the platform's first two Promising verdicts were built on.
+    pub carry_annual_by_year: [f64; config::POLICY_RATE_YEARS],
+}
+
+impl PairLegFeeConfig {
+    /// Fee config with no financing and no carry -- the right default for
+    /// spot crypto and equities, and what tests want.
+    pub fn new(taker_fee: f64, slippage_bps: f64) -> Self {
+        Self { taker_fee, slippage_bps, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }
+    }
+
+    /// This leg's signed annual carry in `year`, clamped to the table's range.
+    pub fn carry_annual_for_year(&self, year: i32) -> f64 {
+        let idx = (year - config::POLICY_RATE_BASE_YEAR).clamp(0, config::POLICY_RATE_YEARS as i32 - 1) as usize;
+        self.carry_annual_by_year[idx]
+    }
 }
 
 /// Configuration for `run_pair_backtest`.
@@ -504,6 +527,12 @@ pub fn run_pair_backtest(
                         ) + swap_cost(
                             leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
                             fee_b, pos.entry_time, exit_time,
+                        ) - carry_pnl(
+                            leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                            pos.leg_a.side == "long", fee_a, pos.entry_time, exit_time,
+                        ) - carry_pnl(
+                            leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                            pos.leg_b.side == "long", fee_b, pos.entry_time, exit_time,
                         );
                         let (record, net_pnl) = close_pair_position(
                             pos, exit_fill_a, exit_fill_b, exit_comm_a, exit_comm_b, exit_slip_a, exit_slip_b,
@@ -648,6 +677,12 @@ pub fn run_pair_backtest(
                     ) + swap_cost(
                         leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
                         fee_b, pos.entry_time, exit_time,
+                    ) - carry_pnl(
+                        leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                        pos.leg_a.side == "long", fee_a, pos.entry_time, exit_time,
+                    ) - carry_pnl(
+                        leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                        pos.leg_b.side == "long", fee_b, pos.entry_time, exit_time,
                     );
                     let (record, net_pnl) = close_pair_position(
                         pos, exit_fill_a, exit_fill_b, exit_comm_a, exit_comm_b, exit_slip_a, exit_slip_b,
@@ -680,6 +715,14 @@ pub fn run_pair_backtest(
                         leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
                         fee_b, pos.entry_time, now,
                     )
+                    + carry_pnl(
+                        leg_notional(pos.leg_a.entry_price, pos.leg_a.quantity, pos.leg_a.option_instrument.as_ref()),
+                        pos.leg_a.side == "long", fee_a, pos.entry_time, now,
+                    )
+                    + carry_pnl(
+                        leg_notional(pos.leg_b.entry_price, pos.leg_b.quantity, pos.leg_b.option_instrument.as_ref()),
+                        pos.leg_b.side == "long", fee_b, pos.entry_time, now,
+                    )
             }
         }).unwrap_or(0.0);
         equity_curve.push(config.initial_capital + realized_pnl + unrealized);
@@ -707,6 +750,26 @@ pub(crate) fn swap_cost(leg_notional: f64, fee: PairLegFeeConfig, entry_time: Da
     }
     let days = (now - entry_time).num_seconds().max(0) as f64 / 86_400.0;
     fee.swap_fee_daily * leg_notional.abs() * days
+}
+
+/// Carry accrued on one open leg between `entry_time` and `now`, as a signed
+/// P&L contribution: positive when the position earns the interest-rate
+/// differential, negative when it funds it. Long legs take
+/// `carry_annual_for_year` as-is, short legs take its negative -- see
+/// `PairLegFeeConfig::carry_annual_by_year`.
+///
+/// The rate is read at the ENTRY year, not accrued across a year boundary:
+/// holding periods here are days to weeks, so the error is small next to the
+/// table's own approximation, and a position open across New Year simply
+/// keeps its entry year's rate.
+pub(crate) fn carry_pnl(leg_notional: f64, is_long: bool, fee: PairLegFeeConfig, entry_time: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    let annual = fee.carry_annual_for_year(entry_time.year());
+    if annual == 0.0 || leg_notional <= 0.0 {
+        return 0.0;
+    }
+    let days = (now - entry_time).num_seconds().max(0) as f64 / 86_400.0;
+    let signed = if is_long { annual } else { -annual };
+    signed * leg_notional.abs() * days / 365.0
 }
 
 /// One leg's entry notional (price x quantity x contract multiplier).
@@ -800,11 +863,11 @@ mod tests {
     }
 
     fn default_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.001, slippage_bps: 1.0, swap_fee_daily: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.001, slippage_bps: 1.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }
     }
 
     fn zero_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }
     }
 
     fn simple_pair_spec() -> PairSpec {
@@ -893,7 +956,7 @@ mod tests {
             let mut signals = vec![0i8; 11];
             signals[0] = 1;
             signals[close_at] = 2;
-            let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: swap };
+            let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: swap, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] };
             let result = run_pair_backtest(&venues, &simple_pair_spec(), &signals, fee, fee, PairBacktestConfig::default())
                 .expect("should run");
             result.trades[0].pnl.unwrap()
@@ -915,6 +978,56 @@ mod tests {
     }
 
     #[test]
+    fn carry_is_directional_and_uses_the_entry_years_rate() {
+        // A long leg in a high-yield base currency EARNS the differential;
+        // the same leg short PAYS it. This is what a flat markup could never
+        // express, and what both Promising verdicts were built on.
+        let mut carry = [0.0; config::POLICY_RATE_YEARS];
+        let idx_2021 = (2021 - config::POLICY_RATE_BASE_YEAR) as usize;
+        let idx_2024 = (2024 - config::POLICY_RATE_BASE_YEAR) as usize;
+        carry[idx_2021] = 0.04;
+        carry[idx_2024] = 0.40;
+        let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: carry };
+
+        let entry_2021 = DateTime::from_timestamp_millis(1_609_502_400_000).unwrap(); // 2021-01-01
+        let ten_days = entry_2021 + chrono::Duration::days(10);
+        let long_carry = carry_pnl(100_000.0, true, fee, entry_2021, ten_days);
+        let short_carry = carry_pnl(100_000.0, false, fee, entry_2021, ten_days);
+        assert!((long_carry - 100_000.0 * 0.04 * 10.0 / 365.0).abs() < 1e-6, "got {long_carry}");
+        assert!((short_carry + long_carry).abs() < 1e-9, "short must be the exact negative: {short_carry}");
+
+        // Same trade three years later is priced at that year's rate.
+        let entry_2024 = DateTime::from_timestamp_millis(1_704_067_200_000).unwrap(); // 2024-01-01
+        let later = carry_pnl(100_000.0, true, fee, entry_2024, entry_2024 + chrono::Duration::days(10));
+        assert!(later > long_carry * 9.0, "2024's 40% must dwarf 2021's 4%: {later} vs {long_carry}");
+    }
+
+    #[test]
+    fn carry_moves_a_pair_trade_pnl_in_the_direction_the_rates_imply() {
+        let prices_a = vec![100.0; 11];
+        let prices_b = vec![50.0; 11];
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), daily_venue_series(prices_a));
+        venues.insert(("BBB".to_string(), "test".to_string()), daily_venue_series(prices_b));
+        let mut carry = [0.0; config::POLICY_RATE_YEARS];
+        carry[0] = 0.10; // the 1970 timestamps in `daily_venue_series` clamp to the table's first year
+        let earning = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: carry };
+        let flat = PairLegFeeConfig::new(0.0, 0.0);
+
+        let mut signals = vec![0i8; 11];
+        signals[0] = 1;
+        signals[10] = 2;
+        // Leg A long earns +10%/yr, leg B short pays it back at leg B's own
+        // (zero) rate, so the net is a credit against an otherwise flat pair.
+        let with_carry = run_pair_backtest(&venues, &simple_pair_spec(), &signals, earning, flat, PairBacktestConfig::default())
+            .expect("should run").trades[0].pnl.unwrap();
+        let without = run_pair_backtest(&venues, &simple_pair_spec(), &signals, flat, flat, PairBacktestConfig::default())
+            .expect("should run").trades[0].pnl.unwrap();
+        assert!(without.abs() < 1e-9, "flat prices and no costs is break-even, got {without}");
+        assert!(with_carry > 0.0, "a long leg in a high-yield currency must earn carry, got {with_carry}");
+    }
+
+    #[test]
     fn overnight_financing_is_charged_on_short_legs_too() {
         // Both directions pay: this models the broker's financing markup,
         // not an interest-rate differential that one side would earn.
@@ -923,7 +1036,7 @@ mod tests {
         let mut venues = HashMap::new();
         venues.insert(("AAA".to_string(), "test".to_string()), daily_venue_series(prices_a));
         venues.insert(("BBB".to_string(), "test".to_string()), daily_venue_series(prices_b));
-        let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.01 };
+        let fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.01, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] };
 
         let long_spread = run_pair_backtest(&venues, &simple_pair_spec(), &[1, 0, 0, 0, 0, 2], fee, fee, PairBacktestConfig::default())
             .expect("should run").trades[0].pnl.unwrap();
@@ -943,7 +1056,7 @@ mod tests {
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
         venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
 
-        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
+        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] };
         let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
 
         let long_spread_signals = vec![1i8, 2];
@@ -1228,7 +1341,7 @@ mod tests {
 
         // taker_fee: 0.0 would zero out a plain leg's commission entirely --
         // an option leg must still be charged via OptionsFeeConfig.
-        let zero_pct_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
+        let zero_pct_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] };
         let signals = vec![1i8, 2];
         let result = run_pair_backtest(&venues, &spec, &signals, zero_pct_fee, zero_pct_fee, config).unwrap();
 
@@ -1336,7 +1449,7 @@ mod tests {
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series(prices_a));
         venues.insert(("BBB".to_string(), "test".to_string()), venue_series(prices_b));
 
-        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 };
+        let zero_fee = PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] };
         let config = PairBacktestConfig { max_net_exposure_pct: 1.0, ..PairBacktestConfig::default() };
         // Winning long-spread trade (t0->t1: A rises), then a losing one (t2->t3: A falls).
         let signals = vec![1i8, 2, 1, 2];

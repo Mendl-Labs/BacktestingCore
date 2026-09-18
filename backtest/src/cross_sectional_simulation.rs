@@ -38,7 +38,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::pair_simulation::{leg_multiplier, leg_notional, max_drawdown_from_equity, sharpe_from_equity, swap_cost, taker_fill, PairLegFeeConfig};
+use crate::pair_simulation::{carry_pnl, leg_multiplier, leg_notional, max_drawdown_from_equity, sharpe_from_equity, swap_cost, taker_fill, PairLegFeeConfig};
 use crate::types::{TradeLeg, TradeRecord};
 use derivatives::DerivativeMetadata;
 use quant_diagnostics::{cross_sectional_rank_spread_by_class, volatility_tercile_regimes, CrossSectionalRankResult, VolatilityRegime};
@@ -369,6 +369,12 @@ pub fn run_cross_sectional_backtest(
                     fees[leg.asset],
                     entry_time,
                     timestamp_from_millis(timestamps[bar]),
+                ) - carry_pnl(
+                    leg_notional(leg.entry_fill, leg.quantity, instrument),
+                    leg.is_long,
+                    fees[leg.asset],
+                    entry_time,
+                    timestamp_from_millis(timestamps[bar]),
                 );
                 period_pnl += leg_pnl - exit_comm - financing;
                 total_commission += exit_comm;
@@ -514,6 +520,13 @@ pub fn run_cross_sectional_backtest(
                             timestamp_from_millis(timestamps[tranche.entry_bar]),
                             timestamp_from_millis(timestamps[bar]),
                         )
+                        + carry_pnl(
+                            leg_notional(leg.entry_fill, leg.quantity, instrument),
+                            leg.is_long,
+                            fees[leg.asset],
+                            timestamp_from_millis(timestamps[tranche.entry_bar]),
+                            timestamp_from_millis(timestamps[bar]),
+                        )
                 }).sum::<f64>() - tranche.entry_commission
             })
             .sum();
@@ -537,7 +550,7 @@ mod tests {
     }
 
     fn flat_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }
     }
 
     fn test_call_instrument(symbol: &str, underlying: &str, strike: f64) -> DerivativeMetadata {
@@ -667,7 +680,7 @@ mod tests {
         let free_fees = vec![flat_fee(); 4];
         let free_result = run_cross_sectional_backtest(&assets, &prices, &ts, &free_fees, config).unwrap();
 
-        let costly_fees = vec![PairLegFeeConfig { taker_fee: 0.01, slippage_bps: 20.0, swap_fee_daily: 0.0 }; 4];
+        let costly_fees = vec![PairLegFeeConfig { taker_fee: 0.01, slippage_bps: 20.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }; 4];
         let costly_result = run_cross_sectional_backtest(&assets, &prices, &ts, &costly_fees, config).unwrap();
 
         let free_pnl = free_result.summarize(None).total_pnl;

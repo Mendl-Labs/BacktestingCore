@@ -2714,3 +2714,96 @@ mod tests {
         assert!(parsed.random_control);
     }
 }
+
+// ── FX policy rates, for carry ───────────────────────────────────────────
+
+/// First year covered by [`POLICY_RATES`].
+pub const POLICY_RATE_BASE_YEAR: i32 = 2015;
+/// Years covered by [`POLICY_RATES`] (2015..=2030).
+pub const POLICY_RATE_YEARS: usize = 16;
+
+/// Approximate ANNUAL AVERAGE central-bank policy rate, as a fraction
+/// (0.05 = 5%), per currency, for 2015..=2030.
+///
+/// This exists so FX carry -- the interest-rate differential between the two
+/// currencies of a cross -- can be priced at all. Before 2026-09-18 nothing
+/// modelled it: a held FX position cost only spread, which flattered exactly
+/// the trades where carry dominates. The platform's first two Promising
+/// verdicts were both FX baskets (EM crosses on TRY/ZAR/MXN, then G10 crosses
+/// carrying five JPY legs) whose carry was never charged.
+///
+/// These are hand-entered approximations of published policy rates, not a
+/// data feed: good to roughly a percentage point on the majors, cruder on
+/// EM, and the tail years are forecasts that will drift. They are meant to
+/// make carry approximately right instead of exactly zero, which is what
+/// they replace. A real deployment should source a rates series and delete
+/// this table; `annual_policy_rate` returning `None` is what the submission
+/// path refuses on, so adding a currency here is what makes it tradable.
+///
+/// Pegged currencies track their anchor (DKK to EUR, HKD to USD).
+const POLICY_RATES: &[(&str, [f64; POLICY_RATE_YEARS])] = &[
+    //                 2015   2016   2017   2018   2019   2020   2021   2022   2023   2024   2025   2026   2027   2028   2029   2030
+    ("USD", [0.0025, 0.005, 0.0125, 0.020, 0.023, 0.005, 0.001, 0.017, 0.050, 0.051, 0.043, 0.035, 0.030, 0.030, 0.030, 0.030]),
+    ("EUR", [0.0005, 0.000, 0.000, 0.000, 0.000, -0.005, -0.005, 0.005, 0.038, 0.037, 0.024, 0.020, 0.020, 0.020, 0.020, 0.020]),
+    ("JPY", [-0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, 0.001, 0.005, 0.0075, 0.010, 0.010, 0.010, 0.010]),
+    ("GBP", [0.005, 0.0025, 0.0050, 0.0075, 0.0075, 0.001, 0.001, 0.015, 0.048, 0.051, 0.043, 0.0375, 0.033, 0.030, 0.030, 0.030]),
+    ("CHF", [-0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0025, 0.016, 0.013, 0.0025, 0.000, 0.000, 0.000, 0.000, 0.000]),
+    ("CAD", [0.0075, 0.005, 0.0075, 0.0150, 0.0175, 0.0025, 0.0025, 0.023, 0.048, 0.045, 0.029, 0.025, 0.025, 0.025, 0.025, 0.025]),
+    ("AUD", [0.020, 0.0150, 0.0150, 0.0150, 0.010, 0.0025, 0.001, 0.016, 0.039, 0.0435, 0.039, 0.034, 0.032, 0.030, 0.030, 0.030]),
+    ("NZD", [0.028, 0.020, 0.0175, 0.0175, 0.0125, 0.0025, 0.0035, 0.029, 0.054, 0.054, 0.033, 0.0275, 0.027, 0.027, 0.027, 0.027]),
+    ("NOK", [0.010, 0.005, 0.005, 0.0075, 0.0150, 0.000, 0.0025, 0.0150, 0.037, 0.045, 0.043, 0.040, 0.035, 0.035, 0.035, 0.035]),
+    ("SEK", [-0.0035, -0.005, -0.005, -0.005, -0.0025, 0.000, 0.000, 0.012, 0.036, 0.037, 0.021, 0.020, 0.020, 0.020, 0.020, 0.020]),
+    ("DKK", [0.0005, 0.000, 0.000, 0.000, 0.000, -0.005, -0.005, 0.006, 0.039, 0.038, 0.025, 0.021, 0.021, 0.021, 0.021, 0.021]),
+    ("TRY", [0.080, 0.080, 0.080, 0.200, 0.180, 0.130, 0.170, 0.120, 0.250, 0.500, 0.400, 0.300, 0.250, 0.200, 0.200, 0.200]),
+    ("ZAR", [0.060, 0.070, 0.0675, 0.0675, 0.0650, 0.040, 0.035, 0.055, 0.081, 0.081, 0.073, 0.070, 0.070, 0.070, 0.070, 0.070]),
+    ("MXN", [0.030, 0.0425, 0.070, 0.0775, 0.0775, 0.045, 0.045, 0.080, 0.1125, 0.108, 0.088, 0.075, 0.070, 0.070, 0.070, 0.070]),
+    ("PLN", [0.0150, 0.0150, 0.0150, 0.0150, 0.0150, 0.0025, 0.007, 0.062, 0.064, 0.0575, 0.050, 0.045, 0.040, 0.040, 0.040, 0.040]),
+    ("HUF", [0.0135, 0.009, 0.009, 0.009, 0.009, 0.006, 0.019, 0.105, 0.135, 0.070, 0.065, 0.060, 0.055, 0.050, 0.050, 0.050]),
+    ("CZK", [0.0005, 0.0005, 0.0025, 0.0125, 0.020, 0.0035, 0.0150, 0.064, 0.070, 0.048, 0.035, 0.035, 0.035, 0.035, 0.035, 0.035]),
+    ("SGD", [0.010, 0.010, 0.010, 0.0150, 0.0175, 0.003, 0.003, 0.020, 0.037, 0.035, 0.020, 0.018, 0.018, 0.018, 0.018, 0.018]),
+    ("HKD", [0.005, 0.0075, 0.0150, 0.0225, 0.025, 0.005, 0.005, 0.020, 0.053, 0.053, 0.045, 0.038, 0.033, 0.033, 0.033, 0.033]),
+    ("CNH", [0.0435, 0.0435, 0.0435, 0.0435, 0.0425, 0.0385, 0.0385, 0.0365, 0.0345, 0.031, 0.030, 0.028, 0.028, 0.028, 0.028, 0.028]),
+    ("INR", [0.0725, 0.0650, 0.060, 0.0650, 0.0515, 0.040, 0.040, 0.050, 0.065, 0.065, 0.060, 0.055, 0.055, 0.055, 0.055, 0.055]),
+    ("KRW", [0.0175, 0.0125, 0.0150, 0.0175, 0.0125, 0.005, 0.0075, 0.025, 0.035, 0.034, 0.026, 0.023, 0.023, 0.023, 0.023, 0.023]),
+    ("ILS", [0.001, 0.001, 0.001, 0.0025, 0.0025, 0.001, 0.001, 0.0150, 0.046, 0.045, 0.044, 0.040, 0.035, 0.035, 0.035, 0.035]),
+    ("BRL", [0.1350, 0.1400, 0.1000, 0.0650, 0.0600, 0.0275, 0.050, 0.1325, 0.130, 0.110, 0.140, 0.130, 0.110, 0.100, 0.100, 0.100]),
+];
+
+/// Approximate annual policy rate for `currency` in `year`, as a fraction.
+/// `None` for a currency with no entry -- the submission path refuses those
+/// rather than pricing their carry at zero. Years outside the table clamp to
+/// its first/last column.
+pub fn annual_policy_rate(currency: &str, year: i32) -> Option<f64> {
+    let code = currency.trim().to_ascii_uppercase();
+    let row = POLICY_RATES.iter().find(|(c, _)| *c == code)?;
+    let idx = (year - POLICY_RATE_BASE_YEAR).clamp(0, POLICY_RATE_YEARS as i32 - 1) as usize;
+    Some(row.1[idx])
+}
+
+/// Split an FX cross symbol into its (base, quote) currency codes --
+/// "EUR-JPY", "EUR/JPY" and "EURJPY" all give ("EUR", "JPY"). `None` when
+/// the symbol isn't a recognizable 3+3 cross.
+pub fn split_fx_pair(symbol: &str) -> Option<(String, String)> {
+    let cleaned: String = symbol.trim().to_ascii_uppercase();
+    let parts: Vec<&str> = cleaned.split(['-', '/', '_']).filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [base, quote] if base.len() == 3 && quote.len() == 3 => Some((base.to_string(), quote.to_string())),
+        [single] if single.len() == 6 => Some((single[..3].to_string(), single[3..].to_string())),
+        _ => None,
+    }
+}
+
+/// Signed annual carry on a LONG position in `symbol` for each year the
+/// policy-rate table covers: holding the base currency earns its rate and
+/// funds it in the quote currency, so carry is `rate(base) - rate(quote)`.
+/// A short position earns the negative of this. `None` when the symbol isn't
+/// an FX cross or either currency is missing from the table.
+pub fn fx_carry_by_year(symbol: &str) -> Option<[f64; POLICY_RATE_YEARS]> {
+    let (base, quote) = split_fx_pair(symbol)?;
+    let mut out = [0.0; POLICY_RATE_YEARS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let year = POLICY_RATE_BASE_YEAR + i as i32;
+        *slot = annual_policy_rate(&base, year)? - annual_policy_rate(&quote, year)?;
+    }
+    Some(out)
+}
