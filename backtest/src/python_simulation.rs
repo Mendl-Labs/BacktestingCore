@@ -437,9 +437,16 @@ async fn run_with_input(
     let adverse_selection = config.backtest_config.trading.adverse_selection;
     let fill_volume_fraction = config.backtest_config.trading.fill_volume_fraction;
     let synthetic_book_cfg = if config.backtest_config.trading.use_synthetic_book {
+        // Bar length from the candles' own timestamps, not a config field:
+        // the book's volatility-widening term is scaled by it (see
+        // `SyntheticBookConfig::bar_minutes`), and a mislabelled interval
+        // would silently mis-price every fill.
+        let bar_minutes = median_candle_spacing_minutes(&input).unwrap_or(crate::synthetic_book::REFERENCE_BAR_MINUTES);
+        log_info!(BACKTEST_LOGGER, "Synthetic book: {:.0}-minute bars (median candle spacing)", bar_minutes);
         Some(SyntheticBookConfig {
             spread_bps: config.backtest_config.trading.synthetic_spread_bps,
             depth_levels: config.backtest_config.trading.synthetic_depth_levels,
+            bar_minutes,
             ..Default::default()
         })
     } else {
@@ -1956,6 +1963,35 @@ fn i8_to_signals(
     }
 }
 
+/// Median spacing between consecutive candles, in minutes. Median rather than
+/// mean so weekend/holiday gaps (FX, equities) don't stretch a daily series'
+/// estimate. `None` when the input has fewer than two candles (tick data
+/// never builds a synthetic book, see `extract_candle_ohlcv`). Samples at
+/// most the first 1,000 gaps -- the spacing is uniform by construction, and
+/// this runs once per simulation.
+fn median_candle_spacing_minutes(input: &MarketDataInput<'_>) -> Option<f64> {
+    let mut prev: Option<DateTime<Utc>> = None;
+    let mut gaps: Vec<f64> = Vec::new();
+    for data in input.iter() {
+        let MarketData::Candle(c) = &*data else { continue };
+        if let Some(p) = prev {
+            let minutes = (c.timestamp - p).num_seconds() as f64 / 60.0;
+            if minutes > 0.0 {
+                gaps.push(minutes);
+            }
+        }
+        prev = Some(c.timestamp);
+        if gaps.len() >= 1_000 {
+            break;
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    Some(gaps[gaps.len() / 2])
+}
+
 /// Extract candle OHLCV as (close, high, low, volume) if the data is a candle.
 fn extract_candle_ohlcv(data: &MarketData) -> Option<(f64, f64, f64, f64)> {
     match data {
@@ -3071,6 +3107,39 @@ fn compute_max_drawdown(equity: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn weekday_daily_candles(n_days: i64) -> Vec<MarketData> {
+        use chrono::{Datelike, TimeZone};
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(); // a Monday
+        (0..n_days)
+            .map(|d| start + Duration::days(d))
+            .filter(|t| t.weekday().num_days_from_monday() < 5)
+            .map(|t| MarketData::Candle(dataloader::Candle {
+                timestamp: t,
+                symbol: "EUR-CHF".into(),
+                exchange: "oanda".into(),
+                open: 0.95, high: 0.952, low: 0.948, close: 0.95,
+                volume: 150_000.0,
+                trade_count: 0,
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn candle_spacing_is_one_day_for_a_weekday_only_daily_series() {
+        // Weekend gaps (3 days, every 5th gap) must not stretch the estimate:
+        // the synthetic book scales its spread by this, see
+        // SyntheticBookConfig::bar_minutes.
+        let candles = weekday_daily_candles(60);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&candles)), Some(1440.0));
+    }
+
+    #[test]
+    fn candle_spacing_is_none_without_two_candles() {
+        let one = weekday_daily_candles(1);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&one)), None);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&[])), None);
+    }
 
     fn mk_trade(pnl: Option<f64>, exit_time: Option<DateTime<Utc>>) -> TradeRecord {
         TradeRecord {
