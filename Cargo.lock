@@ -2709,6 +2709,7 @@ dependencies = [
  "rand 0.8.7",
  "rand_distr",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4382,3 +4383,67 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "backtest"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "config"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "data_prep"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "dataloader"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "derivatives"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "genetic"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "greeks"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "metrics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "orderbook"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portfoliomanager"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "quant-diagnostics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "riskmanager"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "signal"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "smartrouter"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "strategy"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "walkforward"
+version = "0.1.0"
