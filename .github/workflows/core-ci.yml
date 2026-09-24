@@ -1,11 +1,14 @@
 # Minimal CI for the PURE crates of BacktestingCore (BACKTESTER_TRUTH_DESIGN.md, Stage T1).
 #
 # Core had no CI, so Core PRs were unreviewed by machine. This workflow gates only the pure crates (no pyo3, no
-# database, no network calls in the tests). When the rule crate moves into Core (Stage T2) add `-p reference-rules` to
-# the test step; the Engine's ladder_certification test remains the authoritative certification.
+# database, no network calls in the tests). The Engine's ladder_certification test remains the authoritative
+# certification.
 #
-# weightsim is a STANDALONE crate (its own empty [workspace], excluded from Core's workspace) because Core's workspace
-# depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
+# weightsim and reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume) are
+# STANDALONE crates (each has its own [workspace] and Cargo.lock, and both are excluded from Core's workspace) because
+# Core's workspace depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
+# reference-rules' real-history goldens are vendor-derived and are not in this public repository: they are env-gated
+# (REFRULES_LADDER_DIR) and print SKIPPED here; the always-on golden tests run on the synthetic fixtures.
 name: core-pure-crates
 
 on:
@@ -13,6 +16,7 @@ on:
     branches: [local-dev]
     paths:
       - "weightsim/**"
+      - "reference-rules/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -20,6 +24,7 @@ on:
     branches: [local-dev]
     paths:
       - "weightsim/**"
+      - "reference-rules/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -82,3 +87,56 @@ jobs:
           workspaces: weightsim
       - name: run every hand-written mutant against the suite
         run: python3 weightsim/mutants/run_mutants.py
+
+  reference-rules:
+    name: reference-rules (fmt, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: reference-rules
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference-rules
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      # No `clippy -D warnings` gate yet: the crate was moved verbatim from SignalEngine and current clippy flags two
+      # pre-existing lints in src/fx.rs (repeat_vec_with_capacity, manual_is_multiple_of). Fixing them is a source
+      # change, deliberately kept out of the move.
+
+      - name: tests (unit + integration; real-data goldens print SKIPPED, the synthetic goldens run)
+        run: cargo test --locked --no-fail-fast -- --nocapture
+
+      - name: the real-data goldens really are skipped here, and the synthetic ones ran
+        run: |
+          cargo test --locked --test golden --test golden_fx --test golden_synthetic -- --nocapture 2>&1 | tee golden.log
+          grep -q "SKIPPED golden_etf_every_month_end_explicit_mode" golden.log
+          grep -q "synthetic S1 ETF trend (explicit mode): 105/105" golden.log
+
+  reference-rules-mutants:
+    name: reference-rules mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: reference-rules
+    env:
+      REFRULES_TEST_CMD: cargo test --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference-rules
+      - name: run every hand-written mutant against the suite
+        run: python3 reference-rules/mutants/run_mutants.py

@@ -1,0 +1,18 @@
+[package]
+name = "reference-rules"
+description = "Pure decision rules of the documented sleeves (ETF trend, crypto trend, FX momentum); no I/O, no network"
+edition = "2021"
+version = "0.0.1"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Standalone on purpose (same pattern as `weightsim`): NOT a member of the BacktestingCore workspace (root Cargo.toml
+# `exclude`). Its three dependencies are public crates.io crates, so CI and consumers never have to resolve the
+# workspace's private git dependencies. Consumers depend on it by git tag/rev, e.g.
+#   reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", tag = "vX.Y.Z" }
+# `chrono` is used without default features (no clock, no time zones): the rules take the run date as an argument.
+[workspace]
