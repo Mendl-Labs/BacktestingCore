@@ -60,9 +60,11 @@ MUTANTS = [
     ("M13", "fx: wrong clip (upper cap 6 instead of 3)", "src/fx.rs",
      "weight: scaled.clamp(-FX_WEIGHT_CAP, FX_WEIGHT_CAP),",
      "weight: scaled.clamp(-FX_WEIGHT_CAP, 2.0 * FX_WEIGHT_CAP),"),
-    ("M14", "fx: clipped flag off (a weight exactly at the cap counts as clipped)", "src/fx.rs",
+    # (The tempting variant `>` -> `>=` is an EQUIVALENT mutant: it differs only when the scaled weight is exactly 3.0
+    # in binary floating point, which no input reaches; it is deliberately not in this list.)
+    ("M14", "fx: clipped flag threshold wrong (flag only when the weight exceeds twice the cap)", "src/fx.rs",
      "clipped: scaled.abs() > FX_WEIGHT_CAP,",
-     "clipped: scaled.abs() >= FX_WEIGHT_CAP,"),
+     "clipped: scaled.abs() > 2.0 * FX_WEIGHT_CAP,"),
     ("M15", "fx: wrong vol window (59 returns instead of 60)", "src/fx.rs",
      "pub const FX_VOL_WINDOW: usize = 60;",
      "pub const FX_VOL_WINDOW: usize = 59;"),

@@ -410,3 +410,24 @@ fn is_calendar_month_end_matches_the_wall_clock_not_any_data() {
     assert!(!is_calendar_month_end(d(2026, 3, 1)));
     assert!(!is_calendar_month_end(d(2026, 6, 15)));
 }
+
+/// Month-end detection compares the year AND the month: two consecutive bars in the same month of DIFFERENT years (a
+/// hole of a year or more in the data) are each the last bar of their own month. (Added in the move to Core: the
+/// mutation check showed that a `same_month` that ignores the year was not caught by any test.)
+#[test]
+fn month_end_helper_distinguishes_the_same_month_of_different_years() {
+    let s = PriceSeries::new(
+        "A",
+        vec![d(2019, 1, 31), d(2020, 1, 30), d(2020, 2, 28)],
+        vec![1.0, 2.0, 3.0],
+    )
+    .unwrap();
+    assert_eq!(
+        month_end_dates(&s),
+        vec![d(2019, 1, 31), d(2020, 1, 30), d(2020, 2, 28)]
+    );
+    assert_eq!(
+        completed_month_end_dates(&s),
+        vec![d(2019, 1, 31), d(2020, 1, 30)]
+    );
+}
