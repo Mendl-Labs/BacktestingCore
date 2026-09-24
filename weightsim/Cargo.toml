@@ -1,0 +1,22 @@
+[package]
+name = "weightsim"
+version = "0.1.0"
+edition = "2021"
+description = "Pure, deterministic weight-target sleeve simulator (BACKTESTER_TRUTH_DESIGN.md Section 2, stage T1)"
+publish = false
+
+# Deliberately ZERO dependencies. The simulator is pure (no I/O, no vendor calls, no DB, no Python, no network),
+# so it needs nothing beyond `std`:
+#   * dates      -> src/date.rs   (civil-date arithmetic; replaces chrono)
+#   * SHA-256    -> src/sha256.rs (series digest + fixture pinning; replaces sha2/hex; checked against the NIST vectors
+#                                  and against `sha256sum` output in the tests)
+#   * errors     -> hand-written Display/Error impls (replaces thiserror)
+#   * JSON/serde -> not needed in T1 (results are plain structs; the Engine glue serialises them in T3/T4)
+# Every avoided dependency is one less thing that can change the numerical path or the build on the WSL/ARM64 box.
+[dependencies]
+
+[dev-dependencies]
+
+# Standalone on purpose: NOT a member of the BacktestingCore workspace (root Cargo.toml `exclude`). Its
+# dependency set is empty, so CI and consumers never have to resolve the workspace's private git dependencies.
+[workspace]

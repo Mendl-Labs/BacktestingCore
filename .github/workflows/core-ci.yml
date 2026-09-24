@@ -1,0 +1,84 @@
+# Minimal CI for the PURE crates of BacktestingCore (BACKTESTER_TRUTH_DESIGN.md, Stage T1).
+#
+# Core had no CI, so Core PRs were unreviewed by machine. This workflow gates only the pure crates (no pyo3, no
+# database, no network calls in the tests). When the rule crate moves into Core (Stage T2) add `-p reference-rules` to
+# the test step; the Engine's ladder_certification test remains the authoritative certification.
+#
+# weightsim is a STANDALONE crate (its own empty [workspace], excluded from Core's workspace) because Core's workspace
+# depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
+name: core-pure-crates
+
+on:
+  push:
+    branches: [local-dev]
+    paths:
+      - "weightsim/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/core-ci.yml"
+  pull_request:
+    branches: [local-dev]
+    paths:
+      - "weightsim/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/core-ci.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_TOOLCHAIN: "1.90.0"
+
+concurrency:
+  group: core-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weightsim:
+    name: weightsim (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: weightsim
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, integration, doc)
+        run: cargo test --locked --no-fail-fast
+
+      - name: print the pinned series digests (compare with the aarch64 goldens in tests/determinism.rs)
+        run: cargo test --locked --test determinism series_digests_match_the_pinned_goldens -- --nocapture
+
+  weightsim-mutants:
+    name: weightsim mutation power (every mutant must be killed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: weightsim
+    env:
+      WEIGHTSIM_TEST_CMD: cargo test --manifest-path weightsim/Cargo.toml --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+      - name: run every hand-written mutant against the suite
+        run: python3 weightsim/mutants/run_mutants.py
