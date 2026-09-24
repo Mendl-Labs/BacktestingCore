@@ -17,5 +17,5 @@ members = [
     "genetic",
     "strategy",
     "config",
-    "weightsim",
 ]
+exclude = ["weightsim"]

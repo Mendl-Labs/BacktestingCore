@@ -6,7 +6,7 @@ edit, runs the test command, records which tests FAILED (or that the build broke
 A mutant that no test kills is reported as SURVIVED and the script exits non-zero.
 
 Usage (from the crate directory or anywhere):
-    WEIGHTSIM_TEST_CMD="cargo test -p weightsim --no-fail-fast" python3 mutants/run_mutants.py [--only M03,M07]
+    WEIGHTSIM_TEST_CMD="cargo test --manifest-path weightsim/Cargo.toml --no-fail-fast" python3 mutants/run_mutants.py [--only M03,M07]
 `WEIGHTSIM_TEST_CMD` defaults to the command above and is run with the workspace root as its working directory.
 The output is a markdown table. The vendor-data test is env-gated (WEIGHTSIM_LADDER_DIR) and skips itself when unset,
 so a table produced without that variable is the one CI can reproduce.
@@ -122,7 +122,7 @@ def failing_tests(out):
 
 
 def main():
-    cmd = os.environ.get("WEIGHTSIM_TEST_CMD", "cargo test -p weightsim --no-fail-fast")
+    cmd = os.environ.get("WEIGHTSIM_TEST_CMD", "cargo test --manifest-path weightsim/Cargo.toml --no-fail-fast")
     only = None
     if "--only" in sys.argv:
         only = set(sys.argv[sys.argv.index("--only") + 1].split(","))

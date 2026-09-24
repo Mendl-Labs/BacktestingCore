@@ -2,12 +2,12 @@
 
 Pure, deterministic weight-target sleeve simulator (Stage T1 of `product-mandate/BACKTESTER_TRUTH_DESIGN.md`).
 Zero dependencies, no I/O. The semantics, the design choices C1-C14 and the public API map are in the crate docs
-(`src/lib.rs`); run `cargo doc -p weightsim --open`.
+(`src/lib.rs`); run `cd weightsim && cargo doc --open`.
 
 ## Tests
 
-    cargo test -p weightsim                      # unit + integration + doc tests, no vendor data needed
-    WEIGHTSIM_LADDER_DIR=<dir> cargo test -p weightsim --test answer_key -- --nocapture
+    cargo test                      # unit + integration + doc tests, no vendor data needed
+    WEIGHTSIM_LADDER_DIR=<dir> cargo test --test answer_key -- --nocapture
 
 `WEIGHTSIM_LADDER_DIR` points at the `replication_ladder` directory (vendor-derived `ladder_candles.csv` and the recorded
 `shadow_*` key files, all verified by sha256 before use). It is NOT copied into this repository; without the variable the

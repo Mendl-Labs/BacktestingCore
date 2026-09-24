@@ -16,3 +16,7 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
+
+# Standalone on purpose: NOT a member of the BacktestingCore workspace (root Cargo.toml `exclude`). Its
+# dependency set is empty, so CI and consumers never have to resolve the workspace's private git dependencies.
+[workspace]

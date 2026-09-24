@@ -4,10 +4,8 @@
 # database, no network calls in the tests). When the rule crate moves into Core (Stage T2) add `-p reference-rules` to
 # the test step; the Engine's ladder_certification test remains the authoritative certification.
 #
-# NOTE: this file was written in a local WSL worktree and could NOT be executed by GitHub Actions there. What was
-# validated locally is every command in the steps below (fmt, clippy, test, mutation runner) run through the shared
-# build wrapper with the same pinned toolchain. Unverified until the first real run: the action versions, the
-# cache action, and (see below) whether the sibling git dependencies of the workspace need a token on a hosted runner.
+# weightsim is a STANDALONE crate (its own empty [workspace], excluded from Core's workspace) because Core's workspace
+# depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
 name: core-pure-crates
 
 on:
@@ -40,16 +38,11 @@ jobs:
     name: weightsim (fmt, clippy, tests)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Optional. The workspace lockfile also lists sibling git dependencies (LoggingEngine, databaseschema) that cargo
-      # must be able to fetch even for `-p weightsim`. If they are private, add a read-only token as this secret.
-      CORE_CI_GIT_TOKEN: ${{ secrets.CORE_CI_GIT_TOKEN }}
+    defaults:
+      run:
+        working-directory: weightsim
     steps:
       - uses: actions/checkout@v4
-
-      - name: Let cargo fetch sibling private git dependencies (only when the secret exists)
-        if: ${{ env.CORE_CI_GIT_TOKEN != '' }}
-        run: git config --global url."https://x-access-token:${CORE_CI_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -57,18 +50,20 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
 
       - name: fmt
-        run: cargo fmt -p weightsim -- --check
+        run: cargo fmt -- --check
 
       - name: clippy (warnings are errors)
-        run: cargo clippy -p weightsim --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: tests (unit, integration, doc)
-        run: cargo test -p weightsim --locked --no-fail-fast
+        run: cargo test --locked --no-fail-fast
 
       - name: print the pinned series digests (compare with the aarch64 goldens in tests/determinism.rs)
-        run: cargo test -p weightsim --locked --test determinism series_digests_match_the_pinned_goldens -- --nocapture
+        run: cargo test --locked --test determinism series_digests_match_the_pinned_goldens -- --nocapture
 
   weightsim-mutants:
     name: weightsim mutation power (every mutant must be killed)
@@ -76,16 +71,14 @@ jobs:
     timeout-minutes: 45
     needs: weightsim
     env:
-      CORE_CI_GIT_TOKEN: ${{ secrets.CORE_CI_GIT_TOKEN }}
-      WEIGHTSIM_TEST_CMD: cargo test -p weightsim --locked --no-fail-fast
+      WEIGHTSIM_TEST_CMD: cargo test --manifest-path weightsim/Cargo.toml --locked --no-fail-fast
     steps:
       - uses: actions/checkout@v4
-      - name: Let cargo fetch sibling private git dependencies (only when the secret exists)
-        if: ${{ env.CORE_CI_GIT_TOKEN != '' }}
-        run: git config --global url."https://x-access-token:${CORE_CI_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
       - name: run every hand-written mutant against the suite
         run: python3 weightsim/mutants/run_mutants.py
