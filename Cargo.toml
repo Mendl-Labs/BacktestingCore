@@ -18,4 +18,4 @@ members = [
     "strategy",
     "config",
 ]
-exclude = ["weightsim", "reference-rules", "weightsim-rules", "portfolio-construct"]
+exclude = ["weightsim", "reference-rules", "weightsim-rules", "portfolio-construct", "portfolio-eval"]
