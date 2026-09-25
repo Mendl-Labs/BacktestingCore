@@ -4,8 +4,9 @@
 # database, no network calls in the tests). The Engine's ladder_certification test remains the authoritative
 # certification.
 #
-# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume) and
-# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification) are
+# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume),
+# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification) and
+# portfolio-construct (PF2: the shared portfolio-construction specification, zero dependencies) are
 # STANDALONE crates (each has its own [workspace] and Cargo.lock, and all are excluded from Core's workspace) because
 # Core's workspace depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
 # reference-rules' real-history goldens are vendor-derived and are not in this public repository: they are env-gated
@@ -19,6 +20,7 @@ on:
       - "weightsim/**"
       - "reference-rules/**"
       - "weightsim-rules/**"
+      - "portfolio-construct/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -28,6 +30,7 @@ on:
       - "weightsim/**"
       - "reference-rules/**"
       - "weightsim-rules/**"
+      - "portfolio-construct/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -197,3 +200,60 @@ jobs:
           workspaces: weightsim-rules
       - name: run every hand-written mutant against the suite
         run: python3 weightsim-rules/mutants/run_mutants.py
+
+  portfolio-construct:
+    name: portfolio-construct (fmt, clippy, tests, zero dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: portfolio-construct
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-construct
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Forbidden edge (design 5.1): a pure crate may depend on nothing but std. `cargo tree` must list only the crate itself.
+      - name: zero dependencies (normal, dev and build)
+        run: |
+          cargo tree --locked -e normal,dev,build --prefix none | tee tree.log
+          test "$(grep -vc '^portfolio-construct ' tree.log)" = "0"
+
+      - name: tests (golden vectors from the planner, hand-computed, properties, ladder oracle, determinism)
+        run: cargo test --locked --no-fail-fast
+
+      - name: print the pinned digests (compare with the aarch64 goldens in tests/determinism.rs)
+        run: cargo test --locked --test determinism digests_match_the_pinned_goldens -- --nocapture
+
+  portfolio-construct-mutants:
+    name: portfolio-construct mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: portfolio-construct
+    env:
+      PORTFOLIO_CONSTRUCT_TEST_CMD: cargo test --manifest-path portfolio-construct/Cargo.toml --locked --no-fail-fast -- --skip digests_match_the_pinned_goldens
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-construct
+      - name: every mutant edit applies exactly once
+        run: python3 portfolio-construct/mutants/run_mutants.py --validate
+      - name: run every hand-written mutant against the suite
+        run: python3 portfolio-construct/mutants/run_mutants.py
