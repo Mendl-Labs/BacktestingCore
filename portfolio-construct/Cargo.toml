@@ -1,0 +1,23 @@
+[package]
+name = "portfolio-construct"
+version = "0.1.0"
+edition = "2021"
+description = "Pure, deterministic f64 portfolio-construction specification shared by the backtester and the live rebalancer parity tests (PORTFOLIO_FIRST_BACKTESTER_DESIGN.md Section 3.2 and 5, phase PF2)"
+publish = false
+
+# Deliberately ZERO dependencies, for the same reasons as `weightsim`: the crate is pure (no clock, no I/O, no price
+# source, no network, no database), so `std` is enough.
+#   * no `chrono`  -> src/schedule.rs carries its own 40-line civil-date type (a scheduler needs only "is this the last
+#                     calendar day of the month" and "is the next bar in another month");
+#   * no `serde`   -> results are plain structs; the Engine glue serialises them;
+#   * no `rand`    -> the tests carry a 10-line SplitMix64 (the same generator SignalEngine's tests use);
+#   * no `thiserror`/`sha2` -> hand-written Display impls; determinism is pinned with an FNV-1a digest of f64 bits.
+# Every avoided dependency is one less thing that can change the numerical path or the build on the WSL/ARM64 box, and
+# the crate must be linkable from SignalEngine as a dev-dependency without dragging anything into a deployed binary.
+[dependencies]
+
+[dev-dependencies]
+
+# Standalone on purpose: NOT a member of the BacktestingCore workspace (root Cargo.toml `exclude`). Its dependency set is
+# empty, so CI and consumers never have to resolve the workspace's private git dependencies.
+[workspace]
