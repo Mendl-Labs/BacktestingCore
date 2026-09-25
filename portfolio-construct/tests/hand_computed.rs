@@ -124,9 +124,15 @@ fn r2_scale_makes_a_book_that_needs_more_gross_than_the_cap_fit() {
 fn trade_filter_absolute_threshold_boundary() {
     let f = TradeFilter::new(10.0, 0.0);
     assert_eq!(f.check(1000.0, 990.0), None, "delta exactly 10 trades");
-    assert!(matches!(f.check(1000.0, 990.01), Some(SkipReason::BelowMinAbs { min, .. }) if min == 10.0), "delta 9.99 is dropped");
+    assert!(
+        matches!(f.check(1000.0, 990.01), Some(SkipReason::BelowMinAbs { min, .. }) if min == 10.0),
+        "delta 9.99 is dropped"
+    );
     assert_eq!(f.check(1000.0, 989.99), None);
-    assert!(matches!(f.check(990.01, 1000.0), Some(SkipReason::BelowMinAbs { .. })), "a reduction is filtered the same way");
+    assert!(
+        matches!(f.check(990.01, 1000.0), Some(SkipReason::BelowMinAbs { .. })),
+        "a reduction is filtered the same way"
+    );
 }
 
 #[test]
@@ -163,7 +169,9 @@ fn a_dropped_trade_keeps_the_holding_and_records_why() {
     c.filter = TradeFilter::PLANNER_DEFAULT;
     let out = c.ok();
     assert!(out.trades.is_empty());
-    assert!(matches!(skip_reason(&out, "SPY"), SkipReason::BelowMinPct { delta, min } if (*delta - 10.0).abs() < 1e-9 && (*min - 20.0).abs() < 1e-9));
+    assert!(
+        matches!(skip_reason(&out, "SPY"), SkipReason::BelowMinPct { delta, min } if (*delta - 10.0).abs() < 1e-9 && (*min - 20.0).abs() < 1e-9)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -201,7 +209,8 @@ fn quantities_round_down_to_the_lot_and_never_up() {
     assert_eq!(r.round_quantity("W", Side::Buy, 0.999999, 1.0), Err(SizeRefusal::RoundsToZero));
     assert_eq!(r.round_quantity("Y", Side::Buy, 1.0, 1.0), Err(SizeRefusal::UnknownInstrument("Y".into())));
     assert_eq!(ExactUnits.round_quantity("anything", Side::Buy, 1.23456789012, 1.0), Ok(1.23456789012));
-    let m = LotRounder::new().with("M", LotRule::new(1).with_min_quantity(0.5).with_min_notional(20.0).with_max_order_units(10.0));
+    let m = LotRounder::new()
+        .with("M", LotRule::new(1).with_min_quantity(0.5).with_min_notional(20.0).with_max_order_units(10.0));
     assert_eq!(m.round_quantity("M", Side::Buy, 0.49, 100.0), Err(SizeRefusal::BelowMinQuantity { min: 0.5 }));
     assert_eq!(m.round_quantity("M", Side::Buy, 0.5, 39.0), Err(SizeRefusal::BelowMinCost { min: 20.0 }));
     assert_eq!(m.round_quantity("M", Side::Buy, 0.5, 40.0), Ok(0.5));
@@ -332,14 +341,25 @@ fn position_class_and_net_caps_refuse_the_whole_book() {
     let pos = Limits::unlimited().with_max_position(0.4);
     assert!(mk(pos.clone(), [0.4, 0.4, 0.4]).run().is_ok(), "exactly at the cap is fine");
     match mk(pos, [0.3, 0.5, 0.3]).run() {
-        Err(ConstructRefusal::PositionAboveCap { symbol, notional, cap, .. }) => assert_eq!((symbol.as_str(), notional, cap), ("B", 500.0, 400.0)),
+        Err(ConstructRefusal::PositionAboveCap { symbol, notional, cap, .. }) => {
+            assert_eq!((symbol.as_str(), notional, cap), ("B", 500.0, 400.0))
+        }
+        other => panic!("{other:?}"),
+    }
+    // the per-position cap is on |target|: a SHORT beyond the cap breaches it too.
+    match mk(Limits::unlimited().with_max_position(0.4), [0.3, -0.5, 0.3]).run() {
+        Err(ConstructRefusal::PositionAboveCap { symbol, notional, .. }) => {
+            assert_eq!((symbol.as_str(), notional), ("B", -500.0))
+        }
         other => panic!("{other:?}"),
     }
     // asset class: eq cap 0.6 of 1000 = 600; A + B = 700.
     let class = Limits::unlimited().with_class_cap("EQ", 0.6);
     assert!(mk(class.clone(), [0.3, 0.3, 0.9]).run().is_ok());
     match mk(class, [0.3, 0.4, 0.1]).run() {
-        Err(ConstructRefusal::ClassAboveCap { class, gross, cap }) => assert_eq!((class.as_str(), gross, cap), ("eq", 700.0, 600.0)),
+        Err(ConstructRefusal::ClassAboveCap { class, gross, cap }) => {
+            assert_eq!((class.as_str(), gross, cap), ("eq", 700.0, 600.0))
+        }
         other => panic!("{other:?}"),
     }
     // net: cap 0.5 of 1000 = 500; +0.5 +0.4 -0.2 = +0.7 -> 700 refused; +0.5 -0.2 -0.2 = 0.1 fine.
@@ -364,7 +384,9 @@ fn shorting_forbidden_refuses_a_book_with_any_negative_target() {
     c.allocated = None;
     c.limits = Limits::unlimited().with_shorting(false);
     match c.run() {
-        Err(ConstructRefusal::ShortingForbidden { symbol, target, .. }) => assert_eq!((symbol.as_str(), target), ("B", -100.0)),
+        Err(ConstructRefusal::ShortingForbidden { symbol, target, .. }) => {
+            assert_eq!((symbol.as_str(), target), ("B", -100.0))
+        }
         other => panic!("{other:?}"),
     }
     c.limits = Limits::unlimited().with_shorting(true);
@@ -378,7 +400,11 @@ fn shorting_forbidden_refuses_a_book_with_any_negative_target() {
 #[test]
 fn binding_constraints_are_reported_closest_first() {
     let mut c = two_long(1.5, 0.75); // gross exactly at the cap
-    c.limits = Limits::unlimited().with_max_gross(1.5).with_leverage_max_gross(1.5).with_max_position(1.0).with_class_cap("c", 2.0);
+    c.limits = Limits::unlimited()
+        .with_max_gross(1.5)
+        .with_leverage_max_gross(1.5)
+        .with_max_position(1.0)
+        .with_class_cap("c", 2.0);
     let out = c.ok();
     let first = &out.binding[0];
     assert_eq!((first.kind, first.bound), (BindingKind::Gross, true));
@@ -510,7 +536,9 @@ fn alpaca_regt_margin_rate_is_max_of_asset_requirement_and_half() {
 #[test]
 fn alpaca_regt_refuses_a_book_whose_initial_margin_exceeds_equity() {
     // equity 20000: 2x gross of marginable names at 0.5 = 20000 margin = equity -> allowed (tie).
-    let inst = || vec![InstrumentFacts::new("A", "alpaca", "us_etf", 10.0), InstrumentFacts::new("B", "alpaca", "us_etf", 10.0)];
+    let inst = || {
+        vec![InstrumentFacts::new("A", "alpaca", "us_etf", 10.0), InstrumentFacts::new("B", "alpaca", "us_etf", 10.0)]
+    };
     let mk = |w: f64| margin_case(inst(), Box::new(AlpacaRegT::r4_default()), [w, w], 20000.0);
     assert_close(mk(1.0).ok().margin_used, 20000.0, 1e-9, "at the ceiling");
     match mk(1.0 + 1e-9).run() {
@@ -524,7 +552,10 @@ fn alpaca_regt_refuses_a_book_whose_initial_margin_exceeds_equity() {
     let c = margin_case(inst2, Box::new(AlpacaRegT::r4_default()), [1.2, 1.2], 20000.0); // gross 48000, margin 24000
     assert!(matches!(c.run(), Err(ConstructRefusal::MarginExceeded { .. })));
     // A non-marginable instrument is 100%: 25000 of it on 20000 equity refuses.
-    let nm = vec![InstrumentFacts::new("N", "alpaca", "crypto", 10.0).with_marginable(false), InstrumentFacts::new("B", "alpaca", "us_etf", 10.0)];
+    let nm = vec![
+        InstrumentFacts::new("N", "alpaca", "crypto", 10.0).with_marginable(false),
+        InstrumentFacts::new("B", "alpaca", "us_etf", 10.0),
+    ];
     assert!(matches!(
         margin_case(nm, Box::new(AlpacaRegT::r4_default()), [1.25, 0.0], 20000.0).run(),
         Err(ConstructRefusal::MarginExceeded { .. })
@@ -598,7 +629,8 @@ fn reserve_is_rounded_up_to_eight_decimals() {
     c.target_dp = None;
     c.filter = TradeFilter::NONE;
     // cash exactly reserve + 100: available must be 100 - 1.5e-9 slack-free: buy 100 of cost.
-    c.funding = Funding::Cash { cash: 166.66666667 + 100.0, reserve_fraction: 0.05, fee_rate: 0.0, credit_sell_proceeds: true };
+    c.funding =
+        Funding::Cash { cash: 166.66666667 + 100.0, reserve_fraction: 0.05, fee_rate: 0.0, credit_sell_proceeds: true };
     let out = c.ok();
     // available = 266.66666667 - 166.66666667 = 100, less the 1e-8 per-buy slack: the notional is 99.99999999. A reserve
     // rounded DOWN (166.66666666) would leave 100.00000001 and buy 100.00000000.
@@ -612,10 +644,8 @@ fn reserve_is_rounded_up_to_eight_decimals() {
 
 #[test]
 fn an_out_of_scope_instrument_counts_in_the_checks_but_is_not_traded() {
-    let inst = vec![
-        InstrumentFacts::new("A", "v", "c", 10.0),
-        InstrumentFacts::new("B", "v", "c", 10.0).with_in_scope(false),
-    ];
+    let inst =
+        vec![InstrumentFacts::new("A", "v", "c", 10.0), InstrumentFacts::new("B", "v", "c", 10.0).with_in_scope(false)];
     let sleeve = vec![SleeveTargets::long_only("s", 1.0, vec![(0, 0.5), (1, 0.5)])];
     let mut c = Case::new(inst, sleeve);
     c.equity = 1000.0;
@@ -636,7 +666,8 @@ fn an_out_of_scope_instrument_counts_in_the_checks_but_is_not_traded() {
 
 #[test]
 fn an_instrument_without_a_price_is_skipped_and_contributes_nothing() {
-    let inst = vec![InstrumentFacts::new("A", "v", "c", 10.0), InstrumentFacts::new("B", "v", "c", 10.0).without_price()];
+    let inst =
+        vec![InstrumentFacts::new("A", "v", "c", 10.0), InstrumentFacts::new("B", "v", "c", 10.0).without_price()];
     let sleeve = vec![SleeveTargets::long_only("s", 1.0, vec![(0, 0.5), (1, 0.5)])];
     let mut c = Case::new(inst, sleeve);
     c.equity = 1000.0;
@@ -677,4 +708,24 @@ fn projected_gross_includes_unmanaged_positions_and_drives_needs_margin() {
     let mut s = Case::planner(vec![SleeveTargets::signed("ls", 1.0, 2.0, vec![(SPY, 0.2)])]);
     s.unmanaged = 4500.0;
     assert_eq!(s.run(), Err(ConstructRefusal::BuyingPowerRequired { gross: 5500.0 }));
+}
+
+#[test]
+fn the_open_leg_of_a_crossing_covers_the_dust_the_close_leg_could_not_sell() {
+    // Whole-share venue. Hold 4.7 units at 100, target -240 (-2.4 units). The close leg sells floor(4.7) = 4, leaving 0.7
+    // long. The open leg must sell |target| / price + 0.7 = 3.1 -> 3 (not 2.4 -> 2), so the book ends at 0.7 - 3 = -2.3
+    // units (never beyond the -2.4 target) instead of -1.3.
+    let inst = vec![InstrumentFacts::new("X", "v", "c", 100.0).with_held(4.7)];
+    let sleeve = vec![SleeveTargets::signed("s", 1.0, 3.0, vec![(0, -0.024)])];
+    let mut c = Case::new(inst, sleeve);
+    c.equity = 10000.0;
+    c.allocated = None;
+    c.filter = TradeFilter::NONE;
+    c.rounder = Some(LotRounder::new().with("X", LotRule::new(0)));
+    c.funding = Funding::BuyingPower { buying_power: 1_000_000.0, reserve_fraction: 0.0, fee_rate: 0.0 };
+    let out = c.ok();
+    assert_eq!(brief(&out), vec![("X".to_string(), Side::Sell, 4.0), ("X".to_string(), Side::Sell, 3.0)]);
+    let after = 4.7 - 4.0 - 3.0;
+    assert_close(after, -2.3, 1e-12, "final units");
+    assert!(after * 100.0 >= line(&out, "X").target_notional - 1e-9 - 100.0, "within one lot of the target");
 }

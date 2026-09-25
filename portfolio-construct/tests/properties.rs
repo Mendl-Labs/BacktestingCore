@@ -21,7 +21,14 @@ fn sym_map<T: Clone>(out: &ConstructOutput, f: impl Fn(&Line) -> T) -> Vec<(Stri
 }
 
 fn trade_key(t: &TradeIntent) -> (String, u8, u64, u64, u64, bool) {
-    (t.symbol.clone(), if t.side == Side::Buy { 1 } else { 2 }, t.quantity.to_bits(), t.notional.to_bits(), t.est_fee.to_bits(), t.reducing)
+    (
+        t.symbol.clone(),
+        if t.side == Side::Buy { 1 } else { 2 },
+        t.quantity.to_bits(),
+        t.notional.to_bits(),
+        t.est_fee.to_bits(),
+        t.reducing,
+    )
 }
 
 fn sorted_trades(out: &ConstructOutput) -> Vec<(String, u8, u64, u64, u64, bool)> {
@@ -49,10 +56,21 @@ fn every_ok_output_satisfies_every_limit_and_every_refusal_is_a_real_breach() {
                 let gross: f64 = t.iter().map(|x| x.abs()).sum();
                 assert_close(gross, out.gross, 1e-6 * (1.0 + gross), &format!("seed {seed}: gross"));
                 if lim.policy == LimitPolicy::RefuseWholeBook {
-                    assert!(gross <= lim.effective_max_gross() * cb * (1.0 + tol) || lim.effective_max_gross().is_infinite(), "seed {seed}: gross {gross}");
+                    assert!(
+                        gross <= lim.effective_max_gross() * cb * (1.0 + tol)
+                            || lim.effective_max_gross().is_infinite(),
+                        "seed {seed}: gross {gross}"
+                    );
                     let net: f64 = t.iter().sum();
-                    assert!(net.abs() <= lim.max_net * cb * (1.0 + tol) || lim.max_net.is_infinite(), "seed {seed}: net {net}");
-                    assert!(t.iter().all(|x| x.abs() <= lim.max_position * cb * (1.0 + tol) || lim.max_position.is_infinite()), "seed {seed}: position");
+                    assert!(
+                        net.abs() <= lim.max_net * cb * (1.0 + tol) || lim.max_net.is_infinite(),
+                        "seed {seed}: net {net}"
+                    );
+                    assert!(
+                        t.iter()
+                            .all(|x| x.abs() <= lim.max_position * cb * (1.0 + tol) || lim.max_position.is_infinite()),
+                        "seed {seed}: position"
+                    );
                     if let Some(cap) = lim.max_asset_class.get("a") {
                         let class_gross: f64 = out
                             .lines
@@ -99,7 +117,10 @@ fn every_ok_output_satisfies_every_limit_and_every_refusal_is_a_real_breach() {
             Err(other) => panic!("seed {seed}: unexpected {other:?}"),
         }
     }
-    assert!(oks > 400 && refused > 100 && short_books > 100, "non-vacuous: ok {oks}, refused {refused}, short {short_books}");
+    assert!(
+        oks > 400 && refused > 100 && short_books > 100,
+        "non-vacuous: ok {oks}, refused {refused}, short {short_books}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -127,7 +148,13 @@ fn a_plan_never_oversells_never_overspends_and_never_overshoots_a_target() {
                 n_legs += 1;
                 units += if t.side == Side::Buy { t.quantity } else { -t.quantity };
                 if t.reducing {
-                    assert!(t.quantity <= inst.held_units.abs() * (1.0 + 1e-12), "seed {seed}: {} oversells {} of {}", l.symbol, t.quantity, inst.held_units);
+                    assert!(
+                        t.quantity <= inst.held_units.abs() * (1.0 + 1e-12),
+                        "seed {seed}: {} oversells {} of {}",
+                        l.symbol,
+                        t.quantity,
+                        inst.held_units
+                    );
                 }
             }
             if n_legs == 2 {
@@ -176,11 +203,17 @@ fn a_plan_never_oversells_never_overspends_and_never_overshoots_a_target() {
             Funding::BuyingPower { buying_power, reserve_fraction, .. } => {
                 funded += 1;
                 let available = buying_power - ceil_dp(reserve_fraction * cb, 8);
-                assert!(inc <= available.max(0.0) + 1e-6, "seed {seed}: increases {inc} exceed buying power {available}");
+                assert!(
+                    inc <= available.max(0.0) + 1e-6,
+                    "seed {seed}: increases {inc} exceed buying power {available}"
+                );
             }
         }
     }
-    assert!(checked > 800 && funded > 350 && crossings > 30, "non-vacuous: checked {checked}, funded {funded}, crossings {crossings}");
+    assert!(
+        checked > 800 && funded > 350 && crossings > 30,
+        "non-vacuous: checked {checked}, funded {funded}, crossings {crossings}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -199,16 +232,44 @@ fn permuting_sleeves_weights_and_instruments_changes_no_bit_of_the_result() {
         match (g.run(), p.run()) {
             (Ok(a), Ok(b)) => {
                 same += 1;
-                assert_eq!(sym_map(&a, |l| l.target_notional.to_bits()), sym_map(&b, |l| l.target_notional.to_bits()), "seed {seed}: targets");
-                assert_eq!(sym_map(&a, |l| l.current_notional.to_bits()), sym_map(&b, |l| l.current_notional.to_bits()), "seed {seed}: current");
-                assert_eq!(sym_map(&a, |l| l.sleeves.clone()), sym_map(&b, |l| l.sleeves.clone()), "seed {seed}: sleeve labels");
+                assert_eq!(
+                    sym_map(&a, |l| l.target_notional.to_bits()),
+                    sym_map(&b, |l| l.target_notional.to_bits()),
+                    "seed {seed}: targets"
+                );
+                assert_eq!(
+                    sym_map(&a, |l| l.current_notional.to_bits()),
+                    sym_map(&b, |l| l.current_notional.to_bits()),
+                    "seed {seed}: current"
+                );
+                assert_eq!(
+                    sym_map(&a, |l| l.sleeves.clone()),
+                    sym_map(&b, |l| l.sleeves.clone()),
+                    "seed {seed}: sleeve labels"
+                );
                 assert_eq!(sorted_trades(&a), sorted_trades(&b), "seed {seed}: trades");
                 assert_eq!(
-                    (a.gross.to_bits(), a.net.to_bits(), a.margin_used.to_bits(), a.projected_gross.to_bits(), a.needs_margin),
-                    (b.gross.to_bits(), b.net.to_bits(), b.margin_used.to_bits(), b.projected_gross.to_bits(), b.needs_margin),
+                    (
+                        a.gross.to_bits(),
+                        a.net.to_bits(),
+                        a.margin_used.to_bits(),
+                        a.projected_gross.to_bits(),
+                        a.needs_margin
+                    ),
+                    (
+                        b.gross.to_bits(),
+                        b.net.to_bits(),
+                        b.margin_used.to_bits(),
+                        b.projected_gross.to_bits(),
+                        b.needs_margin
+                    ),
                     "seed {seed}: aggregates"
                 );
-                assert_eq!(a.funding_left.map(f64::to_bits), b.funding_left.map(f64::to_bits), "seed {seed}: funding left");
+                assert_eq!(
+                    a.funding_left.map(f64::to_bits),
+                    b.funding_left.map(f64::to_bits),
+                    "seed {seed}: funding left"
+                );
                 let mut sa: Vec<_> = a.skipped.iter().map(|s| (s.symbol.clone(), format!("{:?}", s.reason))).collect();
                 let mut sb: Vec<_> = b.skipped.iter().map(|s| (s.symbol.clone(), format!("{:?}", s.reason))).collect();
                 sa.sort();
@@ -333,7 +394,10 @@ fn lowering_the_risk_scale_never_increases_gross_and_never_creates_a_refusal() {
             }
             (Ok(_), Err(e)) => {
                 // The only refusals lowering the scale may cause are funding ones that do not depend on the book's size.
-                assert!(matches!(e, ConstructRefusal::BuyingPowerRequired { .. }), "seed {seed}: a smaller book was refused: {e:?}");
+                assert!(
+                    matches!(e, ConstructRefusal::BuyingPowerRequired { .. }),
+                    "seed {seed}: a smaller book was refused: {e:?}"
+                );
             }
             _ => {}
         }
@@ -352,7 +416,8 @@ fn raising_a_limit_never_creates_a_refusal_and_lowering_it_never_removes_one() {
         let mut loose = g.clone();
         loose.limits = Limits::unlimited();
         let mut tight = g.clone();
-        tight.limits = tight.limits.clone().with_max_gross(tight.limits.max_gross.min(0.5)).with_leverage_max_gross(f64::INFINITY);
+        tight.limits =
+            tight.limits.clone().with_max_gross(tight.limits.max_gross.min(0.5)).with_leverage_max_gross(f64::INFINITY);
         let (base, lo, ti) = (is_ok(&g), is_ok(&loose), is_ok(&tight));
         if base {
             assert!(lo, "seed {seed}: unlimited caps refused a permitted book: {:?}", loose.run().err());
@@ -381,7 +446,11 @@ fn raising_the_trade_filter_never_adds_a_trade() {
             let mut h = g.clone();
             h.filter = stricter;
             let b: std::collections::BTreeSet<usize> = h.run().unwrap().trades.iter().map(|t| t.instrument).collect();
-            assert!(b.is_subset(&a), "seed {seed}: a stricter filter {stricter:?} added {:?}", b.difference(&a).collect::<Vec<_>>());
+            assert!(
+                b.is_subset(&a),
+                "seed {seed}: a stricter filter {stricter:?} added {:?}",
+                b.difference(&a).collect::<Vec<_>>()
+            );
             compared += 1;
         }
     }
@@ -431,9 +500,13 @@ fn replanning_from_the_post_plan_holdings_trades_nothing_more() {
         }
         assert!(b.trades.is_empty(), "seed {seed}: the second pass still trades {:?}", b.trades);
         second_empty += 1;
-        let dropped_a: Vec<(String, String)> = a.skipped.iter().map(|s| (s.symbol.clone(), format!("{:?}", s.reason))).collect();
+        let dropped_a: Vec<(String, String)> =
+            a.skipped.iter().map(|s| (s.symbol.clone(), format!("{:?}", s.reason))).collect();
         for (sym, _) in &dropped_a {
-            assert!(b.skipped.iter().any(|s| &s.symbol == sym), "seed {seed}: {sym} was skipped once and traded/ignored later");
+            assert!(
+                b.skipped.iter().any(|s| &s.symbol == sym),
+                "seed {seed}: {sym} was skipped once and traded/ignored later"
+            );
         }
         // targets are unchanged by trading (they depend on equity, not on holdings)
         assert_eq!(a.target_notional, b.target_notional, "seed {seed}");
@@ -459,7 +532,10 @@ fn the_rounder_never_returns_more_than_asked_and_lots_are_multiples() {
             ok += 1;
             // (a value within 4 ulps under a lot boundary counts as on it, so a hair above is allowed)
             assert!(q <= wished * (1.0 + 1e-12), "rounded UP: {wished} -> {q}");
-            assert!(wished - q < 1.0 / 10f64.powi(dp as i32) * (1.0 + 1e-9), "{wished} -> {q} loses more than one lot at {dp} dp");
+            assert!(
+                wished - q < 1.0 / 10f64.powi(dp as i32) * (1.0 + 1e-9),
+                "{wished} -> {q} loses more than one lot at {dp} dp"
+            );
             let lots = q * 10f64.powi(dp as i32);
             assert!((lots - lots.round()).abs() < 1e-6 * lots.max(1.0), "{q} is not a multiple of the lot at {dp} dp");
             assert!(q > 0.0);

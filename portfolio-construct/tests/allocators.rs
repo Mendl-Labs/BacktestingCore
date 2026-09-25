@@ -82,10 +82,18 @@ fn inverse_vol_holds_without_history_and_on_degenerate_volatility() {
     assert_eq!(al.review(&[&a, &a], &[3, 3]), ReviewOutcome::Held(HoldReason::NotEnoughHistory));
     let a4 = [0.01, -0.01, 0.01, -0.01];
     let z4 = [0.0; 4];
-    assert_eq!(al.review(&[&a4, &z4], &[4, 4]), ReviewOutcome::Held(HoldReason::DegenerateVolatility), "zero deviation");
+    assert_eq!(
+        al.review(&[&a4, &z4], &[4, 4]),
+        ReviewOutcome::Held(HoldReason::DegenerateVolatility),
+        "zero deviation"
+    );
     assert_eq!(al.shares(), &[0.5, 0.5][..], "held: shares are unchanged");
     let nan4 = [0.01, f64::NAN, 0.01, -0.01];
-    assert_eq!(al.review(&[&a4, &nan4], &[4, 4]), ReviewOutcome::Held(HoldReason::DegenerateVolatility), "a non-finite return");
+    assert_eq!(
+        al.review(&[&a4, &nan4], &[4, 4]),
+        ReviewOutcome::Held(HoldReason::DegenerateVolatility),
+        "a non-finite return"
+    );
     // One sleeve short of history holds the whole review, not just that sleeve.
     assert_eq!(al.review(&[&a4, &z], &[4, 3]), ReviewOutcome::Held(HoldReason::NotEnoughHistory));
     // Wrong arity is a hold, never a panic.
@@ -104,9 +112,8 @@ fn inverse_vol_shares_sum_to_the_total_and_favour_the_calmer_sleeve() {
     let mut rng = SplitMix64(7);
     for case in 0..200 {
         let n = 2 + (case % 3);
-        let rets: Vec<Vec<f64>> = (0..n)
-            .map(|k| (0..80).map(|_| (rng.unit() - 0.5) * 0.01 * (1.0 + 3.0 * k as f64)).collect())
-            .collect();
+        let rets: Vec<Vec<f64>> =
+            (0..n).map(|k| (0..80).map(|_| (rng.unit() - 0.5) * 0.01 * (1.0 + 3.0 * k as f64)).collect()).collect();
         let refs: Vec<&[f64]> = rets.iter().map(|v| v.as_slice()).collect();
         let vis = vec![80; n];
         let mut al = AllocatorState::new(inv_vol(60, 0.0), n, 1.0).unwrap();
@@ -125,7 +132,8 @@ fn allocators_see_only_the_past_poisoned_future_changes_nothing() {
     let mut rng = SplitMix64(99);
     for case in 0..100 {
         let n = 3;
-        let full: Vec<Vec<f64>> = (0..n).map(|k| (0..300).map(|_| (rng.unit() - 0.5) * 0.02 * (1.0 + k as f64)).collect()).collect();
+        let full: Vec<Vec<f64>> =
+            (0..n).map(|k| (0..300).map(|_| (rng.unit() - 0.5) * 0.02 * (1.0 + k as f64)).collect()).collect();
         let vis: Vec<usize> = (0..n).map(|_| rng.range(60, 250) as usize).collect();
         let clean: Vec<&[f64]> = full.iter().map(|v| v.as_slice()).collect();
         let mut a = AllocatorState::new(inv_vol(60, 0.0), n, 1.0).unwrap();

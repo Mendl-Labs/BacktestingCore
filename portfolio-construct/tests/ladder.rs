@@ -67,7 +67,9 @@ fn step_at(l: &Ladder, st: &LadderState, equity: f64) -> LadderDecision {
 #[test]
 fn ladder_rung_one_triggers_exactly_at_the_boundary() {
     let l = baseline();
-    for (equity, want) in [(10000.0, "none"), (9000.01, "none"), (9000.0, "shrink"), (8999.99, "shrink"), (8000.01, "shrink")] {
+    for (equity, want) in
+        [(10000.0, "none"), (9000.01, "none"), (9000.0, "shrink"), (8999.99, "shrink"), (8000.01, "shrink")]
+    {
         let d = eval(&l, 10000.0, equity);
         assert_eq!(kind(&d), want, "equity {equity}: {d:?}");
     }
@@ -464,12 +466,17 @@ fn ten_thousand_generated_paths_agree_with_the_exact_integer_oracle_step_by_step
     // Ladder: daily 3% (300 bp), shrink 0.75 at 5% (500 bp), shrink 0.5 at 10% (1000 bp), halt at 20% (2000 bp), recovery 1/2.
     let ladder = three_rung();
     let scales = [0.75, 0.5];
-    let oracle = Oracle { daily_bp: 300, rungs: vec![(500, false), (1000, false), (2000, true)], rec_num: 1, rec_den: 2 };
+    let oracle =
+        Oracle { daily_bp: 300, rungs: vec![(500, false), (1000, false), (2000, true)], rec_num: 1, rec_den: 2 };
     let mut rng = SplitMix64(0xC0FFEE);
     let (mut ties, mut steps, mut halts, mut shrinks, mut recoveries) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for path in 0..10_000u64 {
         // Marks are multiples of 10000 cents half the time, so that basis-point thresholds land exactly on cents.
-        let start_cents: i128 = if rng.chance(50) { 10000 * i128::from(rng.range(50, 500)) } else { i128::from(rng.range(100_000, 5_000_000)) };
+        let start_cents: i128 = if rng.chance(50) {
+            10000 * i128::from(rng.range(50, 500))
+        } else {
+            i128::from(rng.range(100_000, 5_000_000))
+        };
         let mut equity = start_cents;
         let mut day_start = equity;
         let mut ost = OStatus::Active;

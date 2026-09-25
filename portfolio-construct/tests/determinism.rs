@@ -69,7 +69,8 @@ fn allocator_digest() -> u64 {
     let mut rng = SplitMix64(77);
     for _ in 0..200 {
         let n = 2 + (rng.range(0, 2) as usize);
-        let rets: Vec<Vec<f64>> = (0..n).map(|k| (0..120).map(|_| (rng.unit() - 0.5) * 0.02 * (1.0 + k as f64)).collect()).collect();
+        let rets: Vec<Vec<f64>> =
+            (0..n).map(|k| (0..120).map(|_| (rng.unit() - 0.5) * 0.02 * (1.0 + k as f64)).collect()).collect();
         let refs: Vec<&[f64]> = rets.iter().map(|v| v.as_slice()).collect();
         let mut a = AllocatorState::new(
             AllocatorSpec::InverseVol { lookback_bars: 60, floor: 0.0, freeze: FreezeRule::AtReviewDates },

@@ -62,7 +62,8 @@ fn planner_when_cash_is_ample_buys_are_the_exact_floor_of_target_over_price() {
 #[test]
 fn planner_sells_come_first_and_full_exits_sell_exactly_the_held_quantity() {
     // Holds SPY 4 (2000) and VNQ 3 (270); the ETF sleeve is 100% of capital and wants VNQ at zero.
-    let mut c = Case::planner(vec![etf(1.0, [0.2, 0.2, 0.2, 0.2, 0.0])]).held(SPY, 4.0).held(VNQ, 3.0).with_cash(2730.0);
+    let mut c =
+        Case::planner(vec![etf(1.0, [0.2, 0.2, 0.2, 0.2, 0.0])]).held(SPY, 4.0).held(VNQ, 3.0).with_cash(2730.0);
     c.equity = 5000.0;
     let out = c.ok();
     let sides: Vec<Side> = out.trades.iter().map(|t| t.side).collect();
@@ -213,8 +214,13 @@ fn planner_oanda_rule_table_rounds_down_and_refuses_with_reasons() {
     assert_eq!(t.round_quantity("DE30_EUR", Side::Buy, 2.57, 18000.0), Ok(2.5));
     assert_eq!(t.round_quantity("EUR_USD", Side::Buy, 0.4, px), Err(SizeRefusal::RoundsToZero));
     assert_eq!(t.round_quantity("DE30_EUR", Side::Buy, 0.05, px), Err(SizeRefusal::RoundsToZero));
-    assert!(matches!(t.round_quantity("EUR_USD", Side::Buy, 2_000_000.0, px), Err(SizeRefusal::Other(m)) if m.contains("maximumOrderUnits")));
-    assert_eq!(t.round_quantity("GBP_USD", Side::Buy, 1000.0, px), Err(SizeRefusal::UnknownInstrument("GBP_USD".into())));
+    assert!(
+        matches!(t.round_quantity("EUR_USD", Side::Buy, 2_000_000.0, px), Err(SizeRefusal::Other(m)) if m.contains("maximumOrderUnits"))
+    );
+    assert_eq!(
+        t.round_quantity("GBP_USD", Side::Buy, 1000.0, px),
+        Err(SizeRefusal::UnknownInstrument("GBP_USD".into()))
+    );
     let min10 = LotRounder::new().with("EUR_USD", LotRule::new(0).with_min_quantity(10.0));
     assert_eq!(min10.round_quantity("EUR_USD", Side::Buy, 9.0, 1.0), Err(SizeRefusal::BelowMinQuantity { min: 10.0 }));
     assert_eq!(min10.round_quantity("EUR_USD", Side::Buy, 10.0, 1.0), Ok(10.0));
@@ -228,7 +234,10 @@ fn planner_oanda_rule_table_rounds_down_and_refuses_with_reasons() {
 fn planner_kraken_and_alpaca_shaped_rules() {
     let r = planner_rounder();
     assert_eq!(r.round_quantity("BTC/USD", Side::Buy, 0.123456789, 60000.0), Ok(0.12345678));
-    assert_eq!(r.round_quantity("BTC/USD", Side::Buy, 0.00009, 60000.0), Err(SizeRefusal::BelowMinQuantity { min: 0.0001 }));
+    assert_eq!(
+        r.round_quantity("BTC/USD", Side::Buy, 0.00009, 60000.0),
+        Err(SizeRefusal::BelowMinQuantity { min: 0.0001 })
+    );
     assert!(matches!(r.round_quantity("DOGE/USD", Side::Buy, 1.0, 1.0), Err(SizeRefusal::UnknownInstrument(_))));
     // costmin 0.5: 0.0001 BTC at a price of 100 is worth 0.01.
     assert_eq!(r.round_quantity("BTC/USD", Side::Buy, 0.0001, 100.0), Err(SizeRefusal::BelowMinCost { min: 0.5 }));
@@ -287,13 +296,19 @@ fn planner_sleeve_input_validation() {
     let run = |sleeves: Vec<SleeveTargets>| Case::planner(sleeves).run().unwrap_err();
     let inv = |e: InputError| ConstructRefusal::Invalid(e);
     // shares above 1 in total
-    assert!(matches!(run(vec![etf(0.6, [0.2; 5]), crypto(0.5, 0.5, 0.5)]), ConstructRefusal::Invalid(InputError::SharesExceedOne(_))));
+    assert!(matches!(
+        run(vec![etf(0.6, [0.2; 5]), crypto(0.5, 0.5, 0.5)]),
+        ConstructRefusal::Invalid(InputError::SharesExceedOne(_))
+    ));
     // a share of 0 or above 1
     assert!(matches!(run(vec![etf(0.0, [0.2; 5])]), ConstructRefusal::Invalid(InputError::BadShare(_))));
     assert!(matches!(run(vec![etf(1.1, [0.2; 5])]), ConstructRefusal::Invalid(InputError::BadShare(_))));
     // weights above 1 in total, or a single weight outside [0, 1]
     assert!(matches!(run(vec![etf(1.0, [0.3; 5])]), ConstructRefusal::Invalid(InputError::WeightsExceedOne(_))));
-    assert!(matches!(run(vec![etf(1.0, [-0.1, 0.0, 0.0, 0.0, 0.0])]), ConstructRefusal::Invalid(InputError::BadWeight { .. })));
+    assert!(matches!(
+        run(vec![etf(1.0, [-0.1, 0.0, 0.0, 0.0, 0.0])]),
+        ConstructRefusal::Invalid(InputError::BadWeight { .. })
+    ));
     // duplicate sleeve id, duplicate symbol within a sleeve
     let mut b = etf(0.5, [0.2; 5]);
     b.id = "etf".into();
@@ -435,7 +450,8 @@ fn signed_case(weights: &[(usize, f64)]) -> Case {
     let mut c = Case::planner(vec![SleeveTargets::signed("ls", 1.0, 2.0, weights.to_vec())]);
     c.equity = 20000.0;
     c.allocated = Some(20000.0);
-    c.limits = Limits::unlimited().with_max_gross(3.0).with_leverage_max_gross(3.0).with_max_net(3.0).with_max_position(3.0);
+    c.limits =
+        Limits::unlimited().with_max_gross(3.0).with_leverage_max_gross(3.0).with_max_net(3.0).with_max_position(3.0);
     c.funding = Funding::BuyingPower { buying_power: 100000.0, reserve_fraction: 0.05, fee_rate: 0.0025 };
     c
 }
@@ -444,7 +460,11 @@ fn signed_case(weights: &[(usize, f64)]) -> Case {
 fn signed_long_and_short_targets_are_planned_and_buying_power_left_matches() {
     // SPY +0.1 -> +2000 (4 shares), EFA -0.1 -> -2000 (25 shares).
     let out = signed_case(&[(SPY, 0.1), (EFA, -0.1)]).ok();
-    assert_eq!(brief(&out), vec![("EFA".to_string(), Side::Sell, 25.0), ("SPY".to_string(), Side::Buy, 4.0)], "increases are ordered by (venue, symbol)");
+    assert_eq!(
+        brief(&out),
+        vec![("EFA".to_string(), Side::Sell, 25.0), ("SPY".to_string(), Side::Buy, 4.0)],
+        "increases are ordered by (venue, symbol)"
+    );
     assert_eq!(line(&out, "EFA").target_notional, -2000.0);
     assert_eq!(line(&out, "SPY").target_notional, 2000.0);
     assert!(out.needs_margin, "a short target needs margin");
@@ -479,7 +499,8 @@ fn signed_gross_above_one_times_equity_is_planned_up_to_the_cap_and_refused_abov
 #[test]
 fn signed_a_no_leverage_mandate_refuses_a_levered_plan() {
     let mut c = signed_case(&[(SPY, 0.7), (DBC, 0.7)]);
-    c.limits = Limits::unlimited().with_max_gross(1.0).with_leverage_max_gross(1.0).with_max_net(1.0).with_max_position(1.0);
+    c.limits =
+        Limits::unlimited().with_max_gross(1.0).with_leverage_max_gross(1.0).with_max_net(1.0).with_max_position(1.0);
     assert!(matches!(c.run(), Err(ConstructRefusal::GrossAboveCap { .. })));
 }
 
@@ -497,32 +518,44 @@ fn signed_max_abs_weight_bounds_a_signed_sleeve_and_replaces_the_unit_rules_only
     assert!(run(ls(2.0, &[(SPY, -2.0)])).is_ok());
     for bad in [2.000000001, -2.000000001, 3.0, -5.0] {
         let e = run(ls(2.0, &[(SPY, bad)])).unwrap_err();
-        assert_eq!(e, ConstructRefusal::Invalid(InputError::BadSignedWeight { sleeve: "ls".into(), symbol: "SPY".into(), max: 2.0 }), "{bad}");
+        assert_eq!(
+            e,
+            ConstructRefusal::Invalid(InputError::BadSignedWeight {
+                sleeve: "ls".into(),
+                symbol: "SPY".into(),
+                max: 2.0
+            }),
+            "{bad}"
+        );
     }
     // No sum rule for a signed sleeve.
     assert!(run(ls(2.0, &[(SPY, 1.5), (EFA, -1.5)])).is_ok());
     // The bound itself: (0, MAX_ABS_WEIGHT_CAP].
     assert_eq!(MAX_ABS_WEIGHT_CAP, 3.0);
     for bad in [0.0, -1.0, 3.000000001, 4.0] {
-        assert!(matches!(run(ls(bad, &[(SPY, 0.1)])), Err(ConstructRefusal::Invalid(InputError::BadMaxAbsWeight { .. }))), "{bad}");
+        assert!(
+            matches!(run(ls(bad, &[(SPY, 0.1)])), Err(ConstructRefusal::Invalid(InputError::BadMaxAbsWeight { .. }))),
+            "{bad}"
+        );
     }
     assert!(run(ls(3.0, &[(SPY, 0.0)])).is_ok(), "the hard cap itself is allowed");
     // Per sleeve: a long-only sleeve next to a signed one keeps today's rules (share 0.5 each).
     let mixed = |w: &[(usize, f64)]| {
-        vec![
-            SleeveTargets::signed("ls", 0.5, 2.0, vec![(SPY, 1.5)]),
-            SleeveTargets::long_only("etf", 0.5, w.to_vec()),
-        ]
+        vec![SleeveTargets::signed("ls", 0.5, 2.0, vec![(SPY, 1.5)]), SleeveTargets::long_only("etf", 0.5, w.to_vec())]
     };
     assert!(matches!(run(mixed(&[(EFA, -0.1)])), Err(ConstructRefusal::Invalid(InputError::BadWeight { .. }))));
     assert!(matches!(run(mixed(&[(EFA, 1.1)])), Err(ConstructRefusal::Invalid(InputError::BadWeight { .. }))));
-    assert!(matches!(run(mixed(&[(EFA, 0.6), (IEF, 0.6)])), Err(ConstructRefusal::Invalid(InputError::WeightsExceedOne(_)))));
+    assert!(matches!(
+        run(mixed(&[(EFA, 0.6), (IEF, 0.6)])),
+        Err(ConstructRefusal::Invalid(InputError::WeightsExceedOne(_)))
+    ));
 }
 
 #[test]
 fn signed_a_short_within_the_gross_cap_is_not_leverage_even_at_one_x() {
     let mut c = signed_case(&[(SPY, 0.1), (EFA, -0.1)]);
-    c.limits = Limits::unlimited().with_max_gross(1.0).with_leverage_max_gross(1.0).with_max_net(1.0).with_max_position(1.0);
+    c.limits =
+        Limits::unlimited().with_max_gross(1.0).with_leverage_max_gross(1.0).with_max_net(1.0).with_max_position(1.0);
     let out = c.ok();
     assert_eq!(brief(&out), vec![("EFA".to_string(), Side::Sell, 25.0), ("SPY".to_string(), Side::Buy, 4.0)]);
 }
@@ -531,7 +564,8 @@ fn signed_a_short_within_the_gross_cap_is_not_leverage_even_at_one_x() {
 fn signed_a_margin_plan_without_buying_power_is_refused() {
     let cash_plan = |w: &[(usize, f64)]| {
         let mut c = signed_case(w);
-        c.funding = Funding::Cash { cash: 20000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
+        c.funding =
+            Funding::Cash { cash: 20000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
         c.run()
     };
     // A short target.
@@ -585,7 +619,11 @@ fn signed_with_buying_power_cash_is_not_the_budget() {
 fn signed_long_to_short_is_a_close_leg_then_an_open_leg() {
     // Holds SPY 4 (2000 long); the target is -2000 (-0.1).
     let out = signed_case(&[(SPY, -0.1)]).held(SPY, 4.0).ok();
-    assert_eq!(brief(&out), vec![("SPY".to_string(), Side::Sell, 4.0), ("SPY".to_string(), Side::Sell, 4.0)], "sell to close, then sell to open");
+    assert_eq!(
+        brief(&out),
+        vec![("SPY".to_string(), Side::Sell, 4.0), ("SPY".to_string(), Side::Sell, 4.0)],
+        "sell to close, then sell to open"
+    );
     assert_eq!((out.trades[0].leg, out.trades[0].reducing), (LegKind::Close, true));
     assert_eq!((out.trades[1].leg, out.trades[1].reducing), (LegKind::Open, false));
 }
@@ -609,7 +647,10 @@ fn signed_a_venue_refusal_of_the_open_leg_leaves_the_account_flat() {
     c.filter = TradeFilter::new(0.0, 0.02);
     let out = c.ok();
     assert_eq!(brief(&out), vec![("SPY".to_string(), Side::Sell, 4.0)]);
-    assert!(out.skipped.iter().any(|s| s.symbol == "SPY" && s.reason == SkipReason::VenueRefused(SizeRefusal::RoundsToZero)));
+    assert!(out
+        .skipped
+        .iter()
+        .any(|s| s.symbol == "SPY" && s.reason == SkipReason::VenueRefused(SizeRefusal::RoundsToZero)));
 }
 
 #[test]
@@ -654,12 +695,17 @@ fn signed_a_held_short_is_managed_in_a_signed_sleeve_and_still_skipped_in_a_long
 fn signed_zero_targets_close_everything_without_needing_margin_or_buying_power() {
     let mk = || {
         let mut c = signed_case(&[(SPY, 0.0), (EFA, 0.0), (IEF, 0.0)]);
-        c.funding = Funding::Cash { cash: 20000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
+        c.funding =
+            Funding::Cash { cash: 20000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
         c
     };
     let out = mk().held(SPY, 4.0).held(EFA, -25.0).ok();
     assert!(!out.needs_margin);
-    assert_eq!(brief(&out), vec![("EFA".to_string(), Side::Buy, 25.0), ("SPY".to_string(), Side::Sell, 4.0)], "both are reductions: ordered by symbol");
+    assert_eq!(
+        brief(&out),
+        vec![("EFA".to_string(), Side::Buy, 25.0), ("SPY".to_string(), Side::Sell, 4.0)],
+        "both are reductions: ordered by symbol"
+    );
     // Flat account, zero targets: nothing at all.
     let out = mk().ok();
     assert!(out.trades.is_empty() && out.skipped.is_empty());
@@ -716,13 +762,15 @@ fn deviation_long_only_gross_cap_is_checked_at_plan_level_only_under_r1() {
     let mk = |policy: LimitPolicy| {
         let mut c = Case::planner(vec![etf(1.0, [0.2; 5])]);
         c.limits = Limits::long_only_unit().with_max_gross(0.5).with_policy(policy);
-        c.funding = Funding::Cash { cash: 5000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
+        c.funding =
+            Funding::Cash { cash: 5000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true };
         c
     };
     assert!(matches!(mk(LimitPolicy::RefuseWholeBook).run(), Err(ConstructRefusal::GrossAboveCap { .. })));
     assert!(mk(LimitPolicy::PlannerFaithful).run().is_ok());
     // A signed plan is refused by both.
     let mut c = signed_case(&[(SPY, 1.0), (EFA, 1.0)]);
-    c.limits = c.limits.clone().with_max_gross(1.0).with_leverage_max_gross(1.0).with_policy(LimitPolicy::PlannerFaithful);
+    c.limits =
+        c.limits.clone().with_max_gross(1.0).with_leverage_max_gross(1.0).with_policy(LimitPolicy::PlannerFaithful);
     assert!(matches!(c.run(), Err(ConstructRefusal::GrossAboveCap { .. })));
 }

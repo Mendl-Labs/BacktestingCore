@@ -690,15 +690,12 @@ pub fn construct(i: &ConstructInputs<'_>) -> Result<ConstructOutput, ConstructRe
         }
     }
     // margin model (reported under both policies; refused only under R1/R2 semantics)
-    let mut margin_terms = Vec::with_capacity(lines.len());
-    for l in &lines {
-        let inst = &i.instruments[l.instrument];
-        let Some(rate) = i.margin.rate(inst) else {
-            return Err(ConstructRefusal::Invalid(InputError::MarginRateUnknown(inst.symbol.clone())));
-        };
-        margin_terms.push(rate * l.target_notional.abs());
-    }
-    let margin_used = stable_sum(&margin_terms);
+    let book: Vec<(&InstrumentFacts, f64)> =
+        lines.iter().map(|l| (&i.instruments[l.instrument], l.target_notional)).collect();
+    let Some(margin_used) = i.margin.margin_used(&book) else {
+        let missing = book.iter().find(|(inst, _)| i.margin.rate(inst).is_none()).map(|(inst, _)| inst.symbol.clone());
+        return Err(ConstructRefusal::Invalid(InputError::MarginRateUnknown(missing.unwrap_or_default())));
+    };
     let margin_ceiling = i.margin.ceiling(i.equity);
     if refuse_all {
         if let Some(ceiling) = margin_ceiling {

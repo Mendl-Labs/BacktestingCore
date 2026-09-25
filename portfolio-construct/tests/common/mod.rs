@@ -117,7 +117,12 @@ impl Case {
             margin: Box::new(NoMargin),
             filter: TradeFilter::PLANNER_DEFAULT,
             rounder: Some(planner_rounder()),
-            funding: Funding::Cash { cash: 5000.0, reserve_fraction: 0.05, fee_rate: 0.0025, credit_sell_proceeds: true },
+            funding: Funding::Cash {
+                cash: 5000.0,
+                reserve_fraction: 0.05,
+                fee_rate: 0.0025,
+                credit_sell_proceeds: true,
+            },
             target_dp: Some(8),
             unmanaged: 0.0,
         }
@@ -178,7 +183,11 @@ pub fn trade<'a>(out: &'a ConstructOutput, symbol: &str) -> &'a TradeIntent {
 }
 
 pub fn skip_reason<'a>(out: &'a ConstructOutput, symbol: &str) -> &'a SkipReason {
-    &out.skipped.iter().find(|s| s.symbol == symbol).unwrap_or_else(|| panic!("{symbol} not skipped: {:?}", out.skipped)).reason
+    &out.skipped
+        .iter()
+        .find(|s| s.symbol == symbol)
+        .unwrap_or_else(|| panic!("{symbol} not skipped: {:?}", out.skipped))
+        .reason
 }
 
 pub fn line<'a>(out: &'a ConstructOutput, symbol: &str) -> &'a Line {
@@ -403,7 +412,12 @@ pub fn gen(seed: u64) -> G {
             fee_rate: *r.pick(&[0.0, 0.0025]),
         },
     };
-    let filter = *r.pick(&[TradeFilter::NONE, TradeFilter::PLANNER_DEFAULT, TradeFilter::new(5.0, 0.05), TradeFilter::new(50.0, 0.0)]);
+    let filter = *r.pick(&[
+        TradeFilter::NONE,
+        TradeFilter::PLANNER_DEFAULT,
+        TradeFilter::new(5.0, 0.05),
+        TradeFilter::new(50.0, 0.0),
+    ]);
     let rounder = if r.chance(50) {
         let mut t = LotRounder::new();
         for i in &instruments {
