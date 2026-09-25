@@ -4,9 +4,10 @@
 # database, no network calls in the tests). The Engine's ladder_certification test remains the authoritative
 # certification.
 #
-# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume) and
-# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification) are
-# STANDALONE crates (each has its own [workspace] and Cargo.lock, and all are excluded from Core's workspace) because
+# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume),
+# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification)
+# and portfolio-eval (Stage PF5: purged folds, stationary bootstrap, paired marginal test, HAC spanning alpha, DSR,
+# trial ledger, PBO and the committed power table; zero dependencies) are STANDALONE crates (each has its own [workspace] and Cargo.lock, and all are excluded from Core's workspace) because
 # Core's workspace depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
 # reference-rules' real-history goldens are vendor-derived and are not in this public repository: they are env-gated
 # (REFRULES_LADDER_DIR) and print SKIPPED here; the always-on golden tests run on the synthetic fixtures.
@@ -19,6 +20,7 @@ on:
       - "weightsim/**"
       - "reference-rules/**"
       - "weightsim-rules/**"
+      - "portfolio-eval/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -28,6 +30,7 @@ on:
       - "weightsim/**"
       - "reference-rules/**"
       - "weightsim-rules/**"
+      - "portfolio-eval/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -197,3 +200,54 @@ jobs:
           workspaces: weightsim-rules
       - name: run every hand-written mutant against the suite
         run: python3 weightsim-rules/mutants/run_mutants.py
+
+  portfolio-eval:
+    name: portfolio-eval (fmt, clippy, tests, power table)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: portfolio-eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-eval
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, integration, hand-computed references, property tests, determinism, pinned reduced Monte Carlo)
+        run: cargo test --locked --no-fail-fast
+
+      # The committed POWER_TABLE.md must be exactly what the code generates, on this platform too (the crate uses no
+      # libm, so x86_64 and aarch64 give the same bits). About 40 s in release on two cores.
+      - name: the committed power table regenerates byte for byte
+        run: cargo test --release --locked --test power_table -- --ignored --nocapture
+
+  portfolio-eval-mutants:
+    name: portfolio-eval mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: portfolio-eval
+    env:
+      PORTFOLIO_EVAL_TEST_CMD: cargo test --manifest-path portfolio-eval/Cargo.toml --locked
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-eval
+      - name: run every hand-written mutant against the suite
+        run: python3 portfolio-eval/mutants/run_mutants.py

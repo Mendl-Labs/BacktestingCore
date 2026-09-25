@@ -1,0 +1,23 @@
+[package]
+name = "portfolio-eval"
+version = "0.1.0"
+edition = "2021"
+description = "Pure, deterministic portfolio-level evaluation statistics: purged folds, stationary bootstrap, paired marginal test, HAC spanning alpha, DSR, trial ledger, PBO (PORTFOLIO_FIRST_BACKTESTER_DESIGN.md, PF5)"
+publish = false
+
+# Deliberately ZERO dependencies. Everything here is arithmetic on slices of f64 and a seeded in-crate PRNG, so `std` is
+# enough:
+#   * randomness    -> src/rng.rs     (xoshiro256** seeded through SplitMix64; nothing is ever read from the OS)
+#   * exp/ln/sin/cos/erfc/probit -> src/detmath.rs (basic IEEE operations only, so every result, and therefore every
+#                                     pinned digest and the committed power table, is bit-identical on x86_64 and aarch64
+#                                     instead of depending on the platform libm)
+#   * errors        -> hand-written Display/Error impls (replaces thiserror)
+#   * SHA-256       -> src/sha256.rs  (digests that pin bootstrap draws and the power table; checked against NIST vectors)
+# Every avoided dependency is one less thing that can change the numerical path.
+[dependencies]
+
+[dev-dependencies]
+
+# Standalone on purpose: NOT a member of the BacktestingCore workspace (root Cargo.toml `exclude`). Its dependency set
+# is empty, so CI and consumers never have to resolve the workspace's private git dependencies.
+[workspace]
