@@ -4,8 +4,9 @@
 # database, no network calls in the tests). The Engine's ladder_certification test remains the authoritative
 # certification.
 #
-# weightsim and reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume) are
-# STANDALONE crates (each has its own [workspace] and Cargo.lock, and both are excluded from Core's workspace) because
+# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume) and
+# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification) are
+# STANDALONE crates (each has its own [workspace] and Cargo.lock, and all are excluded from Core's workspace) because
 # Core's workspace depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
 # reference-rules' real-history goldens are vendor-derived and are not in this public repository: they are env-gated
 # (REFRULES_LADDER_DIR) and print SKIPPED here; the always-on golden tests run on the synthetic fixtures.
@@ -17,6 +18,7 @@ on:
     paths:
       - "weightsim/**"
       - "reference-rules/**"
+      - "weightsim-rules/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -25,6 +27,7 @@ on:
     paths:
       - "weightsim/**"
       - "reference-rules/**"
+      - "weightsim-rules/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
@@ -140,3 +143,57 @@ jobs:
           workspaces: reference-rules
       - name: run every hand-written mutant against the suite
         run: python3 reference-rules/mutants/run_mutants.py
+
+  weightsim-rules:
+    name: weightsim-rules (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: weightsim-rules
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim-rules
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, adapters vs the Python key of the synthetic fixture, ladder logic on a synthetic answer key, mutant oracles, negative controls)
+        run: cargo test --locked --no-fail-fast -- --nocapture
+
+      # The real-data ladder needs vendor-derived fixtures that live only in the private Engine repository. They are
+      # env-gated (WEIGHTSIM_RULES_LADDER_DIR) and must print SKIPPED here, never silently pass as if they had run.
+      - name: the real-data ladder is skipped here (the Engine's CI runs it on the committed fixtures)
+        run: |
+          cargo test --locked --test ladder_real -- --nocapture 2>&1 | tee real.log
+          grep -q "SKIPPED real ladder" real.log
+          grep -q "SKIPPED flat-start negative control" real.log
+
+  weightsim-rules-mutants:
+    name: weightsim-rules mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    needs: weightsim-rules
+    env:
+      WEIGHTSIM_RULES_TEST_CMD: cargo test --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim-rules
+      - name: run every hand-written mutant against the suite
+        run: python3 weightsim-rules/mutants/run_mutants.py
