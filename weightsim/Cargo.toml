@@ -1,8 +1,8 @@
 [package]
 name = "weightsim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Pure, deterministic weight-target sleeve simulator (BACKTESTER_TRUTH_DESIGN.md Section 2, stage T1)"
+description = "Pure, deterministic weight-target simulator: the single-sleeve T1 simulator and the joint-account BOOK simulator (BACKTESTER_TRUTH_DESIGN.md Section 2; PORTFOLIO_FIRST_BACKTESTER_DESIGN.md phase PF1)"
 publish = false
 
 # Deliberately ZERO dependencies. The simulator is pure (no I/O, no vendor calls, no DB, no Python, no network),
