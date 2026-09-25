@@ -40,7 +40,10 @@
 //!    sticky and the state records why.
 //! 7. **Allocators** are static between reviews; `InverseVol` is the key's definition (60-bar sample deviation of each
 //!    sleeve's own-calendar returns, shares proportional to `1/sd`) with an optional deviation floor.
-//! 8. **Schedule** carries its own civil-date type (no `chrono`); `weightsim` converts its `Date` when it integrates.
+//! 8. **Schedule** carries its own civil-date type (no `chrono`); `weightsim` converts its `Date` when it integrates. Since 0.2
+//!    it also carries the LIVE monthly cadence, [`Cadence::DecisionPending`] (council Ruling 1: evaluate every run, plan iff
+//!    `D_computable > D_acted`), as pure functions; [`Cadence::CalendarMonthEnd`] stays as the documented wall-clock predicate
+//!    of the U3 defect and must not be used for the live ETF cadence.
 //!
 //! # Known deviations from the live planner and from the PF0 key (the ledger)
 //! Planner (SignalEngine `main` at 4937a43): (1) limits: the planner checks only the gross cap and only for signed plans
@@ -82,7 +85,10 @@ pub use limits::{LimitPolicy, Limits};
 pub use margin::{AlpacaRegT, BuyingPower, BuyingPowerFactor, MarginModel, NoMargin, OandaMargin};
 pub use num::{ceil_dp, floor_dp, round_toward_zero_dp, stable_sum, EDGE_TOL};
 pub use rounding::{ExactUnits, LotRounder, LotRule, QuantityRounder, Side, SizeRefusal};
-pub use schedule::{due, plan_flags, BookCadence, Cadence, CivilDate};
+pub use schedule::{
+    advance_acted, closed_bars, computable_decision_date, decision_pending, due, due_on, evaluate_decision, plan_flags,
+    plan_flags_for, BarsError, BookCadence, Cadence, CivilDate, DecisionEvaluation, DueInputs,
+};
 
 /// The reference FX rule clips every weight to +-3 AFTER its volatility scaling (observed maximum 1.87), so a per-instrument
 /// sleeve weight above 3 is not a reproduction of any documented rule; a sanity ceiling on the INPUT, never a permission

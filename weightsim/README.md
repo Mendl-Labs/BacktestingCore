@@ -1,7 +1,7 @@
 # weightsim
 
 Pure, deterministic weight-target simulator: the single-sleeve simulator (Stage T1 of
-`product-mandate/BACKTESTER_TRUTH_DESIGN.md`) and, since 0.2, the joint-account BOOK simulator (phase PF1 of
+`product-mandate/BACKTESTER_TRUTH_DESIGN.md`) and, since 0.2, the joint-account BOOK simulator (0.3: per-sleeve execution delay and the delay-sensitivity table) (phase PF1 of
 `product-mandate/PORTFOLIO_FIRST_BACKTESTER_DESIGN.md`: several sleeves in one account on the union clock, sleeve combine,
 capital base, risk scale, trade filter, cash policy, both cadence modes, a frozen inverse-vol allocator, per-sleeve shadow
 curves, attribution, an overlay hook). `simulate` is unchanged; `simulate_book` with one sleeve is bit-identical to it.
@@ -26,6 +26,19 @@ test prints `SKIPPED`.
 The real-data tests compare the simulator with the PF0 book key (`replication_ladder_book/`, pre-registered in Amendment 12,
 private Engine repository): five per-bar files, the netting file, the T0 single-sleeve files and the finding-F1 numbers; and
 check one-sleeve identity with `simulate` on the real candles. Without the variables they print `SKIPPED`.
+
+### Per-sleeve execution delay and the delay-sensitivity table (weightsim 0.3)
+
+    cargo test --test book_delay                                                              # always on, synthetic
+    WEIGHTSIM_LADDER_DIR=<replication_ladder> WEIGHTSIM_BOOK_KEY_DIR=<replication_ladder_book> \
+        cargo test --test book_key_real real_delay -- --nocapture                             # real data, env-gated
+
+`SleeveSpec::with_execution_delay(d)` gives one sleeve its own delay in ITS OWN bars (a decision at the close of own bar `t` is
+traded at the close of own bar `t + d`; `None` = the book-level `execution_delay_bars`, so nothing changes for a book that never
+sets one). A book with an ETF sleeve at `d = 1` and a crypto sleeve at `d = 0` is proven equal to the single-sleeve books (shadows,
+cadence flags) and to an independent oracle (each rule wrapped to emit its decision `d` bars late, run at delay 0) on every column.
+`delay_sensitivity(&panel, &book, &cfg, DelayScope::Book | Sleeve(s), &STANDARD_DELAYS)` returns the table `d = 0, 1, 2, 3, 5`
+(gross and net metrics, correlation of the net returns to the baseline row, cost) and `format_delay_table` prints it.
 
 ## Answer-key fixtures (`tests/fixtures/`)
 
@@ -53,7 +66,7 @@ refusal, trade filter, cash policy, frozen inverse-vol shares) behind the `Const
 
 Each hand-written mutant is one exact source edit; every one must be killed by at least one test.
 
-    python3 weightsim/mutants/run_book_mutants.py           # 51 mutants of the book simulator (design 6.5 list + our own)
+    python3 weightsim/mutants/run_book_mutants.py           # 69 mutants of the book simulator (design 6.5 list + our own, B52-B69: 0.3 delay)
     python3 weightsim/mutants/run_book_mutants.py --check   # verify that every edit still matches exactly once
 
 `WEIGHTSIM_BOOK_TEST_CMD` overrides the test command; every book mutant must be killed by the ALWAYS-ON tests.

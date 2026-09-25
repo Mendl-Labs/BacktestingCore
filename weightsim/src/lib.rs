@@ -115,7 +115,8 @@
 //! * **P9 Shadows are online.** Each sleeve's unit-capital accounts (gross and cost) run inside the loop on the sleeve's own
 //!   bars, so the allocator can only read returns through the review close: look-ahead is structurally impossible, and the
 //!   poisoning tests certify it. The gross shadow carries no cost and no financing; the cost shadow the run's preset.
-//! * **P10 Execution delay** counts the decision sleeve's OWN bars (a Friday ETF decision with delay 1 fills on Monday).
+//! * **P10 Execution delay** counts the decision sleeve's OWN bars (a Friday ETF decision with delay 1 fills on Monday). Since 0.3
+//!   the delay is PER SLEEVE (P15).
 //! * **P11 Overlay.** [`Overlay`] steps on the simulated post-cost equity marked at the bar's closes before trading; its
 //!   scale multiplies the constant risk scale; a halt flattens through the same construction path and is sticky.
 //! * **P12 `IndependentSubAccounts`** is legacy emulation: each sleeve is its own sub-account with capital
@@ -125,6 +126,25 @@
 //!   (`ppy = n/years` on the account clock); each sleeve is also reported on its own calendar.
 //! * **P14 Poison** for books is a per-instrument level shift in `[0.5, 2)` with 10% bar noise, milder than T1's, so a levered
 //!   book is not ruined by the poison itself (a ruined poisoned run is an error, never a pass).
+//!
+//! # weightsim 0.3 (council Ruling 4, work items W1 and W8): per-sleeve execution delay and the delay-sensitivity table
+//! Everything is additive and a book that never sets a per-sleeve delay is bit-identical to 0.2 (every pinned digest is
+//! unchanged, every one-sleeve identity to `simulate` holds; the tests of 0.2 run unmodified).
+//! * **P15 Per-sleeve delay.** [`SleeveSpec::with_execution_delay`] (field `execution_delay: Option<usize>`) gives one sleeve
+//!   its own delay `d_s`, in that sleeve's OWN bars: a decision taken at the close of the sleeve's own bar `t` becomes
+//!   effective, and is traded, at the close of the sleeve's own bar `t + d_s` (a Friday ETF decision with `d = 1` trades on
+//!   Monday, never on the closed Saturday). `None` means the book-level [`SimConfig::execution_delay_bars`], so the book-level
+//!   integer is now the DEFAULT for sleeves that do not override it; `Some(0)` overrides a non-zero default. Consequently a
+//!   book with an ETF sleeve at `d = 1` and a crypto sleeve at `d = 0` is exactly the two decision streams, each shifted by its
+//!   own delay, traded through the SAME joint construction (gross cap refusal, trade filter, cash policy, shares, allocator and
+//!   overlay are untouched by the delay; the shadows run on the delayed standing targets of their own sleeve only, so a
+//!   sleeve's shadow and cadence flags do not depend on any other sleeve's delay). A delay that is not smaller than the
+//!   sleeve's whole own history is refused (`BookError::BadBook`, it could never execute anything); a smaller delay that
+//!   pushes the last decisions past the end of the data simply never executes them (C11).
+//! * **P16 Delay sensitivity** ([`delay`]): [`delay_sensitivity`] runs a book, or one sleeve of it ([`DelayScope`]), at
+//!   [`STANDARD_DELAYS`] (`0, 1, 2, 3, 5`) and returns one [`DelayRow`] per delay: gross and net metrics, the correlation of
+//!   the net returns to the baseline row, cost and the pinned digest. It selects nothing; the delay a product states is
+//!   pre-registered (Ruling 12).
 
 // Deliberate, crate-wide clippy exceptions:
 //  * `needless_range_loop`: the simulation path indexes several parallel per-asset vectors in lock step with plain
@@ -142,6 +162,7 @@ pub mod book_sim;
 pub mod construct;
 pub mod costs;
 pub mod date;
+pub mod delay;
 pub mod harness;
 pub mod metrics;
 pub mod panel;
@@ -168,6 +189,9 @@ pub use construct::{
 };
 pub use costs::{CostModel, Financing};
 pub use date::{Date, DateError};
+pub use delay::{
+    aligned_correlation, book_with_delay, delay_sensitivity, format_delay_table, DelayRow, DelayScope, STANDARD_DELAYS,
+};
 pub use metrics::{answer_key_metrics, Metrics, METRIC_DEFINITIONS};
 pub use panel::{HistoryView, Panel, PanelError, PriceSource};
 pub use rule::{DecisionSchedule, OnRefusal, RebalancePolicy, RefusalKind, Rule, RuleRefusal, WeightRule};
