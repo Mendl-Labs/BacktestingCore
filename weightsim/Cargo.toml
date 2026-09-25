@@ -1,6 +1,6 @@
 [package]
 name = "weightsim"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Pure, deterministic weight-target simulator: the single-sleeve T1 simulator and the joint-account BOOK simulator (BACKTESTER_TRUTH_DESIGN.md Section 2; PORTFOLIO_FIRST_BACKTESTER_DESIGN.md phase PF1)"
 publish = false

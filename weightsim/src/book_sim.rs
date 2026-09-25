@@ -12,7 +12,8 @@
 //! (4) joint account: financing, E_pre = cash + SUM units*mark (no trading yet); contributions of the previous bar's
 //!     weights; the overlay steps on E_pre and scales the risk
 //! (5) decisions: each sleeve with an own bar asks its rule (own-calendar schedule and history), targets become
-//!     effective after `execution_delay_bars` own bars
+//!     effective after the sleeve's execution delay in own bars (`SleeveSpec::execution_delay`, else the book-level
+//!     `execution_delay_bars`)
 //! (6) allocator review (calendar month-end of the account clock): shares from past shadow returns only
 //! (7) cadence: due sleeves, driver run, planned sleeves
 //! (8) construction (crate::construct) -> units, cost; a whole-book refusal trades nothing
@@ -160,6 +161,8 @@ struct SleeveRt<'a> {
     schedule: DecisionSchedule,
     policy: RebalancePolicy,
     min_hist: usize,
+    /// Execution delay of THIS sleeve in its own bars: its own `SleeveSpec::execution_delay`, else the book-level value.
+    delay: usize,
     standing: Option<Vec<f64>>,
     pending: VecDeque<(usize, Vec<f64>)>,
     decided_any: bool,
@@ -316,6 +319,16 @@ pub fn simulate_book_with(
             own_of_union[u] = t;
         }
         let k = spec.universe.len();
+        // A delay of at least the sleeve's whole own history means no decision could ever be executed: refuse instead of
+        // returning a silently flat sleeve (a smaller but still too large delay simply never fills the late decisions, C11).
+        let delay = spec.effective_delay(cfg.sim.execution_delay_bars);
+        if delay >= cal.panel.n_bars() {
+            return Err(BookError::BadBook(format!(
+                "sleeve {}: execution delay of {delay} own bars is not smaller than the {} own bars the sleeve has: no decision could ever be executed",
+                spec.id,
+                cal.panel.n_bars()
+            )));
+        }
         sl.push(SleeveRt {
             cal,
             own_of_union,
@@ -323,6 +336,7 @@ pub fn simulate_book_with(
             schedule: spec.rule.decision_schedule(),
             policy: spec.effective_policy(),
             min_hist: spec.rule.min_history_bars(),
+            delay,
             standing: None,
             pending: VecDeque::new(),
             decided_any: false,
@@ -354,7 +368,6 @@ pub fn simulate_book_with(
     let mut fills = vec![0u64; n];
     let mut rebalance_bars = 0u64;
     let on_refusal = cfg.sim.on_refusal;
-    let delay = cfg.sim.execution_delay_bars;
 
     // ---- outputs
     let mut res = BookResult {
@@ -631,7 +644,7 @@ pub fn simulate_book_with(
                         decision_ok[s] = true;
                         r.decision_bars.push(k);
                         r.decision_signs.push(w.iter().map(|v| sign(*v * cfg.sim.risk_scale)).collect());
-                        r.pending.push_back((t + delay, w));
+                        r.pending.push_back((t + r.delay, w));
                     }
                     Err(refusal) => {
                         let tolerated_warmup = refusal.kind == RefusalKind::Warmup && !r.decided_any;

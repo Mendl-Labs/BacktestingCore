@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Hand-written mutation testing for the BOOK simulator of `weightsim` v0.2 (design 6.5, PF1 mutant list, plus our own).
+"""Hand-written mutation testing for the BOOK simulator of `weightsim` (design 6.5, PF1 mutant list, plus our own; B52-B69
+are the mutants of the 0.3 per-sleeve execution delay and the delay-sensitivity table, `tests/book_delay.rs`).
 
 Each mutant is one or more EXACT source edits (every `old` text must occur exactly once in its file). For every mutant the
 script applies the edits, runs the always-on book tests, records which tests FAILED (or that the build broke), and restores
@@ -35,7 +36,7 @@ CRATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = os.path.dirname(CRATE)
 DEFAULT_CMD = (
     "cargo test --manifest-path weightsim/Cargo.toml --locked --no-fail-fast "
-    "--lib --test book_identity --test book_key --test book_props --test book_causality"
+    "--lib --test book_identity --test book_key --test book_props --test book_causality --test book_delay"
 )
 
 SIM = "src/book_sim.rs"
@@ -43,6 +44,8 @@ CON = "src/construct.rs"
 PAN = "src/book_panel.rs"
 RES = "src/book_result.rs"
 HAR = "src/book_harness.rs"
+BOK = "src/book.rs"
+DLY = "src/delay.rs"
 STA = "src/stateful.rs"
 PRP = "tests/book_props.rs"
 
@@ -140,6 +143,40 @@ MUTANTS = [
         "times[u - 1].date().days_until(date), cash, long_v, short_v", "times[u - 1].date().days_until(date) + 1, cash, long_v, short_v")]),
     ("B50", "a rule is asked one bar later than its declared minimum history", [(SIM, "&& t + 1 >= r.min_hist {", "&& t >= r.min_hist {")]),
     ("B51", "held weights are divided by the pre-cost equity", [(SIM, "let hw = units[j] * mark[j] / equity;", "let hw = units[j] * mark[j] / equity_pre;")]),
+    # ---- weightsim 0.3: per-sleeve execution delay (council Ruling 4, W8) and the delay-sensitivity table (W1) -----------------
+    ("B52", "the per-sleeve delay is ignored (every sleeve uses the book-level value)", [(SIM,
+        "let delay = spec.effective_delay(cfg.sim.execution_delay_bars);", "let delay = cfg.sim.execution_delay_bars;")]),
+    ("B53", "the book-level delay is no longer the default of a sleeve without an override", [(SIM,
+        "let delay = spec.effective_delay(cfg.sim.execution_delay_bars);", "let delay = spec.execution_delay.unwrap_or(0);")]),
+    ("B54", "every sleeve takes the delay of sleeve 0", [(SIM,
+        "let delay = spec.effective_delay(cfg.sim.execution_delay_bars);", "let delay = book.sleeves[0].effective_delay(cfg.sim.execution_delay_bars);")]),
+    ("B55", "a decision is executed one own bar too late (t + d + 1)", [(SIM,
+        "r.pending.push_back((t + r.delay, w));", "r.pending.push_back((t + r.delay + 1, w));")]),
+    ("B56", "a decision is executed one own bar too early (a delay of 1 acts like 0)", [(SIM,
+        "r.pending.push_back((t + r.delay, w));", "r.pending.push_back((t + r.delay.saturating_sub(1), w));")]),
+    ("B57", "a delay equal to the sleeve's whole own history is no longer refused (silently flat sleeve)", [(SIM,
+        "if delay >= cal.panel.n_bars() {", "if delay > cal.panel.n_bars() {")]),
+    ("B58", "no refusal of a delay larger than the data", [(SIM, "if delay >= cal.panel.n_bars() {", "if false {")]),
+    ("B59", "a per-sleeve delay of Some(0) is read as `inherit the book-level value`", [(BOK,
+        "self.execution_delay.unwrap_or(book_default)", "self.execution_delay.filter(|x| *x > 0).unwrap_or(book_default)")]),
+    ("B60", "the Book scope of the sensitivity table delays only the first sleeve", [(DLY,
+        "            for sp in &mut b.sleeves {\n                sp.execution_delay = Some(d);\n            }",
+        "            for sp in b.sleeves.iter_mut().take(1) {\n                sp.execution_delay = Some(d);\n            }")]),
+    ("B61", "the Sleeve scope of the sensitivity table always delays sleeve 0", [(DLY, "                .get_mut(s)\n", "                .get_mut(0)\n")]),
+    ("B62", "the Book scope of the sensitivity table sets no delay at all", [(DLY,
+        "            for sp in &mut b.sleeves {\n                sp.execution_delay = Some(d);\n            }",
+        "            for sp in &mut b.sleeves {\n                sp.execution_delay = None;\n            }")]),
+    ("B63", "the table's correlation is the regression slope instead of Pearson's coefficient", [(DLY,
+        "sxy / (sxx.sqrt() * syy.sqrt())", "sxy / sxx")]),
+    ("B64", "the two-pointer date alignment of the correlation advances the wrong pointer", [(DLY,
+        "} else if da[i] < db[j] {", "} else if da[i] > db[j] {")]),
+    ("B65", "every row's correlation is taken against itself instead of the baseline row", [(DLY,
+        "Some((bd, br)) => aligned_correlation(bd, br, &dates, &rets),", "Some((_bd, _br)) => aligned_correlation(&dates, &rets, &dates, &rets),")]),
+    ("B66", "the table's gross metrics are the net ones", [(DLY, "gross: g.metrics(),", "gross: n.metrics(),")]),
+    ("B67", "the table's cost is the gross run's (always zero)", [(DLY, "total_cost: n.total_cost(),", "total_cost: g.total_cost(),")]),
+    ("B68", "an empty list of delays is accepted (an empty table)", [(DLY, "if delays.is_empty() {", "if false {")]),
+    ("B69", "the council's standard delays lose the 5-bar row", [(DLY,
+        "pub const STANDARD_DELAYS: [usize; 5] = [0, 1, 2, 3, 5];", "pub const STANDARD_DELAYS: [usize; 5] = [0, 1, 2, 3, 4];")]),
 ]
 
 

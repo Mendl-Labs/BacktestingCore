@@ -41,11 +41,28 @@ pub struct SleeveSpec {
     pub share: ShareSpec,
     /// Overrides the rule's own rebalance policy for this sleeve (`None` = the rule's).
     pub policy: Option<RebalancePolicy>,
+    /// PER-SLEEVE execution delay (weightsim 0.3, council Ruling 4): a decision taken at the close of the sleeve's OWN bar
+    /// `t` becomes effective, and is traded, at the close of the sleeve's own bar `t + d`. `None` (the default) means "the
+    /// book-level value", `BookConfig::sim.execution_delay_bars`, so every book that never calls
+    /// [`SleeveSpec::with_execution_delay`] behaves, bit for bit, as it did before 0.3. `Some(d)` OVERRIDES the book-level
+    /// value for this sleeve only (including `Some(0)` under a non-zero book-level delay).
+    pub execution_delay: Option<usize>,
 }
 
 impl SleeveSpec {
     pub fn new(id: impl Into<String>, rule: Arc<dyn DynRule>, universe: Vec<usize>, share: ShareSpec) -> SleeveSpec {
-        SleeveSpec { id: id.into(), rule, universe, share, policy: None }
+        SleeveSpec { id: id.into(), rule, universe, share, policy: None, execution_delay: None }
+    }
+    /// Give this sleeve its own execution delay, in the sleeve's OWN bars (see [`SleeveSpec::execution_delay`]). A live
+    /// ETF sleeve is `with_execution_delay(1)` (decided at the month-end close, acted one session later) while a crypto
+    /// sleeve in the same account stays at 0.
+    pub fn with_execution_delay(mut self, bars: usize) -> SleeveSpec {
+        self.execution_delay = Some(bars);
+        self
+    }
+    /// The delay in force for this sleeve: its own if set, else the book-level `book_default`.
+    pub fn effective_delay(&self, book_default: usize) -> usize {
+        self.execution_delay.unwrap_or(book_default)
     }
     /// A sleeve running a T1 [`WeightRule`] (wrapped in [`Stateless`]).
     pub fn from_rule<R: WeightRule + 'static>(
@@ -116,7 +133,8 @@ pub enum AccountMode {
 #[derive(Clone, Debug)]
 pub struct BookConfig {
     /// `start`/`end` (counting window, as in T1), `initial_equity`, `cost`, `financing`, `on_refusal`,
-    /// `execution_delay_bars` (in the decision sleeve's OWN bars), `risk_scale` (constant approval scale) and
+    /// `execution_delay_bars` (in the decision sleeve's OWN bars; the DEFAULT for every sleeve, which a sleeve overrides
+    /// with [`SleeveSpec::with_execution_delay`]), `risk_scale` (constant approval scale) and
     /// `max_gross` (a breach REFUSES the whole book on that bar; under `OnRefusal::Abort` it fails the run instead).
     pub sim: SimConfig,
     /// The account is flat before the first clock instant at or after this time; earlier bars are history only (rules

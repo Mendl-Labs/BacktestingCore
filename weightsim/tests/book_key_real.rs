@@ -352,3 +352,81 @@ fn real_cadence_modes_reproduce_the_amendment_12_f1_numbers() {
         ],
     );
 }
+
+#[test]
+fn real_delay_sensitivity_tables_for_the_etf_s1_and_crypto_s3_sleeves_and_the_60_40_book() {
+    // W1 of the ETF timing council: net Sharpe / CAGR / max drawdown / correlation to the d = 0 run at d = 0, 1, 2, 3, 5 on the
+    // pinned ladder candles, printed for the report. Each single-sleeve row is checked against `simulate` at that delay (the
+    // one-sleeve identity), and the 60/40 book's ETF sleeve is delayed alone (the live-realistic layer: ETF d, crypto 0).
+    let r = skip_unless_real!("real_delay_sensitivity_tables_for_the_etf_s1_and_crypto_s3_sleeves_and_the_60_40_book");
+    let (d1, d3) = r.decisions();
+    let net = CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE;
+    for (sid, uni, sched, pol, dec, id, name) in [
+        (
+            "etf",
+            ETF.to_vec(),
+            DecisionSchedule::LastBarOfMonth,
+            RebalancePolicy::OnDecision,
+            &d1,
+            "etf_trend_faber",
+            "S1 ETF",
+        ),
+        (
+            "crypto",
+            CRY.to_vec(),
+            DecisionSchedule::Daily,
+            RebalancePolicy::EveryBar,
+            &d3,
+            "crypto_trend_100d",
+            "S3 crypto",
+        ),
+    ] {
+        let panel = Panel::from_long_csv(&r.candles, &uni).unwrap();
+        let bp = BookPanel::from_panel(&panel);
+        let start = *dec.keys().min().unwrap();
+        let book = Book::new(vec![SleeveSpec::from_rule(
+            sid,
+            scripted(id, &uni, sched, pol, dec),
+            (0..uni.len()).collect(),
+            ShareSpec::Fixed(1.0),
+        )]);
+        let mut cfg = BookConfig { sim: SimConfig { cost: net, ..SimConfig::default() }, ..BookConfig::default() };
+        cfg.account_start = Some(BarTime::from_date(start));
+        let rows = delay_sensitivity(&bp, &book, &cfg, DelayScope::Book, &STANDARD_DELAYS).unwrap();
+        println!(
+            "REAL DELAY SENSITIVITY {name}: one-sleeve book, net of 10 bps per side, T0 decisions\n{}",
+            format_delay_table(&rows)
+        );
+        for row in &rows {
+            // the one-sleeve identity at this delay: `simulate` starts at the first bar, the book at the first decision, and the
+            // counted window (first fill + 1) is the same, so the metrics agree
+            let w = simulate(
+                &panel,
+                &scripted(id, &uni, sched, pol, dec),
+                &SimConfig { cost: net, execution_delay_bars: row.delay, ..SimConfig::default() },
+            )
+            .unwrap_or_else(|e| panic!("{name} d={}: simulate failed: {e}", row.delay));
+            let (a, b) = (row.net.as_ref().unwrap(), w.metrics().unwrap());
+            assert_eq!(a.n, b.n, "{name} d={}: counted returns", row.delay);
+            for (what, x, y) in
+                [("sharpe", a.sharpe, b.sharpe), ("cagr", a.cagr, b.cagr), ("max_dd", a.max_drawdown, b.max_drawdown)]
+            {
+                assert!((x - y).abs() <= 1e-9, "{name} d={}: {what} book {x} vs simulate {y}", row.delay);
+            }
+        }
+        assert!((rows[0].corr_net_to_baseline - 1.0).abs() < 1e-12);
+        assert!(rows.iter().all(|x| x.net.as_ref().is_some_and(|m| m.sharpe.is_finite())), "{name}: finite metrics");
+    }
+    // the 60/40 certified book with the ETF sleeve alone delayed (crypto stays at 0), and with both delayed
+    let panel = r.panel();
+    let c = real_case("book_cert_60_40");
+    let (book, cfg) = real_book(&panel, &c, &r);
+    let etf = delay_sensitivity(&panel, &book, &cfg, DelayScope::Sleeve(0), &STANDARD_DELAYS).unwrap();
+    println!(
+        "REAL DELAY SENSITIVITY 60/40 book_cert, ETF sleeve delayed alone (crypto d = 0), net 10 bps\n{}",
+        format_delay_table(&etf)
+    );
+    let both = delay_sensitivity(&panel, &book, &cfg, DelayScope::Book, &STANDARD_DELAYS).unwrap();
+    println!("REAL DELAY SENSITIVITY 60/40 book_cert, both sleeves delayed, net 10 bps\n{}", format_delay_table(&both));
+    assert_eq!(etf[0].series_sha256, both[0].series_sha256, "d = 0 is the same run in both scopes");
+}

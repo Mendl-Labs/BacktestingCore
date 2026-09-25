@@ -24,7 +24,8 @@ Minimum Rust: 1.82 (`Option::is_none_or`); CI uses 1.90.0.
 | `QuantityRounder`, `LotRounder`, `LotRule`, `ExactUnits`, `SizeRefusal` | rounding by venue lot rules, always down, typed refusals |
 | `Ladder`, `LadderState`, `Ladder::step(&mut state, equity, day_start)` | drawdown ladder and daily-loss limit in f64 |
 | `AllocatorSpec { Fixed, Equal, InverseVol }`, `AllocatorState::review` | static shares, reviews at declared dates, past-only |
-| `schedule::{due, Cadence, CivilDate, BookCadence, plan_flags}` | which sleeve is due, which sleeves a run plans |
+| `schedule::{due, due_on, Cadence, CivilDate, BookCadence, plan_flags, plan_flags_for}` | which sleeve is due, which sleeves a run plans |
+| `schedule::{computable_decision_date, decision_pending, advance_acted, closed_bars, evaluate_decision, DueInputs}` | the LIVE monthly cadence `Cadence::DecisionPending` (Ruling 1): plan iff `D_computable > D_acted` |
 | `approval_risk_scale(cap)`, `capital_base`, `round_toward_zero_dp`, `floor_dp`, `ceil_dp` | R2 constant scale, the capital base, the 8-decimal helpers |
 
 Exact signatures are in the rustdoc (`cargo doc --open`); the entry point is
@@ -111,7 +112,7 @@ Per bar `t` of the union clock, after marking to market:
 
 ## Tests
 
-    cargo test                                # 121 always-on tests (62 mutants), no vendor data, no environment gates
+    cargo test                                # always-on tests (80 mutants), no vendor data, no environment gates
     python3 ../portfolio-construct/mutants/run_mutants.py   # from the Core root; every mutant must be killed
 
 * `tests/golden_planner.rs`: golden vectors transcribed by hand from the planner's own tests (`planner.rs`, `signed.rs`,
@@ -125,5 +126,8 @@ Per bar `t` of the union clock, after marking to market:
 * `tests/properties.rs`: seeded properties (limits, no cash creation, never oversell or overshoot, permutation invariance, linearity,
   monotonicity, idempotence). `tests/determinism.rs`: bit-identity and pinned digests. `tests/schedule.rs`: calendar cases and a
   30-year weekday calendar against an independent oracle.
+  `tests/decision_pending.rs`: the LIVE monthly cadence `Cadence::DecisionPending` (council Ruling 1): hand-computed weekend and
+  holiday month-ends (2019-09-30, 2020-02-29, Memorial Day 2021, Labor Day 2019), vendor lag, missed runs, entry, monotone `D_acted`,
+  idempotence, and the 1990-2030 property (exactly one action per calendar month, on the day after the first new-month session).
 
 Every fixture is synthetic; no vendor data and no account data are in this repository.
