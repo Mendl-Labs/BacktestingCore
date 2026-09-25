@@ -534,9 +534,9 @@ mod tests {
         let mut key = rets(60);
         key[5] = 0.0;
         let mut run = key.clone();
-        run[5] = TIER2_TOL; // |0 - 1e-9| is exactly the tolerance
+        run[5] = 1e-9; // |0 - 1e-9| is exactly the pre-registered tolerance
         assert!(compare(&rows(key.clone()), &rows(run.clone())).unwrap().tier2_pass);
-        run[5] = TIER2_TOL * 1.0000001;
+        run[5] = 1.0000001e-9;
         assert!(!compare(&rows(key), &rows(run)).unwrap().tier2_pass);
     }
 
@@ -545,10 +545,21 @@ mod tests {
         let mut key = rows(rets(40));
         key.w_target = Some(vec![vec![0.5, 0.0]; 40]);
         let mut run = key.clone();
-        run.w_target.as_mut().unwrap()[3][1] = TIER3_CELL_TOL; // exactly at the tolerance: agrees
+        run.w_target.as_mut().unwrap()[3][1] = 1e-6; // exactly at the pre-registered tolerance: agrees
         assert_eq!(compare(&key, &run).unwrap().tier3.unwrap().disagreeing, 0);
-        run.w_target.as_mut().unwrap()[3][1] = TIER3_CELL_TOL * 1.01;
+        run.w_target.as_mut().unwrap()[3][1] = 1.01e-6;
         assert_eq!(compare(&key, &run).unwrap().tier3.unwrap().disagreeing, 1);
+    }
+
+    #[test]
+    fn the_constants_are_the_preregistered_values() {
+        assert_eq!(TIER1_CORR_MIN, 0.99);
+        assert_eq!(TIER1_D_SHARPE_MAX, 0.05);
+        assert_eq!(TIER1_D_CAGR_PP_MAX, 0.5);
+        assert_eq!(TIER1_TRADES_REL_MAX, 0.05);
+        assert_eq!(TIER2_TOL, 1e-9);
+        assert_eq!(TIER3_CELL_TOL, 1e-6);
+        assert_eq!(TIER3_MIN_AGREEMENT, 0.98);
     }
 
     #[test]

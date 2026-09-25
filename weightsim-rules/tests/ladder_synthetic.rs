@@ -201,15 +201,20 @@ fn trades_band_is_five_percent_and_the_exact_counter_is_reported_separately() {
     let mut fx = fixtures();
     let real = fx.s3.flips;
     fx.s3.flips = real - 1;
-    let f = failed(&run(&fx));
-    assert_eq!(f, vec!["S3.trades.exact".to_string()], "flips {real} -> {}", real - 1);
+    let r = run(&fx);
+    assert_eq!(failed(&r), vec!["S3.trades.exact".to_string()], "flips {real} -> {}", real - 1);
+    assert!(r.sleeves[1].gross.tier1_pass && r.sleeves[1].net.tier1_pass, "4.76% is inside the Tier I trades band");
     // A 20% gap breaks the band on both bases.
     let mut fx = fixtures();
     fx.s3.flips = real * 12 / 10 + 2;
-    let f = failed(&run(&fx));
+    let r = run(&fx);
+    let f = failed(&r);
     for name in ["S3.gross.tier1.trades", "S3.net.tier1.trades", "S3.trades.exact"] {
         assert!(f.contains(&name.to_string()), "{f:?}");
     }
+    // the sleeve's Tier I verdict includes the trades band
+    assert!(!r.sleeves[1].gross.tier1_pass && !r.sleeves[1].net.tier1_pass);
+    assert!(r.sleeves[1].gross.cmp.bands_pass, "only the trades band is broken here");
 }
 
 #[test]

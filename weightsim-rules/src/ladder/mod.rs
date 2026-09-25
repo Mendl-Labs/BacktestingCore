@@ -45,6 +45,13 @@ pub const COST_IDENTITY_MAX_REL_GAP: f64 = 0.10;
 /// absolute tolerance. A consistency cross-check of the key itself, not one of the tiers.
 pub const KEY_SELF_CONSISTENCY_TOL: f64 = 1e-8;
 
+/// The Layer C cost identity: every bar's cost equals rate x traded notional (exactly, to rounding), the total agrees
+/// with rate x total traded to 1e-12 relative, and the net-versus-gross drag is within 10% of turnover x cost. A NaN
+/// gap (nothing was traded) is not a pass.
+pub fn cost_identity_holds(max_bar_error: f64, total_rel_error: f64, relative_gap: f64) -> bool {
+    max_bar_error <= 1e-15 && total_rel_error <= 1e-12 && relative_gap <= COST_IDENTITY_MAX_REL_GAP
+}
+
 /// One named pass/fail line of the ladder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Check {
@@ -395,7 +402,7 @@ where
     let total_rel = (ci.total_cost - ci.rate_times_total_traded).abs() / ci.rate_times_total_traded.abs().max(1e-300);
     col.push(
         format!("{code}.cost_identity"),
-        ci.max_bar_cost_error <= 1e-15 && total_rel <= 1e-12 && ci.relative_gap <= COST_IDENTITY_MAX_REL_GAP,
+        cost_identity_holds(ci.max_bar_cost_error, total_rel, ci.relative_gap),
         format!(
             "max per-bar |cost - 0.001 x traded| {:e}; total cost vs rate x traded rel {:e}; drag {:.6} vs turnover x cost {:.6} (gap {:.4}, <= {})",
             ci.max_bar_cost_error, total_rel, ci.actual_drag, ci.predicted_drag, ci.relative_gap, COST_IDENTITY_MAX_REL_GAP
@@ -783,5 +790,29 @@ fn verdict(ok: bool) -> &'static str {
         "PASS"
     } else {
         "FAIL"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_identity_boundaries() {
+        assert!(cost_identity_holds(0.0, 0.0, 0.0));
+        // per-bar error: exactly 1e-15 passes, more fails
+        assert!(cost_identity_holds(1e-15, 0.0, 0.0));
+        assert!(!cost_identity_holds(1.5e-15, 0.0, 0.0));
+        // total relative error: exactly 1e-12 passes, more fails
+        assert!(cost_identity_holds(0.0, 1e-12, 0.0));
+        assert!(!cost_identity_holds(0.0, 1.5e-12, 0.0));
+        // relative drag gap: 10% inclusive
+        assert!(cost_identity_holds(0.0, 0.0, 0.1));
+        assert!(cost_identity_holds(0.0, 0.0, 0.0999));
+        assert!(!cost_identity_holds(0.0, 0.0, 0.1001));
+        assert!(!cost_identity_holds(0.0, 0.0, f64::NAN));
+        assert!(!cost_identity_holds(f64::NAN, 0.0, 0.0));
+        assert!(!cost_identity_holds(0.0, f64::NAN, 0.0));
+        assert_eq!(COST_IDENTITY_MAX_REL_GAP, 0.10);
     }
 }
