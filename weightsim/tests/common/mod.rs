@@ -4,6 +4,8 @@
 
 use weightsim::*;
 
+pub mod book;
+
 pub const ETF: [&str; 5] = ["SPY", "EFA", "IEF", "DBC", "VNQ"];
 pub const CRY: [&str; 2] = ["BTC", "ETH"];
 

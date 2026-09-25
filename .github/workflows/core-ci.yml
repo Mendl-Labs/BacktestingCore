@@ -76,6 +76,29 @@ jobs:
       - name: print the pinned series digests (compare with the aarch64 goldens in tests/determinism.rs)
         run: cargo test --locked --test determinism series_digests_match_the_pinned_goldens -- --nocapture
 
+      # PF1 (weightsim 0.2, the book simulator): the always-on tests above already ran the synthetic book fixtures, the
+      # one-sleeve identity, the properties and the causality harnesses. The digests of the book runs must equal the
+      # aarch64 goldens (IEEE-exact arithmetic only), and the real-data comparisons against the PF0 book key are env-gated
+      # (WEIGHTSIM_LADDER_DIR, WEIGHTSIM_BOOK_KEY_DIR; vendor-derived files live only in the private Engine repository):
+      # they must print SKIPPED here, never silently pass as if they had run.
+      - name: print the pinned BOOK series digests (compare with the aarch64 goldens in tests/book_causality.rs)
+        run: cargo test --locked --test book_causality series_digests_match_the_pinned_goldens -- --nocapture
+
+      - name: the real-data book tests are skipped here (the owner runs them against the private Engine fixtures)
+        run: |
+          cargo test --locked --test book_key_real --test book_identity -- --nocapture 2>&1 | tee book_real.log
+          grep -q "SKIPPED real_book_matches_the_five_per_bar_key_files_gross_and_net" book_real.log
+          grep -q "SKIPPED real_netting_fixture_matches_the_key_file" book_real.log
+          grep -q "SKIPPED real_one_sleeve_books_reproduce_the_t0_per_bar_files" book_real.log
+          grep -q "SKIPPED real_cadence_modes_reproduce_the_amendment_12_f1_numbers" book_real.log
+          grep -q "SKIPPED real_pinned_ladder_one_sleeve_books_are_bit_identical_to_simulate" book_real.log
+
+      - name: the committed synthetic book fixtures are exactly what gen_book_key.py generates
+        run: |
+          mkdir -p "$RUNNER_TEMP/book_regen"
+          python3 tests/book_fixtures/gen_book_key.py --out "$RUNNER_TEMP/book_regen"
+          for f in tests/book_fixtures/*.csv; do cmp "$f" "$RUNNER_TEMP/book_regen/$(basename "$f")"; done
+
   weightsim-mutants:
     name: weightsim mutation power (every mutant must be killed)
     runs-on: ubuntu-latest
@@ -93,6 +116,24 @@ jobs:
           workspaces: weightsim
       - name: run every hand-written mutant against the suite
         run: python3 weightsim/mutants/run_mutants.py
+
+  weightsim-book-mutants:
+    name: weightsim BOOK mutation power (every book mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    needs: weightsim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+      - name: every `old` text of the mutant list still matches exactly once
+        run: python3 weightsim/mutants/run_book_mutants.py --check
+      - name: run every hand-written book mutant against the always-on book tests
+        run: python3 weightsim/mutants/run_book_mutants.py
 
   reference-rules:
     name: reference-rules (fmt, tests)

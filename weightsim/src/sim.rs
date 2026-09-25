@@ -71,7 +71,7 @@ impl Default for SimConfig {
 }
 
 impl SimConfig {
-    fn validate(&self) -> Result<(), SimError> {
+    pub(crate) fn validate(&self) -> Result<(), SimError> {
         if !(self.initial_equity.is_finite() && self.initial_equity > 0.0) {
             return Err(SimError::BadConfig("initial_equity must be finite and > 0".into()));
         }
@@ -249,7 +249,7 @@ impl SimResult {
     }
 }
 
-fn sign(v: f64) -> i8 {
+pub(crate) fn sign(v: f64) -> i8 {
     if v > 0.0 {
         1
     } else if v < 0.0 {
@@ -259,7 +259,7 @@ fn sign(v: f64) -> i8 {
     }
 }
 
-fn exposure_stats(x: &[f64]) -> ExposureStats {
+pub(crate) fn exposure_stats(x: &[f64]) -> ExposureStats {
     let mut s = 0.0;
     let mut mx = f64::NEG_INFINITY;
     for &v in x {
@@ -554,7 +554,7 @@ pub fn simulate_gross_and_net<R: WeightRule + ?Sized>(
     Ok((gross, net))
 }
 
-fn digest(r: &SimResult) -> String {
+pub(crate) fn digest(r: &SimResult) -> String {
     let mut h = Sha256::new();
     h.update(b"weightsim-series-v1\n");
     h.update(r.rule_id.as_bytes());
