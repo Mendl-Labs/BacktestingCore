@@ -6,6 +6,9 @@
 //! each must match `mutants.json`), plus the Layer C canaries and the causality and determinism harnesses of
 //! `weightsim::harness` run on the real fixture.
 //!
+//! Stage T4 slice C1 adds [`verify`]: [`replicate`] runs a library rule and packages the full-resolution series as
+//! [`SeriesColumns`], and [`verify()`] re-derives a stored run from its columns alone (see that module).
+//!
 //! Everything here is a pure function of the fixture bytes: the only I/O is reading the fixture files, through
 //! [`Fixtures`]. [`run_ladder`] returns a [`LadderReport`] whose failed checks are recorded, not thrown;
 //! [`self_test`] turns any failed check into an `Err`.
@@ -15,6 +18,7 @@ pub mod fixtures;
 pub mod json;
 pub mod mutants;
 pub mod runner;
+pub mod verify;
 
 use std::fmt;
 use std::path::Path;
@@ -25,6 +29,11 @@ use weightsim::{answer_key_metrics, sha256_hex, CostModel, Date, Panel, WeightRu
 pub use checks::{Comparison, SeriesRows, Tier3};
 pub use fixtures::{Fixtures, LadderError, Pins};
 pub use mutants::Mutant;
+pub use verify::{
+    analyze_columns, replicate, replicate_with, rule_facts, verify, verify_with, Claims, ReplicateError,
+    ReplicationConfig, ReplicationRun, RuleFacts, RunSummary, SeriesColumns, VerifiedRun, VerifyError, VerifyOptions,
+    VerifyRequest,
+};
 
 use crate::adapters::{CryptoTrendRule, EtfTrendRule, FlatUntil};
 use checks::{compare, trades_within_band};

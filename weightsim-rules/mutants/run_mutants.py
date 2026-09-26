@@ -3,6 +3,9 @@
 
 Mutants of the rule ADAPTERS and of the LADDER LOGIC: tolerances loosened, Tier II skipped, a mutant not applied,
 the manifest check skipped, net and gross swapped, a date conversion off by one, the refusal mapping wrong, and so on.
+Stage T4 slice C1 adds mutants of the re-verifier (`ladder::verify`), of `weightsim::SeriesColumns` and of the bytes
+fixture loader: a digest check skipped, a truncation check off by one, metrics trusted instead of recomputed, gross and
+net swapped, a tamper class not detected, a wrong `ppy`.
 Each mutant is ONE exact source edit (the old text must occur exactly once). For every mutant the script applies the
 edit, runs the test command, records which tests FAILED (or that the build broke), and restores the file byte for byte.
 A mutant that no test kills is reported as SURVIVED and the script exits non-zero.
@@ -30,6 +33,10 @@ M = "src/ladder/mod.rs"
 R = "src/ladder/runner.rs"
 U = "src/ladder/mutants.rs"
 J = "src/ladder/json.rs"
+V = "src/ladder/verify.rs"
+# The columns and the metric definitions live in `weightsim` (path dependency); the verifier's tests must kill mutants there too.
+WC = "../weightsim/src/columns.rs"
+WM = "../weightsim/src/metrics.rs"
 
 # (id, description, file relative to the crate, old text (exactly once), new text)
 MUTANTS = [
@@ -204,6 +211,77 @@ MUTANTS = [
      "            if kv.iter().any(|(e, _)| *e == k) {", "            if false && kv.iter().any(|(e, _)| *e == k) {"),
     ("M92", "json: nesting depth unbounded", J,
      "        if self.depth > 64 {", "        if self.depth > 6400 {"),
+    # ------------------------------------------------------------------------- verify (T4 slice C1): the re-verifier
+    ("V01", "verify skips the comparison with the platform's re-run (digest check off)", V,
+     "if stored != *platform_digest {", "if false && stored != *platform_digest {"),
+    ("V02", "verify does not check the claimed digest against the stored columns", V,
+     "if !claimed.eq_ignore_ascii_case(&recomputed) {", "if false && !claimed.eq_ignore_ascii_case(&recomputed) {"),
+    ("V03", "truncation check off by one (a series one bar short passes it)", V,
+     "if found_bars < expected_bars {", "if found_bars + 1 < expected_bars {"),
+    ("V04", "padding check off by one (an exact-length series is 'extra')", V,
+     "if found_bars > expected_bars {", "if found_bars >= expected_bars {"),
+    ("V05", "claimed summary metrics trusted (never compared with the recomputation)", V,
+     "check_claimed_summary(basis, c, &verified.summary)?;", "let _ = (basis, c, &verified.summary);"),
+    ("V06", "net analysed from the GROSS columns (gross and net swapped)", V,
+     "basis_from_columns(req.net, cost.id, net_digest, prepared.key, Basis::Net)",
+     "basis_from_columns(req.gross, cost.id, net_digest, prepared.key, Basis::Net)"),
+    ("V07", "cost preset of a series not checked", V,
+     "if cols.cost_model_id != cost_id {", "if false && cols.cost_model_id != cost_id {"),
+    ("V08", "rule id of a series not checked", V,
+     "if cols.rule_id != req.rule_id {", "if false && cols.rule_id != req.rule_id {"),
+    ("V09", "implementation version of a series not checked", V,
+     "if cols.rule_impl_version != expected_version {", "if false && cols.rule_impl_version != expected_version {"),
+    ("V10", "symbols of a series not checked", V,
+     "if cols.symbols.iter().map(String::as_str).ne(prepared.rule.universe().iter().copied()) {",
+     "if false && cols.symbols.iter().map(String::as_str).ne(prepared.rule.universe().iter().copied()) {"),
+    ("V11", "metric-definition label of a series not checked", V,
+     "if cols.metric_definitions != METRIC_DEFINITIONS {", "if false && cols.metric_definitions != METRIC_DEFINITIONS {"),
+    ("V12", "NaN and infinity checks skipped", V,
+     "if let Some((column, bar)) = cols.first_non_finite() {",
+     "if let Some((column, bar)) = None::<(&'static str, usize)> {"),
+    ("V13", "column shape not validated before use", V,
+     "cols.validate_shape().map_err(|error| VerifyError::Shape { basis, error })?;", "let _ = cols.validate_shape();"),
+    ("V14", "claimed fixture identity not compared with the fixtures", V,
+     "if !c.eq_ignore_ascii_case(actual) {", "if false && !c.eq_ignore_ascii_case(actual) {"),
+    ("V15", "counted window one bar too long", V,
+     "let window = Window { first_bar, last_bar: first_bar + rows.dates.len() - 1 };",
+     "let window = Window { first_bar, last_bar: first_bar + rows.dates.len() };"),
+    ("V16", "Tier IV never run by verify", V,
+     "let tier4 = if opts.tier4 {", "let tier4 = if false && opts.tier4 {"),
+    ("V17", "a run that fails a tier is accepted", V,
+     "if failures.is_empty() {", "if true || failures.is_empty() {"),
+    ("V18", "Tier IV runs the mutants of every sleeve, not the rule's", V,
+     "if m.sleeve() != sleeve {", "if false && m.sleeve() != sleeve {"),
+    ("V19", "first-difference locator reports the flat index instead of the bar", V,
+     "return Some(Difference { column, bar: i / per });", "return Some(Difference { column, bar: i });"),
+    ("V20", "claimed Sharpe not compared", V,
+     "if !same(claimed.sharpe, got.sharpe) {", "if false && !same(claimed.sharpe, got.sharpe) {"),
+    ("V21", "claimed CAGR tolerance loosened to 1e-3", V,
+     "pub const CLAIMED_CAGR_TOL: f64 = 1e-12;", "pub const CLAIMED_CAGR_TOL: f64 = 1e-3;"),
+    ("V22", "summary reports the per-bar std as the annualised volatility", V,
+     "        vol: m.vol,", "        vol: m.std_ddof1,"),
+    ("V23", "replicate counts flips over the wrong span", V,
+     "flips_by_key_convention(sim, first, last)", "flips_by_key_convention(sim, first, first)"),
+    ("V24", "default net cost preset is zero cost", V,
+     "pub const DEFAULT_COST_MODEL_ID: &str = CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE.id;",
+     "pub const DEFAULT_COST_MODEL_ID: &str = CostModel::ZERO.id;"),
+    # ------------------------------------------------------------------------- bytes loader, columns, metric definitions
+    ("V25", "bytes loader serves the first file whatever is asked for", F,
+     ".find(|(n, _)| *n == name)", ".find(|_| true)"),
+    ("V26", "bytes loader accepts a repeated file name", F,
+     "if files[..i].iter().any(|(n, _)| n == name) {", "if false && files[..i].iter().any(|(n, _)| n == name) {"),
+    ("V27", "columns: infinity in a matrix is not a non-finite value", WC,
+     "if let Some(i) = col.iter().position(|v| !v.is_finite()) {", "if let Some(i) = col.iter().position(|v| v.is_nan()) {"),
+    ("V28", "columns: infinity in a per-bar column is not a non-finite value", WC,
+     "if let Some(t) = col.iter().position(|v| !v.is_finite()) {", "if let Some(t) = col.iter().position(|v| v.is_nan()) {"),
+    ("V29", "columns: a repeated date passes the ascending check", WC,
+     "if self.dates[t] <= self.dates[t - 1] {", "if self.dates[t] < self.dates[t - 1] {"),
+    ("V30", "columns from a run: pre-cost returns taken from the post-cost column", WC,
+     "ret_pre_cost: r.ret_pre_cost.clone(),", "ret_pre_cost: r.ret.clone(),"),
+    ("V31", "columns from a run: units taken from the held weights", WC,
+     "units: r.units.clone(),", "units: r.held_weights.clone(),"),
+    ("V32", "answer-key metrics use ppy = 365 instead of n / years", WM,
+     "let ppy = n as f64 / years;", "let ppy = 365.0;"),
 ]
 
 

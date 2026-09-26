@@ -101,6 +101,15 @@ MUTANTS = [
     ("M26", "S1 test rule averages only the last 9 month-end closes (still divides by 10)", "tests/common/mod.rs",
      "let last10 = &me[me.len() - 10..];",
      "let last10 = &me[me.len() - 9..];"),
+    # Stage T4 slice C1: the series digest over plain columns (a stored run must be re-verifiable from its columns).
+    ("M27", "series columns: digest computed without validating the shape first", "src/columns.rs",
+     "        self.validate_shape()?;\n        Ok(digest_columns(self))", "        Ok(digest_columns(self))"),
+    ("M28", "series columns of a run: pre-cost returns taken from the post-cost column", "src/columns.rs",
+     "ret_pre_cost: r.ret_pre_cost.clone(),", "ret_pre_cost: r.ret.clone(),"),
+    ("M29", "series columns: infinity in a matrix is not a non-finite value", "src/columns.rs",
+     "if let Some(i) = col.iter().position(|v| !v.is_finite()) {", "if let Some(i) = col.iter().position(|v| v.is_nan()) {"),
+    ("M30", "series columns: a repeated date passes the ascending check", "src/columns.rs",
+     "if self.dates[t] <= self.dates[t - 1] {", "if self.dates[t] < self.dates[t - 1] {"),
 ]
 
 
