@@ -12,6 +12,11 @@
 //!   a [`ladder::LadderReport`] (plain structs, `Display`) and [`ladder::self_test`], which is `Err` unless
 //!   everything passes.
 //!
+//! * [`ladder::verify`] (stage T4, slice C1): [`ladder::replicate`] runs a library rule on the fixtures (loaded from a
+//!   directory, a reader, or embedded bytes with [`ladder::Fixtures::from_files`]) and packages the full-resolution series
+//!   as plain columns plus their digests; [`ladder::verify()`] re-derives a stored run from its columns alone and
+//!   returns a typed error for every tamper class.
+//!
 //! Dependencies: `weightsim` and `reference-rules` (by path; neither depends on the other or on this crate) and
 //! `chrono` (for the rule crate's date type). No serde, no I/O other than reading fixture files, no network.
 //!

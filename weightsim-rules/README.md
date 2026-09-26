@@ -18,6 +18,22 @@ against the pinned answer key. Stage T3 (milestone A: ETF and crypto certified i
   * Tier IV: eight named mutants (same-day peek, extra delay, SMA excludes today, half sizing, drifting sub-accounts,
     S1 SMA excludes current, S1 one bar late, S1 wrong rebalance mode); each must fail, in the tiers `mutants.json` names.
   * Layer C canaries, cost identity, simulator poisoning, rule truncation and determinism on the real fixture.
+* `ladder::verify` (stage T4, slice C1 of `product-mandate/T4_FIXED_RULE_ENDPOINT_PLAN.md`): what a run store needs.
+  * `Fixtures::from_files(&[(name, bytes)], pins)` loads the fixtures from embedded bytes (`include_bytes!`) with the
+    same trust chain as `from_dir` (both wrap `Fixtures::load`); identical bytes give identical fixtures and digests.
+  * `replicate(fx, rule_id)` runs a library rule under the ladder's base configuration and returns a `ReplicationRun`:
+    the FULL-resolution gross and net series as plain `weightsim::SeriesColumns` (exactly the fields the series digest
+    covers), their digests, a `RunSummary` per basis (Sharpe, CAGR, vol, max drawdown, flips; the key's definitions) and
+    the refusals. `rule_facts(rule_id)` gives the rule's declared facts.
+  * `verify(fx, rule_id, gross, net)` (or `verify_with` for a cost preset, the store's claims and options) re-derives a
+    stored run from its columns alone: shape and finiteness, rule id, implementation version, symbols, cost preset,
+    claimed digests, a re-run from the fixtures that must be bit-identical, then the counted window, the metrics and
+    the flips recomputed FROM THE STORED COLUMNS, and Tiers I-III (gross and net) and Tier IV. Every tamper class is a
+    typed `VerifyError` (`DigestMismatch` names the first differing cell, `Truncated`, `NonFinite`,
+    `CostModelMismatch`, `ImplVersionMismatch`, `ClaimedMetricsMismatch`, ...); a genuine run that does not reproduce
+    the key is `TierFailed` and carries the numbers.
+  * `weightsim-rules` stays at 0.1.0: the crate version is part of `rule_impl_version`, a series-digest input, so a
+    bump changes every pinned digest.
 
 Dependencies: `weightsim` and `reference-rules` by path (neither depends on the other or on this crate) and `chrono`.
 No serde, no I/O other than reading the fixture files, no network. Standalone (own `[workspace]` and `Cargo.lock`,
@@ -39,6 +55,11 @@ git revision:
 * `tests/negative_controls.rs`: a leaky, an end-of-array, a nondeterministic and a merely wrong rule are handed to the
   per-sleeve certification and must fail the matching checks.
 * `tests/runner_units.rs`: alignment conventions, the entry bar, the key's trade counter, `FlatUntil`.
+* `tests/replication_verify.rs`: replicate, package and re-verify on the synthetic fixtures: the round trip, bit-for-bit
+  metrics, one test per tamper class (one ulp, a date, a fixture byte, the rule id, the implementation version, the cost
+  preset, a dropped row, swapped gross/net columns, NaN, a wrong claimed digest or summary), determinism, and the bytes
+  loader against the file loader.
+* `tests/replication_verify_real.rs`: the same on the REAL pinned data (env-gated like `ladder_real.rs`).
 * `tests/ladder_real.rs`: the REAL pinned data. Vendor-derived, so it is not in this public repository: env-gated.
 
       WEIGHTSIM_RULES_LADDER_DIR=<Engine>/program/tests/fixtures/replication_ladder cargo test --release --test ladder_real -- --nocapture

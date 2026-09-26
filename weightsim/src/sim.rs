@@ -21,6 +21,7 @@
 //! Only `+ - * /` and `sqrt` are used, all sums are sequential left-to-right, there is no parallelism and no libm call
 //! in this file, so results are bit-reproducible across x86 and ARM.
 
+use crate::columns::SeriesColumns;
 use crate::costs::{CostModel, Financing};
 use crate::date::Date;
 use crate::metrics::{
@@ -554,7 +555,14 @@ pub fn simulate_gross_and_net<R: WeightRule + ?Sized>(
     Ok((gross, net))
 }
 
+/// The series digest of a run: the digest of its [`SeriesColumns`] (so a stored run can recompute it from columns).
 pub(crate) fn digest(r: &SimResult) -> String {
+    digest_columns(&SeriesColumns::from(r))
+}
+
+/// The body of the series digest. Callers must have checked the shape ([`SeriesColumns::validate_shape`]): it indexes
+/// every column by bar.
+pub(crate) fn digest_columns(r: &SeriesColumns) -> String {
     let mut h = Sha256::new();
     h.update(b"weightsim-series-v1\n");
     h.update(r.rule_id.as_bytes());
