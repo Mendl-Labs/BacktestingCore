@@ -12,6 +12,8 @@
 //! * [`Panel`], [`HistoryView`], [`PriceSource`]: data and the causal view handed to rules ([`panel`])
 //! * [`WeightRule`] (alias [`Rule`]), [`DecisionSchedule`], [`RebalancePolicy`], [`OnRefusal`], [`RuleRefusal`] ([`rule`])
 //! * [`simulate`], [`simulate_gross_and_net`], [`SimConfig`], [`SimResult`], [`SimError`] ([`sim`])
+//! * [`SeriesColumns`]: the digest-covered series of a run as plain owned columns, with `digest()` recomputing
+//!   [`SimResult::series_sha256`] bit for bit from them, so a stored run can be re-verified ([`columns`])
 //! * [`CostModel`] (with the explicit [`CostModel::ZERO`] preset), [`Financing`] ([`costs`])
 //! * [`answer_key_metrics`], [`Metrics`], [`METRIC_DEFINITIONS`] ([`metrics`])
 //! * [`harness`]: poisoning / truncation / determinism / cost-identity checks, reusable by the Engine self-test
@@ -159,6 +161,7 @@ pub mod book_harness;
 pub mod book_panel;
 pub mod book_result;
 pub mod book_sim;
+pub mod columns;
 pub mod construct;
 pub mod costs;
 pub mod date;
@@ -183,6 +186,7 @@ pub use book_harness::{
 pub use book_panel::{Availability, BarSeries, BookPanel, BookPanelError, DatedSeries, SessionKind, SleeveCalendar};
 pub use book_result::{AttributionReport, BookResult, ShadowSeries, BOOK_METRIC_DEFINITIONS};
 pub use book_sim::{simulate_book, simulate_book_gross_and_net, simulate_book_with};
+pub use columns::{ColumnsError, SeriesColumns};
 pub use construct::{
     CashPolicy, Construct, ConstructInputs, ConstructOutput, ConstructPolicy, ConstructRefusal, MinimalConstruct,
     SleeveTarget, TradeFilter,

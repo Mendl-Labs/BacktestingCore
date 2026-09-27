@@ -185,6 +185,26 @@ impl Fixtures {
         Fixtures::load(&reader, pins)
     }
 
+    /// Load from an in-memory table of `(relative path, bytes)`, for instance `include_bytes!` data, verifying the
+    /// same trust chain as [`Fixtures::load`] (which it wraps): the bytes are the only input, nothing touches the file
+    /// system. A name that occurs twice in the table is an [`LadderError::Io`] error (a lookup must be unambiguous);
+    /// a file the manifest does not list is ignored, exactly as with a directory.
+    pub fn from_files(files: &[(&str, &[u8])], pins: Pins<'_>) -> Result<Fixtures, LadderError> {
+        for (i, (name, _)) in files.iter().enumerate() {
+            if files[..i].iter().any(|(n, _)| n == name) {
+                return Err(LadderError::Io(format!("{name}: listed twice in the in-memory file table")));
+            }
+        }
+        let reader = |name: &str| -> Result<Vec<u8>, String> {
+            files
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, bytes)| bytes.to_vec())
+                .ok_or_else(|| format!("{name}: not in the in-memory file table"))
+        };
+        Fixtures::load(&reader, pins)
+    }
+
     /// Load through `read` (relative path -> bytes), verifying the trust chain first.
     pub fn load(read: Reader<'_>, pins: Pins<'_>) -> Result<Fixtures, LadderError> {
         let get = |name: &str| read(name).map_err(LadderError::Io);
