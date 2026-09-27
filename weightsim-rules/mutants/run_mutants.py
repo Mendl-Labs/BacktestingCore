@@ -237,8 +237,8 @@ MUTANTS = [
     ("V11", "metric-definition label of a series not checked", V,
      "if cols.metric_definitions != METRIC_DEFINITIONS {", "if false && cols.metric_definitions != METRIC_DEFINITIONS {"),
     ("V12", "NaN and infinity checks skipped", V,
-     "if let Some((column, bar)) = cols.first_non_finite() {",
-     "if let Some((column, bar)) = None::<(&'static str, usize)> {"),
+     "        if let Some((column, bar)) = cols.first_non_finite() {\n            return Err(VerifyError::NonFinite { basis, column, bar });",
+     "        if let Some((column, bar)) = None::<(&'static str, usize)> {\n            return Err(VerifyError::NonFinite { basis, column, bar });"),
     ("V13", "column shape not validated before use", V,
      "cols.validate_shape().map_err(|error| VerifyError::Shape { basis, error })?;", "let _ = cols.validate_shape();"),
     ("V14", "claimed fixture identity not compared with the fixtures", V,
@@ -282,6 +282,11 @@ MUTANTS = [
      "units: r.units.clone(),", "units: r.held_weights.clone(),"),
     ("V32", "answer-key metrics use ppy = 365 instead of n / years", WM,
      "let ppy = n as f64 / years;", "let ppy = 365.0;"),
+    ("V33", "analyze_columns skips the NaN and infinity check", V,
+     "    if let Some((column, bar)) = cols.first_non_finite() {\n        return Err(VerifyError::NonFinite { basis: name, column, bar });",
+     "    if let Some((column, bar)) = None::<(&'static str, usize)> {\n        return Err(VerifyError::NonFinite { basis: name, column, bar });"),
+    ("V34", "analyze_columns judges a net series against the GROSS key", V,
+     "basis_from_columns(cols, cost_id, digest, prepared.key, basis)", "basis_from_columns(cols, cost_id, digest, prepared.key, Basis::Gross)"),
 ]
 
 
