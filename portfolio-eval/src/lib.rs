@@ -7,7 +7,7 @@
 //!
 //! | module | what | design |
 //! |---|---|---|
-//! | [`folds`] | walk-forward, purged K-fold and CPCV index ranges with purge and embargo | 4.3 |
+//! | [`folds`] | walk-forward, purged K-fold and CPCV index ranges with purge and embargo, plus an optional regime-stratified walk-forward window placement (`walk_forward_folds_stratified`, ported from `backtest::python_validation::resolve_wf_window_offsets`; `SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md` A1) | 4.3 |
 //! | [`bootstrap`] | stationary block bootstrap (Politis-Romano), automatic block length (Politis-White) | 4.4 |
 //! | [`marginal`] | paired equal-volatility marginal test, minimum detectable effect | 3.4 |
 //! | [`hac`] | Newey-West standard errors, spanning-regression alpha | 3.4 |
