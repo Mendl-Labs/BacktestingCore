@@ -52,6 +52,11 @@ metrics = { path = "../metrics" }
 genetic = { path = "../genetic" }
 walkforward = { path = "../walkforward" }
 smartrouter = { path = "../smartrouter" }
+# Excluded from the workspace (zero-dependency, standalone crate -- see its own
+# Cargo.toml) but still consumable as an ordinary path dependency. Shared
+# verification infra, slice A3: `backtest` is only a CALLER of
+# `portfolio_eval::folds` here, never a modifier of it.
+portfolio-eval = { path = "../portfolio-eval" }
 databaseschema = { git = "https://github.com/Nwagbara-Group-LLC/databaseschema", tag = "v0.1.1", optional = true }
 quant-diagnostics = { path = "../quant-diagnostics" }
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }

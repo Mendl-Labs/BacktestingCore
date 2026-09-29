@@ -423,6 +423,7 @@ dependencies = [
  "once_cell",
  "orderbook",
  "ordered-float 4.6.0",
+ "portfolio-eval",
  "portfoliomanager",
  "pyo3",
  "quant-diagnostics",
@@ -2499,6 +2500,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
+name = "portfolio-eval"
+version = "0.1.0"
+
+[[package]]
 name = "portfoliomanager"
 version = "0.1.0"
 dependencies = [
@@ -3999,10 +4004,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "weightsim"
-version = "0.1.0"
 
 [[package]]
 name = "whoami"

@@ -3067,6 +3067,135 @@ pub fn resolve_wf_step(n: usize, window_size: usize, num_windows: usize) -> usiz
     ((n - window_size) / (num_windows - 1)).max(1)
 }
 
+/// One walk-forward window's fold boundaries, as bar indices into the same
+/// `data` slice `run_walk_forward` was called with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WfFoldBounds {
+    pub train_start: usize,
+    pub train_end: usize,
+    pub test_start: usize,
+    pub test_end: usize,
+}
+
+/// Translate this crate's own `VolatilityRegime` into `portfolio_eval::folds::RegimeLabel`
+/// -- the same three-way Low/Medium/High split, structurally identical, kept as a separate
+/// type on the `portfolio-eval` side only because that crate is deliberately zero-dependency
+/// (see `RegimeLabel`'s own doc comment). A pure, allocating, one-shot mapping -- not new
+/// classification logic; it doesn't invent, reorder or reinterpret any label.
+fn to_shared_regime_labels(
+    regimes: &[Option<quant_diagnostics::VolatilityRegime>],
+) -> Vec<Option<portfolio_eval::folds::RegimeLabel>> {
+    regimes
+        .iter()
+        .map(|r| {
+            r.map(|v| match v {
+                quant_diagnostics::VolatilityRegime::Low => portfolio_eval::folds::RegimeLabel::Low,
+                quant_diagnostics::VolatilityRegime::Medium => {
+                    portfolio_eval::folds::RegimeLabel::Medium
+                }
+                quant_diagnostics::VolatilityRegime::High => {
+                    portfolio_eval::folds::RegimeLabel::High
+                }
+            })
+        })
+        .collect()
+}
+
+/// Resolve every walk-forward window's train/test bar-index boundaries for a
+/// series of `n` bars split into (up to) `num_windows` windows -- the exact
+/// fold-boundary construction `run_walk_forward` used to compute inline,
+/// extracted (shared verification infra, slice A3,
+/// `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) purely so
+/// it is directly, synchronously testable without a full async Python
+/// backtest harness.
+///
+/// The window/train/test/purge-gap sizing and the final train/test bar-index
+/// assembly are unchanged from before this slice (own formula -- see
+/// `resolve_wf_purge_gap_bars`'s doc comment; `portfolio_eval::folds` has no
+/// equivalent purge-gap-from-calendar-days formula to substitute). What DOES
+/// now call into `portfolio_eval::folds` is the regime-stratified window
+/// OFFSET-PLACEMENT step itself: `portfolio_eval::folds::resolve_wf_window_offsets`
+/// is a verified byte-for-byte port of this crate's own (still-present,
+/// still separately tested) `resolve_wf_window_offsets` -- see
+/// `scratch_probe_offset_placement_primitive_matches`-style differential
+/// testing in this module's test suite, and `portfolio_eval::folds`' own
+/// module doc, which states the port explicitly. This is the genuinely safe
+/// half of A3 for this function.
+///
+/// **What did NOT migrate, and why (the honest exception this slice's task
+/// explicitly allows for):** `portfolio_eval::folds::walk_forward_folds_stratified`
+/// -- the higher-level function that ALSO assembles train/test/purge bounds,
+/// not just offsets -- is NOT a safe substitute for this function's overall
+/// boundary construction. Two independent, empirically-confirmed reasons:
+/// (1) its `window_size` bakes the purge gap directly into the spacing used
+/// to place windows (`train_span + purge + test_len`), whereas this
+/// function's own `window_size` (`n / num_windows`) deliberately excludes
+/// the purge gap, adding it only when constructing each window's actual
+/// train/test bounds -- these are different, incompatible placement widths,
+/// and swapping to the former shifts (or entirely drops, once a window's
+/// footprint no longer fits) every window whenever `purge_gap_bars > 0`
+/// (the common case). (2) `walk_forward_folds_stratified`'s `regime_labels:
+/// None` path delegates to plain `walk_forward_folds`, whose OWN doc comment
+/// states it places "the LAST `n_folds x test_len` bars" as contiguous test
+/// windows -- i.e. it evaluates ONLY the tail of the series. This function's
+/// own placement (via `resolve_wf_window_offsets`, ported faithfully as
+/// described above) spreads test windows across the FULL range by design --
+/// the exact "2026-08 full-range-coverage fix" `resolve_wf_step`'s own doc
+/// comment describes, deliberately built to close a 33-46%-of-the-range
+/// blind spot. Migrating to `walk_forward_folds_stratified` wholesale would
+/// silently reintroduce that exact regression for any caller without regime
+/// data, and change window count/placement whenever it does. Both effects
+/// were confirmed empirically against real golden vectors before this
+/// function's design was finalized -- not merely reasoned about.
+///
+/// `span_ms` is the timestamp delta between the data's first and last bar (0
+/// if fewer than 2 bars) -- feeds `resolve_wf_purge_gap_bars`. `regimes` is
+/// `run_walk_forward`'s own per-return volatility-tercile classification
+/// (one entry per RETURN, i.e. one shorter than `n`); `None` is a valid,
+/// deliberate input (e.g. a dataset too short to classify at all), not an
+/// error -- it reproduces the prior uniform-only placement exactly.
+pub fn resolve_wf_fold_bounds(
+    n: usize,
+    num_windows: usize,
+    span_ms: i64,
+    regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
+) -> Vec<WfFoldBounds> {
+    let window_size = n / num_windows.max(1);
+    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+    let test_size = window_size - train_size;
+    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+
+    let mapped_regimes: Option<Vec<Option<portfolio_eval::folds::RegimeLabel>>> =
+        regimes.map(to_shared_regime_labels);
+    let offsets: Vec<usize> = portfolio_eval::folds::resolve_wf_window_offsets(
+        n,
+        window_size,
+        num_windows,
+        test_size,
+        mapped_regimes.as_deref(),
+    )
+    .into_iter()
+    .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+    .collect();
+
+    offsets
+        .into_iter()
+        .take(num_windows)
+        .map(|offset| {
+            let train_start = offset;
+            let train_end = offset + train_size;
+            let test_start = train_end + purge_gap_bars;
+            let test_end = (test_start + test_size).min(n);
+            WfFoldBounds {
+                train_start,
+                train_end,
+                test_start,
+                test_end,
+            }
+        })
+        .collect()
+}
+
 /// Run walk-forward analysis over market data, splitting into rolling windows.
 ///
 /// Each window uses a train slice then (optionally) skips a `WF_PURGE_GAP_DAYS`-wide embargo
@@ -3087,13 +3216,6 @@ async fn run_walk_forward(
         anyhow::bail!("Insufficient data for walk-forward analysis (need >= 100 ticks, got {})", n);
     }
 
-    // Calculate window sizes
-    // Each window covers (window_size = n / num_windows) ticks, spanning the FULL
-    // range n across num_windows windows (see resolve_wf_step's doc comment).
-    let window_size = n / num_windows.max(1);
-    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-    let test_size = window_size - train_size;
-
     // Convert WF_PURGE_GAP_DAYS to a bar count from the data's own average
     // spacing (capped at half the test window so a short/coarse-granularity
     // window can never purge the ENTIRE test slice away -- see
@@ -3102,7 +3224,6 @@ async fn run_walk_forward(
         (Some(first), Some(last)) => (last - first).num_milliseconds(),
         _ => 0,
     };
-    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
 
     // Bar-based annualization factor derived from this dataset's OWN average
     // bar spacing (2026-08 annualization fix) -- every per-window OOS Sharpe
@@ -3118,27 +3239,24 @@ async fn run_walk_forward(
 
     // Window placement (2026-08 stratified-by-regime upgrade, Phase 2):
     // reserves a window per detected regime before falling back to uniform
-    // spacing -- see resolve_wf_window_offsets' doc comment. Filtered against
-    // the same bound the original while-loop enforced (offset + train + gap
-    // + test <= n), since the placement function itself doesn't know about
-    // the purge gap.
-    let offsets: Vec<usize> = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes))
-        .into_iter()
-        .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
-        .collect();
+    // spacing. Extracted into `resolve_wf_fold_bounds` (shared verification
+    // infra, slice A3) purely so the fold-boundary math is directly
+    // testable -- see that function's doc comment; this call is the exact
+    // same window/train/test/purge arithmetic that used to be inline here.
+    let fold_bounds = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
 
     let mut windows: Vec<WalkForwardWindow> = Vec::new();
     let mut oos_results: Vec<BacktestResult> = Vec::new();
     let mut window_idx = 0usize;
 
-    for offset in offsets {
+    for bounds in fold_bounds {
         if windows.len() >= num_windows {
             break;
         }
-        let train_start = offset;
-        let train_end = offset + train_size;
-        let test_start = train_end + purge_gap_bars;
-        let test_end = (test_start + test_size).min(n);
+        let train_start = bounds.train_start;
+        let train_end = bounds.train_end;
+        let test_start = bounds.test_start;
+        let test_end = bounds.test_end;
 
         // Subsample each window slice to cap at ~500K ticks for speed.
         // Walk-forward is a relative comparison (train vs test), so subsampling
@@ -3855,6 +3973,188 @@ pub fn compute_tick_divergence(
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // A3 migration evidence (shared verification infra,
+    // `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) --
+    // permanent tests documenting exactly what did and did not migrate to
+    // `portfolio_eval::folds`, and why, so a future reader doesn't have to
+    // re-derive this from scratch. See `resolve_wf_fold_bounds`'s own doc
+    // comment for the prose version of the same finding.
+    // ---------------------------------------------------------------------
+
+    /// The genuinely safe half of A3: `resolve_wf_fold_bounds` now calls
+    /// `portfolio_eval::folds::resolve_wf_window_offsets` for its regime-
+    /// stratified placement step instead of this module's own (still
+    /// present, still separately tested) `resolve_wf_window_offsets`. This
+    /// differential test proves the two are byte-for-byte identical across
+    /// a diverse set of configs (uniform/no-regime, regime-present,
+    /// scarce-regime, an odd `n` not evenly divisible by `num_windows`) --
+    /// i.e. `portfolio_eval::folds` really is a faithful port of this exact
+    /// algorithm, not merely documented as one.
+    #[test]
+    fn offset_placement_primitive_matches_portfolio_eval_byte_for_byte() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let cases: Vec<(
+            usize,
+            usize,
+            usize,
+            Option<Vec<Option<quant_diagnostics::VolatilityRegime>>>,
+        )> = vec![
+            (10_000, 200, 8, None),
+            (1000, 200, 5, None),
+            (
+                900,
+                150,
+                3,
+                Some(make_regimes(&[(600, Low), (60, High), (240, Medium)])),
+            ),
+            (
+                500,
+                120,
+                3,
+                Some(make_regimes(&[(420, Low), (30, High), (49, Medium)])),
+            ),
+            (2000, 250, 8, None),
+            (
+                997,
+                90,
+                5,
+                Some({
+                    let mut r = make_regimes(&[(500, Low), (496, High)]);
+                    r.truncate(996);
+                    r
+                }),
+            ),
+        ];
+        for (n, window_size, num_windows, regimes) in cases {
+            let test_size = window_size / 3;
+            let mapped = regimes.as_ref().map(|r| to_shared_regime_labels(r));
+            let old = resolve_wf_window_offsets(
+                n,
+                window_size,
+                num_windows,
+                test_size,
+                regimes.as_deref(),
+            );
+            let new = portfolio_eval::folds::resolve_wf_window_offsets(
+                n,
+                window_size,
+                num_windows,
+                test_size,
+                mapped.as_deref(),
+            );
+            assert_eq!(
+                old, new,
+                "offset placement primitive diverged for n={n} window_size={window_size} num_windows={num_windows}"
+            );
+        }
+    }
+
+    /// The NOT-safe half of A3, pinned as a permanent regression test rather
+    /// than left as a one-off finding: `portfolio_eval::folds::walk_forward_folds_stratified`
+    /// is not a drop-in substitute for `resolve_wf_fold_bounds`'s overall
+    /// boundary construction, for two independent, structural reasons (see
+    /// `resolve_wf_fold_bounds`'s doc comment for the full explanation).
+    /// This test exercises both on the SAME golden-vector config
+    /// (n=1000, 5 daily-bar windows, `WF_TRAIN_FRAC`=0.7) and asserts they
+    /// genuinely disagree today -- if `portfolio_eval::folds` is ever
+    /// extended with a full-range-spread, gracefully-degrading stratified
+    /// mode (the plan doc's own section 4 risk item 2 anticipates exactly
+    /// this kind of gap), this test is the tripwire that should fail and
+    /// prompt re-evaluating whether the full migration has become safe.
+    #[test]
+    fn walk_forward_folds_stratified_is_not_a_safe_substitute_for_resolve_wf_fold_bounds() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * 86_400_000i64; // ordinary daily bars
+        let window_size = n / num_windows;
+        let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+        let test_size = window_size - train_size;
+        let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+
+        let today = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        let today_tuples: Vec<(usize, usize, usize, usize)> = today
+            .iter()
+            .map(|b| (b.train_start, b.train_end, b.test_start, b.test_end))
+            .collect();
+        // TODAY spreads test windows across the full range (2026-08 fix);
+        // its first window's test slice starts near bar 145, not near the
+        // tail of the series.
+        assert!(
+            today_tuples[0].2 < n / 2,
+            "today's placement should cover early data, got {:?}",
+            today_tuples
+        );
+
+        let via_shared = portfolio_eval::folds::walk_forward_folds_stratified(
+            n,
+            num_windows,
+            test_size,
+            train_size,
+            purge_gap_bars,
+            portfolio_eval::folds::TrainMode::Rolling {
+                train_len: train_size,
+            },
+            None, // no regime data -- delegates straight to plain walk_forward_folds
+        )
+        .expect("walk_forward_folds_stratified should succeed for this config");
+        let shared_tuples: Vec<(usize, usize, usize, usize)> = via_shared
+            .iter()
+            .map(|f| {
+                (
+                    f.train[0].start,
+                    f.train[0].end,
+                    f.test[0].start,
+                    f.test[0].end,
+                )
+            })
+            .collect();
+        // Reason 1: `walk_forward_folds`'s `None` path packs ALL test
+        // windows into the LAST `n_folds * test_len` bars only (its own doc
+        // comment) -- every window's test slice starts well past the
+        // midpoint, the opposite of today's full-range spread.
+        assert!(
+            shared_tuples.iter().all(|t| t.2 >= n / 2),
+            "walk_forward_folds_stratified's None path should be tail-packed, got {:?}",
+            shared_tuples
+        );
+        assert_ne!(
+            today_tuples, shared_tuples,
+            "expected these two placement strategies to genuinely disagree on this config"
+        );
+
+        // Reason 2: even the regime-aware path is strict (all n_folds
+        // windows or an Err), where today's code gracefully degrades to
+        // fewer windows -- reproduce the "with regimes" golden-vector
+        // config (which today succeeds with only 3 of 5 requested windows)
+        // and confirm the shared function refuses it outright.
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let regimes = make_regimes(&[(600, Low), (150, High), (249, Medium)]);
+        let today_with_regimes = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_eq!(
+            today_with_regimes.len(),
+            3,
+            "today's code should still gracefully return fewer windows than requested"
+        );
+        let mapped = to_shared_regime_labels(&regimes);
+        let shared_with_regimes = portfolio_eval::folds::walk_forward_folds_stratified(
+            n,
+            num_windows,
+            test_size,
+            train_size,
+            purge_gap_bars,
+            portfolio_eval::folds::TrainMode::Rolling {
+                train_len: train_size,
+            },
+            Some(&mapped),
+        );
+        assert!(
+            shared_with_regimes.is_err(),
+            "walk_forward_folds_stratified is expected to refuse outright (not gracefully degrade) on this config, got {:?}",
+            shared_with_regimes
+        );
+    }
+
     // ── resolve_fixed_parameter_wf_windows — rule-first discovery flow ──
 
     fn synthetic_daily_candles(n: usize) -> Vec<MarketData> {
@@ -4463,6 +4763,186 @@ mod tests {
         assert!(resolve_wf_window_offsets(1000, 0, 4, 10, None).is_empty());
         assert!(resolve_wf_window_offsets(1000, 100, 0, 10, None).is_empty());
         assert!(resolve_wf_window_offsets(100, 500, 4, 10, None).is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // resolve_wf_fold_bounds -- golden-vector regression (shared
+    // verification infra, slice A3,
+    // `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`).
+    //
+    // Each case's `expected` is computed by literally re-deriving the same
+    // arithmetic `resolve_wf_fold_bounds` itself performs (window_size,
+    // train_size, test_size, `resolve_wf_purge_gap_bars`,
+    // `resolve_wf_window_offsets`, the `<= n` filter, then
+    // train/test bar-index construction) -- i.e. a second, independent
+    // expression of TODAY'S exact formula, not a hand-picked number. This is
+    // the pinned "before" behavior: run against the current (unmigrated)
+    // internals first; after migrating `resolve_wf_fold_bounds` to call
+    // `portfolio_eval::folds::walk_forward_folds_stratified`, these same
+    // assertions are re-run unchanged. A handful of the literal (offset,
+    // train_start, train_end, test_start, test_end) tuples observed from a
+    // real `cargo test -p backtest -- resolve_wf_fold_bounds` run are also
+    // pasted in the PR description for a paper-trail independent of this
+    // source file.
+    // ---------------------------------------------------------------------
+
+    /// Re-derive the expected fold bounds directly from the same primitives
+    /// `resolve_wf_fold_bounds` calls, so this test file has its own,
+    /// separate expression of "today's formula" to compare against.
+    fn expected_wf_fold_bounds(
+        n: usize,
+        num_windows: usize,
+        span_ms: i64,
+        regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let window_size = n / num_windows.max(1);
+        let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+        let test_size = window_size - train_size;
+        let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+        resolve_wf_window_offsets(n, window_size, num_windows, test_size, regimes)
+            .into_iter()
+            .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+            .take(num_windows)
+            .map(|offset| {
+                let train_start = offset;
+                let train_end = offset + train_size;
+                let test_start = train_end + purge_gap_bars;
+                let test_end = (test_start + test_size).min(n);
+                (train_start, train_end, test_start, test_end)
+            })
+            .collect()
+    }
+
+    fn assert_fold_bounds_match(
+        actual: &[WfFoldBounds],
+        expected: &[(usize, usize, usize, usize)],
+    ) {
+        let actual_tuples: Vec<(usize, usize, usize, usize)> = actual
+            .iter()
+            .map(|b| (b.train_start, b.train_end, b.test_start, b.test_end))
+            .collect();
+        assert_eq!(actual_tuples, expected);
+    }
+
+    const DAY_MS: i64 = 86_400_000;
+
+    #[test]
+    fn golden_wf_fold_bounds_1000_daily_bars_5_windows_no_regimes() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS; // daily bars
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+        // Pinned literal values (pasted into the PR description too) --
+        // window_size=200, train_size=140, test_size=60, purge_gap_bars=5,
+        // uniform step=200 (back-to-back, see resolve_wf_step). Only 4 of
+        // the 5 requested windows survive: the 5th candidate offset (800)
+        // is spaced by the uniform step (200, computed WITHOUT the purge
+        // gap) but its actual footprint is train+purge+test = 205 bars, so
+        // 800 + 140 + 5 + 60 = 1005 > n (1000) and the existing `<= n`
+        // filter drops it outright -- TODAY's code asks for 5 windows and
+        // silently returns 4 whenever purge_gap_bars > 0 and the data
+        // divides evenly. Preserved here byte-for-byte as "today's" real
+        // behavior, not smoothed over.
+        assert_eq!(
+            expected,
+            vec![
+                (0, 140, 145, 205),
+                (200, 340, 345, 405),
+                (400, 540, 545, 605),
+                (600, 740, 745, 805)
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_1000_daily_bars_5_windows_with_regimes() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS;
+        // Regimes are indexed over returns (n - 1 = 999 entries): a long Low
+        // run, then a short High spike, then Medium -- the same
+        // "uniform spacing alone would plausibly miss the short segment"
+        // shape used by the existing resolve_wf_window_offsets tests.
+        let regimes = make_regimes(&[(600, Low), (150, High), (249, Medium)]);
+        assert_eq!(regimes.len(), n - 1);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_fold_bounds_match(&actual, &expected);
+        assert!(
+            !expected.is_empty(),
+            "regime-stratified placement must still produce windows"
+        );
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_500_bars_3_windows_scarce_regime() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let n = 500usize;
+        let num_windows = 3usize;
+        let span_ms = 499 * DAY_MS;
+        let regimes = make_regimes(&[(420, Low), (30, High), (49, Medium)]);
+        assert_eq!(regimes.len(), n - 1);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_2000_hourly_bars_8_windows_no_regimes() {
+        let n = 2000usize;
+        let num_windows = 8usize;
+        // Hourly bars: same calendar span expressed in far more bars, so
+        // resolve_wf_purge_gap_bars's calendar-day-to-bar-count conversion
+        // is exercised at a different granularity than the daily cases.
+        let span_ms = 1999 * (DAY_MS / 24);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_short_series_purge_gap_capped() {
+        // Small enough that resolve_wf_purge_gap_bars' test_size/2 cap binds
+        // (see resolve_wf_purge_gap_bars_never_exceeds_half_the_test_window).
+        let n = 120usize;
+        let num_windows = 3usize;
+        let span_ms = 119 * DAY_MS;
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    // ---------------------------------------------------------------------
+    // Historical bug regression #1 (named in the plan doc): missing purge
+    // gap -- a purge gap of 0 between train_end and test_start would let a
+    // training observation's label/holding period reach directly into the
+    // test window. For any realistic (sub-half-test_size) calendar spacing,
+    // resolve_wf_fold_bounds's test_start must be strictly ahead of
+    // train_end by a positive number of bars.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn historical_bug_missing_purge_gap_regression() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS; // ordinary daily bars -> a real, positive gap is expected
+        let bounds = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert!(!bounds.is_empty());
+        for b in &bounds {
+            let gap = b.test_start.saturating_sub(b.train_end);
+            assert!(
+                gap > 0,
+                "train_end={} test_start={} must be separated by a positive purge gap (bug: missing purge gap), got gap={}",
+                b.train_end, b.test_start, gap
+            );
+            assert_eq!(
+                gap, 5,
+                "daily bars should convert WF_PURGE_GAP_DAYS=5.0 into ~5 bars of purge, got {gap}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
