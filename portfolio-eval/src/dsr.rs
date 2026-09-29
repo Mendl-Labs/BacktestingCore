@@ -17,6 +17,21 @@
 //! the interval but sampling noise in skewness must not shrink it). None of these formulas repairs autocorrelation;
 //! block-bootstrap intervals ([`crate::marginal`]) are the primary uncertainty statement and the DSR is reported beside
 //! them (design 4.4).
+//!
+//! A THIRD Core formula is mirrored in [`core_compat`] as well, added later and kept separate from the two above
+//! because it is neither of them: `backtest::statistical_significance::compute_deflated_sharpe_ratio` /
+//! `expected_max_sharpe_under_null` (Core's `backtest` crate, not `metrics`). This is the formula actually wired
+//! into the live, production `Promising`/`Underperformed`/`Inconclusive` verdict in
+//! `BacktestingEngine/program/src/worker.rs` (`compute_statistical_significance_summary`); the two formulas mirrored
+//! above are not, as far as this crate can verify, the operative verdict path. It uses a plain classical
+//! extreme-value approximation for the expected maximum of N standard normals
+//! (`sqrt(2 ln N) - (ln(ln N) + ln(4 pi)) / (2 sqrt(2 ln N))`, times a finite-sample `sqrt((T-1)/T)` adjustment) with
+//! NO Euler-Mascheroni/Gumbel correction (unlike both formulas above and [`expected_max_normal`]), and applies NO
+//! skewness/kurtosis correction to the Sharpe standard error at all (unlike `metrics::performance`'s Bailey-Lopez de
+//! Prado formula and [`sharpe_se_sq`]) -- deliberately the plainer, more mechanical formula. See
+//! [`core_compat::deflated_sharpe_live_verdict_formula`] for the mirror and `tests/core_equivalence.rs` for the
+//! equivalence test against Core's real function (golden values produced by
+//! `tests/reference/core_goldens.sh`, which also now copies `backtest/src/statistical_significance.rs`).
 
 use crate::detmath;
 use crate::error::{invalid, EvalError, Result};
@@ -197,6 +212,13 @@ pub fn benjamini_hochberg_q(p_values: &[f64]) -> Result<Vec<f64>> {
 /// shared inputs and so a reader can see exactly how the crate's own DSR differs. They use the same approximations
 /// as Core (A&S 7.1.26 `erfc`, Acklam probit without refinement, Gumbel-corrected expected maximum); only the
 /// elementary `exp`/`ln` come from [`crate::detmath`].
+///
+/// The one exception is the THIRD mirror (`deflated_sharpe_live_verdict_formula`, `expected_max_sharpe_under_null_live_verdict`,
+/// `normal_cdf_live_verdict`): Core's own `backtest::statistical_significance` computes it with plain `f64` methods
+/// (`.ln()`, `.exp()`, `.sqrt()`), not a custom libm, so a bit-for-bit mirror uses the same plain `f64` methods too
+/// rather than [`crate::detmath`] -- routing it through `detmath` would substitute a different (more accurate)
+/// elementary-function implementation and a different (Gumbel-corrected) expected-maximum formula, silently
+/// producing a FOURTH formula instead of a faithful mirror of the third.
 #[allow(clippy::excessive_precision)] // constants and formulas are copied verbatim from Core
 pub mod core_compat {
     use crate::detmath;
@@ -353,5 +375,86 @@ pub mod core_compat {
         let se_sq = ((1.0 - skewness * sr + ((excess_kurtosis + 2.0) / 4.0) * sr * sr) / (n_f - 1.0))
             .max(se_sq_normal_baseline);
         Some((sr - sr_star) / se_sq.sqrt())
+    }
+
+    /// Mirror of the private `normal_cdf` in `backtest::statistical_significance` -- the standard normal CDF via the
+    /// Abramowitz-Stegun 7.1.26 `erf` approximation applied CORRECTLY to `x / sqrt(2)` (unlike this module's own
+    /// [`normal_cdf_approx`], which applies the same polynomial to `x` directly and is 0.037 off at its worst point;
+    /// see that function's doc comment). Not directly testable against Core because the function it mirrors is
+    /// private, not `pub`; exercised indirectly through [`deflated_sharpe_live_verdict_formula`]'s equivalence test
+    /// against Core's own public `compute_deflated_sharpe_ratio`. Deliberately uses plain `f64` methods, not
+    /// [`crate::detmath`] -- see the module-level doc comment above `core_compat` for why.
+    fn normal_cdf_live_verdict(x: f64) -> f64 {
+        let a1 = 0.254829592;
+        let a2 = -0.284496736;
+        let a3 = 1.421413741;
+        let a4 = -1.453152027;
+        let a5 = 1.061405429;
+        let p = 0.3275911;
+
+        let sign = if x < 0.0 { -1.0 } else { 1.0 };
+        let x = x.abs() / std::f64::consts::SQRT_2;
+
+        let t = 1.0 / (1.0 + p * x);
+        let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+
+        0.5 * (1.0 + sign * y)
+    }
+
+    /// Mirror of `backtest::statistical_significance::expected_max_sharpe_under_null(num_strategies, lookback_periods)`
+    /// -- the THIRD, distinct DSR formula named in this module's top-level doc comment (the one actually wired into
+    /// the live `Promising`/`Underperformed`/`Inconclusive` verdict via
+    /// `BacktestingEngine/program/src/worker.rs::compute_statistical_significance_summary`), NOT
+    /// `metrics::significance`/`metrics::performance`'s expected-maximum formulas mirrored elsewhere in this module.
+    /// A plain classical extreme-value approximation for the expected maximum of `num_strategies` standard normals,
+    /// with NO Euler-Mascheroni/Gumbel correction (contrast [`expected_max_normal`] and
+    /// `expected_max_normal_core` above): `sqrt(2 ln N) - (ln(ln N) + ln(4 pi)) / (2 sqrt(2 ln N))`, scaled by the
+    /// finite-sample adjustment `sqrt((T-1)/T)` where `T = lookback_periods`. Returns `0.0` when either input is `0`
+    /// or when `ln(num_strategies) <= 0` (i.e. `num_strategies <= 1`), matching Core's own early returns exactly.
+    pub fn expected_max_sharpe_under_null_live_verdict(num_strategies: usize, lookback_periods: usize) -> f64 {
+        if num_strategies == 0 || lookback_periods == 0 {
+            return 0.0;
+        }
+
+        let n = num_strategies as f64;
+        let t = lookback_periods as f64;
+
+        let ln_n = n.ln();
+        if ln_n <= 0.0 {
+            return 0.0;
+        }
+
+        let sqrt_2_ln_n = (2.0 * ln_n).sqrt();
+        let expected_max =
+            sqrt_2_ln_n - (ln_n.ln() + (4.0 * std::f64::consts::PI).ln()) / (2.0 * sqrt_2_ln_n);
+
+        expected_max * ((t - 1.0) / t).sqrt()
+    }
+
+    /// Mirror of `backtest::statistical_significance::compute_deflated_sharpe_ratio(sharpe, sharpe_std_error,
+    /// num_strategies_tested, expected_max_sharpe_if_null)` -- the THIRD, distinct DSR formula this module's
+    /// top-level doc comment names as the one wired into the live, production `Promising`/`Underperformed`/
+    /// `Inconclusive` verdict (`BacktestingEngine/program/src/worker.rs`, imported and called from
+    /// `compute_statistical_significance_summary`), not either of the two `metrics::` formulas this module already
+    /// mirrors above. Applies NO skewness/kurtosis correction to the Sharpe standard error at all (contrast
+    /// [`sharpe_se_sq`] and `metrics::performance`'s Bailey-Lopez de Prado formula) -- `sharpe_std_error` is a plain
+    /// caller-supplied input here, not derived from return moments by this function. Callers normally obtain
+    /// `expected_max_sharpe_if_null` from [`expected_max_sharpe_under_null_live_verdict`] first (that two-step shape
+    /// mirrors how Core's own two functions are composed by their caller). Returns `0.0` when `sharpe_std_error <=
+    /// 0.0` (the zero/degenerate-variance case) or `num_strategies_tested == 0`, matching Core's own early return
+    /// exactly -- this is Core's OWN "no scaling" convention for degenerate inputs, distinct from the two other
+    /// mirrors' own degenerate conventions (`deflated_sharpe_significance` returns `0.5`; `deflated_sharpe_performance`
+    /// returns `None`).
+    pub fn deflated_sharpe_live_verdict_formula(
+        sharpe: f64,
+        sharpe_std_error: f64,
+        num_strategies_tested: usize,
+        expected_max_sharpe_if_null: f64,
+    ) -> f64 {
+        if sharpe_std_error <= 0.0 || num_strategies_tested == 0 {
+            return 0.0;
+        }
+
+        normal_cdf_live_verdict((sharpe - expected_max_sharpe_if_null) / sharpe_std_error)
     }
 }
