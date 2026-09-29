@@ -287,7 +287,7 @@ pub fn resolve_wf_window_offsets(
 
     use RegimeLabel::{High, Low, Medium};
     let mut present: Vec<RegimeLabel> =
-        [Low, Medium, High].into_iter().filter(|label| regimes.iter().any(|r| *r == Some(*label))).collect();
+        [Low, Medium, High].into_iter().filter(|label| regimes.contains(&Some(*label))).collect();
     present.sort_by_key(|label| regimes.iter().filter(|r| **r == Some(*label)).count());
 
     let segments = regime_segments(regimes);
@@ -437,35 +437,10 @@ pub fn walk_forward_folds_stratified(
             TrainMode::Expanding => 0,
             TrainMode::Rolling { train_len } => train_end.saturating_sub(train_len),
         };
-        folds.push(Fold { train: vec![train_start..train_end], test: vec![test_start..test_end] });
+        let (train, test) = (train_start..train_end, test_start..test_end);
+        folds.push(Fold { train: vec![train], test: vec![test] });
     }
     Ok(folds)
-}
-
-#[cfg(test)]
-mod regime_placement_tests {
-    use super::*;
-
-    fn make_regimes(spec: &[(usize, RegimeLabel)]) -> Vec<Option<RegimeLabel>> {
-        spec.iter().flat_map(|(count, label)| std::iter::repeat(Some(*label)).take(*count)).collect()
-    }
-
-    // Mirrors `backtest::python_validation::regime_segments_splits_on_label_change_and_skips_none_gaps`
-    // (that helper is private there too, hence the inline test here rather than in `tests/`).
-    #[test]
-    fn regime_segments_splits_on_label_change_and_skips_none_gaps() {
-        use RegimeLabel::{High, Low, Medium};
-        let mut regimes = make_regimes(&[(5, Low), (3, High), (4, Medium)]);
-        // Insert a None gap inside the Low run -- must not split it.
-        regimes[2] = None;
-        let segments = regime_segments(&regimes);
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].2, Low);
-        assert_eq!(segments[0].0, 0);
-        assert_eq!(segments[0].1, 4); // still spans the whole Low run despite the gap at index 2
-        assert_eq!(segments[1].2, High);
-        assert_eq!(segments[2].2, Medium);
-    }
 }
 
 /// Purged K-fold (Lopez de Prado): `k` contiguous test blocks, each trained on the rest minus the purge and embargo
@@ -565,4 +540,30 @@ pub fn cpcv_splits(n_bars: usize, n_groups: usize, k_test: usize, purge: usize, 
         folds.push(Fold { train, test });
     }
     Ok(folds)
+}
+
+#[cfg(test)]
+mod regime_placement_tests {
+    use super::*;
+
+    fn make_regimes(spec: &[(usize, RegimeLabel)]) -> Vec<Option<RegimeLabel>> {
+        spec.iter().flat_map(|(count, label)| std::iter::repeat_n(Some(*label), *count)).collect()
+    }
+
+    // Mirrors `backtest::python_validation::regime_segments_splits_on_label_change_and_skips_none_gaps`
+    // (that helper is private there too, hence the inline test here rather than in `tests/`).
+    #[test]
+    fn regime_segments_splits_on_label_change_and_skips_none_gaps() {
+        use RegimeLabel::{High, Low, Medium};
+        let mut regimes = make_regimes(&[(5, Low), (3, High), (4, Medium)]);
+        // Insert a None gap inside the Low run -- must not split it.
+        regimes[2] = None;
+        let segments = regime_segments(&regimes);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].2, Low);
+        assert_eq!(segments[0].0, 0);
+        assert_eq!(segments[0].1, 4); // still spans the whole Low run despite the gap at index 2
+        assert_eq!(segments[1].2, High);
+        assert_eq!(segments[2].2, Medium);
+    }
 }

@@ -13,7 +13,7 @@ use portfolio_eval::folds::{
 };
 
 fn make_regimes(spec: &[(usize, RegimeLabel)]) -> Vec<Option<RegimeLabel>> {
-    spec.iter().flat_map(|(count, label)| std::iter::repeat(Some(*label)).take(*count)).collect()
+    spec.iter().flat_map(|(count, label)| std::iter::repeat_n(Some(*label), *count)).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
