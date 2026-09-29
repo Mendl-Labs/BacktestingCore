@@ -300,7 +300,8 @@ pub fn resolve_wf_window_offsets(
     for label in present.into_iter().take(num_windows) {
         // Prefer the LARGEST segment of this label -- more robust than a segment so short it's
         // likely a one-bar classifier blip.
-        let mut candidates: Vec<&(usize, usize, RegimeLabel)> = segments.iter().filter(|(_, _, l)| *l == label).collect();
+        let mut candidates: Vec<&(usize, usize, RegimeLabel)> =
+            segments.iter().filter(|(_, _, l)| *l == label).collect();
         candidates.sort_by_key(|(s, e, _)| std::cmp::Reverse(e.saturating_sub(*s)));
 
         for (seg_start, seg_end, _) in candidates {
@@ -396,7 +397,10 @@ pub fn walk_forward_folds_stratified(
         TrainMode::Expanding => min_train,
         TrainMode::Rolling { train_len } => {
             if train_len < min_train {
-                return Err(invalid("train_len", format!("rolling train_len {train_len} is below min_train {min_train}")));
+                return Err(invalid(
+                    "train_len",
+                    format!("rolling train_len {train_len} is below min_train {min_train}"),
+                ));
             }
             train_len
         }
@@ -405,9 +409,14 @@ pub fn walk_forward_folds_stratified(
         .checked_add(purge)
         .and_then(|v| v.checked_add(test_len))
         .ok_or_else(|| invalid("purge", "sizes overflow usize"))?;
-    let need = n_folds.checked_mul(window_size).ok_or_else(|| invalid("n_folds", "n_folds x window_size overflows usize"))?;
+    let need =
+        n_folds.checked_mul(window_size).ok_or_else(|| invalid("n_folds", "n_folds x window_size overflows usize"))?;
     if window_size > n_bars || need > n_bars {
-        return Err(EvalError::TooShort { what: "regime-stratified walk-forward folds", need: need.max(window_size), got: n_bars });
+        return Err(EvalError::TooShort {
+            what: "regime-stratified walk-forward folds",
+            need: need.max(window_size),
+            got: n_bars,
+        });
     }
 
     let offsets = resolve_wf_window_offsets(n_bars, window_size, n_folds, test_len, Some(regimes));

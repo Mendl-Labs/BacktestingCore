@@ -8,7 +8,9 @@
 //! load-bearing "no behavior change when `regime_labels` is `None`" contract.
 
 use portfolio_eval::error::EvalError;
-use portfolio_eval::folds::{resolve_wf_window_offsets, walk_forward_folds, walk_forward_folds_stratified, RegimeLabel, TrainMode};
+use portfolio_eval::folds::{
+    resolve_wf_window_offsets, walk_forward_folds, walk_forward_folds_stratified, RegimeLabel, TrainMode,
+};
 
 fn make_regimes(spec: &[(usize, RegimeLabel)]) -> Vec<Option<RegimeLabel>> {
     spec.iter().flat_map(|(count, label)| std::iter::repeat(Some(*label)).take(*count)).collect()
@@ -69,7 +71,10 @@ fn resolve_wf_window_offsets_windows_stay_disjoint_with_regimes() {
     for i in 0..offsets.len() {
         for j in (i + 1)..offsets.len() {
             let (a, b) = (offsets[i], offsets[j]);
-            assert!(a + window_size <= b || b + window_size <= a, "windows at {a} and {b} overlap (window_size={window_size})");
+            assert!(
+                a + window_size <= b || b + window_size <= a,
+                "windows at {a} and {b} overlap (window_size={window_size})"
+            );
         }
     }
 }
@@ -129,11 +134,11 @@ fn walk_forward_folds_stratified_none_is_byte_for_byte_identical_to_walk_forward
         (55, 3, 10, 20, 5, TrainMode::Expanding),
         (54, 3, 10, 20, 5, TrainMode::Expanding), // deliberately one bar short -> Err
         (40, 2, 10, 20, 0, TrainMode::Expanding),
-        (100, 0, 10, 20, 5, TrainMode::Expanding),                    // bad n_folds -> Err
-        (100, 4, 0, 20, 5, TrainMode::Expanding),                     // bad test_len -> Err
-        (100, 4, 10, 0, 5, TrainMode::Expanding),                     // bad min_train -> Err
-        (100, 4, 10, 20, 5, TrainMode::Rolling { train_len: 10 }),    // train_len < min_train -> Err
-        (usize::MAX, usize::MAX, 2, 1, 0, TrainMode::Expanding),      // overflow -> Err
+        (100, 0, 10, 20, 5, TrainMode::Expanding), // bad n_folds -> Err
+        (100, 4, 0, 20, 5, TrainMode::Expanding),  // bad test_len -> Err
+        (100, 4, 10, 0, 5, TrainMode::Expanding),  // bad min_train -> Err
+        (100, 4, 10, 20, 5, TrainMode::Rolling { train_len: 10 }), // train_len < min_train -> Err
+        (usize::MAX, usize::MAX, 2, 1, 0, TrainMode::Expanding), // overflow -> Err
     ];
     for (n_bars, n_folds, test_len, min_train, purge, mode) in cases {
         let before = walk_forward_folds(n_bars, n_folds, test_len, min_train, purge, mode);
@@ -271,16 +276,20 @@ fn walk_forward_folds_stratified_offsets_match_resolve_wf_window_offsets_directl
     let n_bars = 1000;
     let (n_folds, test_len, min_train, purge) = (4, 60, 40, 5);
     let window_size = min_train + purge + test_len;
-    let scenarios: Vec<Vec<Option<RegimeLabel>>> = vec![
-        vec![None; n_bars],
-        make_regimes(&[(1000, Low)]),
-        make_regimes(&[(400, Low), (300, Medium), (300, High)]),
-    ];
+    let scenarios: Vec<Vec<Option<RegimeLabel>>> =
+        vec![vec![None; n_bars], make_regimes(&[(1000, Low)]), make_regimes(&[(400, Low), (300, Medium), (300, High)])];
     for regimes in scenarios {
         let expected_offsets = resolve_wf_window_offsets(n_bars, window_size, n_folds, test_len, Some(&regimes));
-        let folds =
-            walk_forward_folds_stratified(n_bars, n_folds, test_len, min_train, purge, TrainMode::Expanding, Some(&regimes))
-                .unwrap();
+        let folds = walk_forward_folds_stratified(
+            n_bars,
+            n_folds,
+            test_len,
+            min_train,
+            purge,
+            TrainMode::Expanding,
+            Some(&regimes),
+        )
+        .unwrap();
         let actual_offsets: Vec<usize> = folds.iter().map(|f| f.test[0].end - window_size).collect();
         assert_eq!(actual_offsets, expected_offsets);
     }
