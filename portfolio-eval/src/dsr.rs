@@ -425,8 +425,7 @@ pub mod core_compat {
         }
 
         let sqrt_2_ln_n = (2.0 * ln_n).sqrt();
-        let expected_max =
-            sqrt_2_ln_n - (ln_n.ln() + (4.0 * std::f64::consts::PI).ln()) / (2.0 * sqrt_2_ln_n);
+        let expected_max = sqrt_2_ln_n - (ln_n.ln() + (4.0 * std::f64::consts::PI).ln()) / (2.0 * sqrt_2_ln_n);
 
         expected_max * ((t - 1.0) / t).sqrt()
     }
