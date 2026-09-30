@@ -13,6 +13,19 @@
 # Two jobs because ~40% of this workspace's open PRs at the time this was written (feat/etc. touching
 # backtest/src/python_validation.rs, backtest/src/python_simulation.rs, strategy/src/strategies/python_strategy.rs)
 # are gated behind the `python` feature (PyO3) and would get ZERO signal from a default-features-only job.
+#
+# CARGO_NET_GIT_FETCH_WITH_CLI=true on both jobs: without it, resolving the `ultra-logger` git dependency's exact
+# locked commit on this runner's cold cache fails with "revision ... not found" -- confirmed NOT specific to any
+# one commit (reproduced identically across two different, unrelated LoggingEngine commits) and NOT a GitHub-side
+# repo restriction (the exact same run's tag-based fetch of the public `databaseschema` repo succeeds anonymously
+# moments earlier in the same log). The real cause, visible one line up in the log past the generic wrapper error:
+# `fatal: could not read Username for 'https://github.com': No such device or address` -- Cargo's own built-in
+# libgit2-based fetch path constructs a direct "fetch this exact commit object" request that can trigger an auth
+# challenge GitHub's smart-HTTP negotiation doesn't raise for a normal ref-based (tag/branch) fetch, and a
+# non-interactive CI shell has nowhere to answer that prompt. This is a well-known Cargo/GitHub friction point,
+# not anything specific to this dependency. Setting this makes Cargo shell out to the system `git` binary (the
+# same negotiation a plain `git fetch` already uses successfully elsewhere in this same job) for git-dependency
+# resolution instead of using its own implementation.
 name: core-workspace-ci
 
 on:
@@ -25,6 +38,8 @@ jobs:
   test:
     name: Test (default features)
     runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +49,8 @@ jobs:
   test-python:
     name: Test (python feature)
     runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
