@@ -3,12 +3,14 @@
 #
 # This is a DIFFERENT set of crates from core-ci.yml, which only covers the standalone pure crates (weightsim,
 # reference-rules, weightsim-rules, portfolio-construct, portfolio-eval) that are excluded from this workspace.
-# core-ci.yml's own comment says the main workspace was left out because it "depends on private sibling repos
-# (LoggingEngine) that a hosted runner cannot fetch without a token" -- that was true once, but LoggingEngine has
-# since been open-sourced (confirmed 2026-09-30: `git ls-remote https://github.com/Nwagbara-Group-LLC/LoggingEngine`
-# succeeds anonymously, no credentials needed). The only other git dependency, `databaseschema`, is `optional = true`
-# behind the `postgres` feature and is also public, so it's never fetched by the jobs below either. No secrets or
-# tokens are required for this workflow.
+#
+# `LoggingEngine` (source of the `ultra-logger` dependency) is a private repo. It used to live in a different
+# GitHub org (Nwagbara-Group-LLC) than this one (Mendl-Labs), so the default GITHUB_TOKEN -- scoped only to the
+# repo/org the workflow runs in -- couldn't see it at all, and a PAT was required. As of 2026-09-30 both
+# BacktestingCore and LoggingEngine live in Mendl-Labs, and LoggingEngine has its Actions access policy set to
+# "organization", so the default GITHUB_TOKEN can check it out with no secret needed. The other git dependency,
+# `databaseschema`, is `optional = true` behind the `postgres` feature and is public, so it's never fetched by
+# the jobs below either.
 #
 # Two jobs because ~40% of this workspace's open PRs at the time this was written (feat/etc. touching
 # backtest/src/python_validation.rs, backtest/src/python_simulation.rs, strategy/src/strategies/python_strategy.rs)
@@ -17,19 +19,10 @@
 # Resolving the `ultra-logger` git dependency's exact locked commit on this runner's cold cache fails with
 # "revision ... not found" -- confirmed NOT specific to any one commit (reproduced identically across two
 # different, unrelated LoggingEngine commits) and not a Cargo git-backend choice (`net.git-fetch-with-cli = true`,
-# already set repo-wide in `.cargo/config.toml`, made no difference). A plain anonymous `git clone` of LoggingEngine
-# ALSO fails outright ("could not read Username") -- unlike the sibling public `databaseschema` repo, which clones
-# fine anonymously in the same job. LoggingEngine genuinely requires authenticated access despite being public;
-# `SignalEngine`'s own already-working CI confirms this, checking it out with an explicit PAT
-# (`secrets.PERSONAL_ACCESS_TOKEN`) rather than the default `GITHUB_TOKEN` (which is scoped to this repo/org only
-# and can't see a different org's repos at all, public or not).
-#
-# Both jobs below check out LoggingEngine with that same secret and `[patch]` the git dependency to the local
-# path, bypassing Cargo's own git-fetching for this one crate entirely (which would still hit the cold-cache
-# revision-not-found issue above even with valid credentials, since that's a separate Cargo-side quirk). The patch
-# is written at run time into `.cargo/config.toml`, never committed -- local dev keeps depending on the real
-# git+tag reference. Requires the `PERSONAL_ACCESS_TOKEN` repo secret (read-only Contents access to
-# Nwagbara-Group-LLC/LoggingEngine), added 2026-09-30 to match SignalEngine's.
+# already set repo-wide in `.cargo/config.toml`, made no difference). Both jobs below check out LoggingEngine
+# directly and `[patch]` the git dependency to that local path, bypassing Cargo's own git-fetching for this one
+# crate entirely. The patch is written at run time into `.cargo/config.toml`, never committed -- local dev keeps
+# depending on the real git+tag reference.
 name: core-workspace-ci
 
 on:
@@ -49,12 +42,11 @@ jobs:
       - name: Check out LoggingEngine locally and patch ultra-logger to it
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
-          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          repository: Mendl-Labs/LoggingEngine
           path: logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
-          [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+          [patch."https://github.com/Mendl-Labs/LoggingEngine"]
           ultra-logger = { path = "${{ github.workspace }}/logging-engine-checkout/ultra-logger" }
           EOF
       - run: cargo test --workspace --lib
@@ -69,12 +61,11 @@ jobs:
       - name: Check out LoggingEngine locally and patch ultra-logger to it
         uses: actions/checkout@v4
         with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
-          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          repository: Mendl-Labs/LoggingEngine
           path: logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
-          [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+          [patch."https://github.com/Mendl-Labs/LoggingEngine"]
           ultra-logger = { path = "${{ github.workspace }}/logging-engine-checkout/ultra-logger" }
           EOF
       # Mirrors BacktestingEngine's own ci-cd.yml pattern (Install numpy/pandas for PyO3 tests) -- the verification
