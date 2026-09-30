@@ -1,0 +1,47 @@
+# CI for the MAIN Cargo workspace (backtest, genetic, strategy, metrics, orderbook, dataloader, walkforward,
+# data_prep, derivatives, greeks, signal, smartrouter, portfoliomanager, quant-diagnostics, riskmanager, config).
+#
+# This is a DIFFERENT set of crates from core-ci.yml, which only covers the standalone pure crates (weightsim,
+# reference-rules, weightsim-rules, portfolio-construct, portfolio-eval) that are excluded from this workspace.
+# core-ci.yml's own comment says the main workspace was left out because it "depends on private sibling repos
+# (LoggingEngine) that a hosted runner cannot fetch without a token" -- that was true once, but LoggingEngine has
+# since been open-sourced (confirmed 2026-09-30: `git ls-remote https://github.com/Nwagbara-Group-LLC/LoggingEngine`
+# succeeds anonymously, no credentials needed). The only other git dependency, `databaseschema`, is `optional = true`
+# behind the `postgres` feature and is also public, so it's never fetched by the jobs below either. No secrets or
+# tokens are required for this workflow.
+#
+# Two jobs because ~40% of this workspace's open PRs at the time this was written (feat/etc. touching
+# backtest/src/python_validation.rs, backtest/src/python_simulation.rs, strategy/src/strategies/python_strategy.rs)
+# are gated behind the `python` feature (PyO3) and would get ZERO signal from a default-features-only job.
+name: core-workspace-ci
+
+on:
+  push:
+    branches: [local-dev]
+  pull_request:
+    branches: [local-dev]
+
+jobs:
+  test:
+    name: Test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --lib
+
+  test-python:
+    name: Test (python feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Mirrors BacktestingEngine's own ci-cd.yml pattern (Install numpy/pandas for PyO3 tests) -- the verification
+      # import fails this step loudly instead of letting a broken install surface later as an unrelated failure.
+      - name: Install numpy/pandas for PyO3 tests
+        run: |
+          sudo python3 -m pip install --no-cache-dir --break-system-packages numpy pandas
+          python3 -c "import numpy, pandas" || (echo "::error::numpy/pandas import failed after install" && exit 1)
+      - run: cargo test --workspace --features backtest/python --lib
