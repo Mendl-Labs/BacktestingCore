@@ -439,7 +439,7 @@ dependencies = [
  "smartrouter",
  "strategy",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "uuid",
  "walkforward",
 ]
@@ -981,7 +981,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
 ]
 
 [[package]]
@@ -1013,7 +1013,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-retry",
  "tracing",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.0)",
  "uuid",
  "zeroize",
 ]
@@ -1047,7 +1047,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-retry",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "urlencoding",
  "uuid",
 ]
@@ -1432,7 +1432,7 @@ dependencies = [
  "smallvec",
  "strategy",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "uuid",
 ]
 
@@ -2037,7 +2037,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "uuid",
 ]
 
@@ -2337,7 +2337,7 @@ dependencies = [
  "signal",
  "tokio",
  "tokio-test",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
 ]
 
 [[package]]
@@ -2517,7 +2517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
 ]
 
 [[package]]
@@ -2970,7 +2970,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
 ]
 
 [[package]]
@@ -3361,7 +3361,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "uuid",
 ]
 
@@ -3467,7 +3467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3746,6 +3746,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ultra-logger"
+version = "0.1.0"
+source = "git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1#c34abcf1d7f3fed6ecdf7c1f01346d3d8a91be69"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flume",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3894,7 +3909,7 @@ dependencies = [
  "serde_json",
  "strategy",
  "tokio",
- "ultra-logger",
+ "ultra-logger 0.1.0 (git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.1)",
  "uuid",
 ]
 
