@@ -14,18 +14,21 @@
 # backtest/src/python_validation.rs, backtest/src/python_simulation.rs, strategy/src/strategies/python_strategy.rs)
 # are gated behind the `python` feature (PyO3) and would get ZERO signal from a default-features-only job.
 #
-# CARGO_NET_GIT_FETCH_WITH_CLI=true on both jobs: without it, resolving the `ultra-logger` git dependency's exact
-# locked commit on this runner's cold cache fails with "revision ... not found" -- confirmed NOT specific to any
-# one commit (reproduced identically across two different, unrelated LoggingEngine commits) and NOT a GitHub-side
-# repo restriction (the exact same run's tag-based fetch of the public `databaseschema` repo succeeds anonymously
-# moments earlier in the same log). The real cause, visible one line up in the log past the generic wrapper error:
-# `fatal: could not read Username for 'https://github.com': No such device or address` -- Cargo's own built-in
-# libgit2-based fetch path constructs a direct "fetch this exact commit object" request that can trigger an auth
-# challenge GitHub's smart-HTTP negotiation doesn't raise for a normal ref-based (tag/branch) fetch, and a
-# non-interactive CI shell has nowhere to answer that prompt. This is a well-known Cargo/GitHub friction point,
-# not anything specific to this dependency. Setting this makes Cargo shell out to the system `git` binary (the
-# same negotiation a plain `git fetch` already uses successfully elsewhere in this same job) for git-dependency
-# resolution instead of using its own implementation.
+# Resolving the `ultra-logger` git dependency's exact locked commit on this runner's cold cache fails with
+# "revision ... not found" -- confirmed NOT specific to any one commit (reproduced identically across two
+# different, unrelated LoggingEngine commits) and NOT fixed by `net.git-fetch-with-cli = true` (already set
+# repo-wide in `.cargo/config.toml` for an unrelated reason -- confirmed via the failing run's own log that Cargo
+# issues the exact same low-level `git fetch ... +SHA:refs/commit/SHA` request either way; this is inherent to how
+# Cargo resolves an exact locked commit for a git+tag dependency, not a choice between its two git backends). The
+# underlying error, one line above the generic wrapper: `fatal: could not read Username for 'https://github.com':
+# No such device or address` -- an auth challenge with nowhere to answer it in a non-interactive shell, for a
+# request shape (fetch one specific non-tip-guaranteed commit object) that a normal ref-based fetch never
+# triggers (the same job's plain tag-based checkout of the public `databaseschema` repo works fine).
+#
+# Rather than keep fighting that fetch, both jobs below check out LoggingEngine as an ordinary directory (the same
+# `actions/checkout` most of this workflow already uses, no special negotiation) and `[patch]` the git dependency
+# to that local path, bypassing Cargo's git-fetching for this one crate entirely. The patch is written at run time
+# into `.cargo/config.toml`, never committed -- local dev keeps depending on the real git+tag reference.
 name: core-workspace-ci
 
 on:
@@ -38,23 +41,39 @@ jobs:
   test:
     name: Test (default features)
     runs-on: ubuntu-latest
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Check out LoggingEngine locally and patch ultra-logger to it
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          path: logging-engine-checkout
+      - run: |
+          cat >> .cargo/config.toml <<EOF
+          [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+          ultra-logger = { path = "${{ github.workspace }}/logging-engine-checkout/ultra-logger" }
+          EOF
       - run: cargo test --workspace --lib
 
   test-python:
     name: Test (python feature)
     runs-on: ubuntu-latest
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Check out LoggingEngine locally and patch ultra-logger to it
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          path: logging-engine-checkout
+      - run: |
+          cat >> .cargo/config.toml <<EOF
+          [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
+          ultra-logger = { path = "${{ github.workspace }}/logging-engine-checkout/ultra-logger" }
+          EOF
       # Mirrors BacktestingEngine's own ci-cd.yml pattern (Install numpy/pandas for PyO3 tests) -- the verification
       # import fails this step loudly instead of letting a broken install surface later as an unrelated failure.
       - name: Install numpy/pandas for PyO3 tests
