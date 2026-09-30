@@ -3467,7 +3467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3733,7 +3733,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "ultra-logger"
 version = "0.1.0"
-source = "git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.0#1d1af4e5c82f0442e8a28095308761a4c3c46167"
+source = "git+https://github.com/Nwagbara-Group-LLC/LoggingEngine?tag=v0.1.0#c34abcf1d7f3fed6ecdf7c1f01346d3d8a91be69"
 dependencies = [
  "async-trait",
  "chrono",
