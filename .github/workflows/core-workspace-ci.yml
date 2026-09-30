@@ -45,11 +45,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `token: ''` forces an anonymous clone. Without it, actions/checkout authenticates with THIS repo's
+      # GITHUB_TOKEN even for a cross-org checkout -- that token has no visibility into Nwagbara-Group-LLC's repos
+      # (a different org than Mendl-Labs), so the API call to resolve LoggingEngine's default branch 404s
+      # ("Not Found") before any clone is attempted. LoggingEngine is public and needs no auth at all.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
         uses: actions/checkout@v4
         with:
           repository: Nwagbara-Group-LLC/LoggingEngine
           path: logging-engine-checkout
+          token: ''
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
@@ -64,11 +69,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `token: ''` forces an anonymous clone. Without it, actions/checkout authenticates with THIS repo's
+      # GITHUB_TOKEN even for a cross-org checkout -- that token has no visibility into Nwagbara-Group-LLC's repos
+      # (a different org than Mendl-Labs), so the API call to resolve LoggingEngine's default branch 404s
+      # ("Not Found") before any clone is attempted. LoggingEngine is public and needs no auth at all.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
         uses: actions/checkout@v4
         with:
           repository: Nwagbara-Group-LLC/LoggingEngine
           path: logging-engine-checkout
+          token: ''
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
