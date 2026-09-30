@@ -45,19 +45,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `ref: main` skips actions/checkout's own default-branch auto-detection, which is what actually 404s here:
-      # that step calls the GitHub API authenticated with THIS repo's GITHUB_TOKEN even for a cross-org checkout,
-      # and that token has no visibility into Nwagbara-Group-LLC's repos (a different org than Mendl-Labs).
-      # (`token: ''` looked like the fix but actions/checkout v4 rejects an empty string as "Input required and
-      # not supplied" -- it wants the input omitted entirely, and omitting it re-triggers the same default-token
-      # auto-detection call this is trying to avoid). With the ref given explicitly, checkout goes straight to
-      # cloning that ref via plain git, which needs no auth at all for a public repo.
+      # Not actions/checkout: it authenticates every git operation against github.com with THIS repo's
+      # GITHUB_TOKEN, including a cross-org checkout of a totally different repo. That's not just unnecessary for
+      # a public repo, it's actively harmful -- GitHub responds "Repository not found" to a `git fetch` carrying
+      # credentials that don't have access to the target repo, rather than falling back to anonymous public
+      # access (confirmed live: `ref: main`, the previous fix, correctly skipped checkout's own default-branch
+      # API lookup, but the git fetch itself still carried that header and still got "Repository not found").
+      # actions/checkout has no input that suppresses the header entirely (`token: ''` is rejected outright as
+      # "Input required and not supplied"). A plain `git clone` with an explicit blank override for that one
+      # header sidesteps the whole thing.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        uses: actions/checkout@v4
-        with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
-          ref: main
-          path: logging-engine-checkout
+        run: git clone -c http.https://github.com/.extraheader= --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
@@ -72,19 +70,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `ref: main` skips actions/checkout's own default-branch auto-detection, which is what actually 404s here:
-      # that step calls the GitHub API authenticated with THIS repo's GITHUB_TOKEN even for a cross-org checkout,
-      # and that token has no visibility into Nwagbara-Group-LLC's repos (a different org than Mendl-Labs).
-      # (`token: ''` looked like the fix but actions/checkout v4 rejects an empty string as "Input required and
-      # not supplied" -- it wants the input omitted entirely, and omitting it re-triggers the same default-token
-      # auto-detection call this is trying to avoid). With the ref given explicitly, checkout goes straight to
-      # cloning that ref via plain git, which needs no auth at all for a public repo.
+      # Not actions/checkout: it authenticates every git operation against github.com with THIS repo's
+      # GITHUB_TOKEN, including a cross-org checkout of a totally different repo. That's not just unnecessary for
+      # a public repo, it's actively harmful -- GitHub responds "Repository not found" to a `git fetch` carrying
+      # credentials that don't have access to the target repo, rather than falling back to anonymous public
+      # access (confirmed live: `ref: main`, the previous fix, correctly skipped checkout's own default-branch
+      # API lookup, but the git fetch itself still carried that header and still got "Repository not found").
+      # actions/checkout has no input that suppresses the header entirely (`token: ''` is rejected outright as
+      # "Input required and not supplied"). A plain `git clone` with an explicit blank override for that one
+      # header sidesteps the whole thing.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        uses: actions/checkout@v4
-        with:
-          repository: Nwagbara-Group-LLC/LoggingEngine
-          ref: main
-          path: logging-engine-checkout
+        run: git clone -c http.https://github.com/.extraheader= --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
