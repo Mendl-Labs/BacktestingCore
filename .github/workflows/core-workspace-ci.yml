@@ -25,10 +25,20 @@
 # request shape (fetch one specific non-tip-guaranteed commit object) that a normal ref-based fetch never
 # triggers (the same job's plain tag-based checkout of the public `databaseschema` repo works fine).
 #
-# Rather than keep fighting that fetch, both jobs below check out LoggingEngine as an ordinary directory (the same
-# `actions/checkout` most of this workflow already uses, no special negotiation) and `[patch]` the git dependency
-# to that local path, bypassing Cargo's git-fetching for this one crate entirely. The patch is written at run time
-# into `.cargo/config.toml`, never committed -- local dev keeps depending on the real git+tag reference.
+# Rather than keep fighting that fetch, both jobs below check out LoggingEngine as an ordinary directory and
+# `[patch]` the git dependency to that local path, bypassing Cargo's git-fetching for this one crate entirely. The
+# patch is written at run time into `.cargo/config.toml`, never committed -- local dev keeps depending on the
+# real git+tag reference.
+#
+# The main `actions/checkout@v4` below now sets `persist-credentials: false`: without it, that step writes THIS
+# repo's GITHUB_TOKEN into a github.com-wide git config entry (`http.https://github.com/.extraheader`), and that
+# entry then attaches to EVERY later git operation touching any github.com URL in this job -- including the
+# LoggingEngine clone, a completely different, unrelated repo. GitHub responds "Repository not found" to a fetch
+# carrying credentials that don't have access to the target repo, rather than falling back to anonymous public
+# access (confirmed live). Overriding the header to empty for just the clone command
+# (`-c http.https://github.com/.extraheader=`) was tried and made it worse: an explicitly empty header value isn't
+# the same as no header, and produced a fresh "could not read Username" auth prompt instead. Not persisting the
+# credential in the first place means there is nothing to override or inherit.
 name: core-workspace-ci
 
 on:
@@ -43,19 +53,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Not actions/checkout: it authenticates every git operation against github.com with THIS repo's
-      # GITHUB_TOKEN, including a cross-org checkout of a totally different repo. That's not just unnecessary for
-      # a public repo, it's actively harmful -- GitHub responds "Repository not found" to a `git fetch` carrying
-      # credentials that don't have access to the target repo, rather than falling back to anonymous public
-      # access (confirmed live: `ref: main`, the previous fix, correctly skipped checkout's own default-branch
-      # API lookup, but the git fetch itself still carried that header and still got "Repository not found").
-      # actions/checkout has no input that suppresses the header entirely (`token: ''` is rejected outright as
-      # "Input required and not supplied"). A plain `git clone` with an explicit blank override for that one
-      # header sidesteps the whole thing.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        run: git clone -c http.https://github.com/.extraheader= --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
+        run: git clone --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
@@ -68,19 +71,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Not actions/checkout: it authenticates every git operation against github.com with THIS repo's
-      # GITHUB_TOKEN, including a cross-org checkout of a totally different repo. That's not just unnecessary for
-      # a public repo, it's actively harmful -- GitHub responds "Repository not found" to a `git fetch` carrying
-      # credentials that don't have access to the target repo, rather than falling back to anonymous public
-      # access (confirmed live: `ref: main`, the previous fix, correctly skipped checkout's own default-branch
-      # API lookup, but the git fetch itself still carried that header and still got "Repository not found").
-      # actions/checkout has no input that suppresses the header entirely (`token: ''` is rejected outright as
-      # "Input required and not supplied"). A plain `git clone` with an explicit blank override for that one
-      # header sidesteps the whole thing.
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        run: git clone -c http.https://github.com/.extraheader= --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
+        run: git clone --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
