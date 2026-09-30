@@ -16,29 +16,20 @@
 #
 # Resolving the `ultra-logger` git dependency's exact locked commit on this runner's cold cache fails with
 # "revision ... not found" -- confirmed NOT specific to any one commit (reproduced identically across two
-# different, unrelated LoggingEngine commits) and NOT fixed by `net.git-fetch-with-cli = true` (already set
-# repo-wide in `.cargo/config.toml` for an unrelated reason -- confirmed via the failing run's own log that Cargo
-# issues the exact same low-level `git fetch ... +SHA:refs/commit/SHA` request either way; this is inherent to how
-# Cargo resolves an exact locked commit for a git+tag dependency, not a choice between its two git backends). The
-# underlying error, one line above the generic wrapper: `fatal: could not read Username for 'https://github.com':
-# No such device or address` -- an auth challenge with nowhere to answer it in a non-interactive shell, for a
-# request shape (fetch one specific non-tip-guaranteed commit object) that a normal ref-based fetch never
-# triggers (the same job's plain tag-based checkout of the public `databaseschema` repo works fine).
+# different, unrelated LoggingEngine commits) and not a Cargo git-backend choice (`net.git-fetch-with-cli = true`,
+# already set repo-wide in `.cargo/config.toml`, made no difference). A plain anonymous `git clone` of LoggingEngine
+# ALSO fails outright ("could not read Username") -- unlike the sibling public `databaseschema` repo, which clones
+# fine anonymously in the same job. LoggingEngine genuinely requires authenticated access despite being public;
+# `SignalEngine`'s own already-working CI confirms this, checking it out with an explicit PAT
+# (`secrets.PERSONAL_ACCESS_TOKEN`) rather than the default `GITHUB_TOKEN` (which is scoped to this repo/org only
+# and can't see a different org's repos at all, public or not).
 #
-# Rather than keep fighting that fetch, both jobs below check out LoggingEngine as an ordinary directory and
-# `[patch]` the git dependency to that local path, bypassing Cargo's git-fetching for this one crate entirely. The
-# patch is written at run time into `.cargo/config.toml`, never committed -- local dev keeps depending on the
-# real git+tag reference.
-#
-# The main `actions/checkout@v4` below now sets `persist-credentials: false`: without it, that step writes THIS
-# repo's GITHUB_TOKEN into a github.com-wide git config entry (`http.https://github.com/.extraheader`), and that
-# entry then attaches to EVERY later git operation touching any github.com URL in this job -- including the
-# LoggingEngine clone, a completely different, unrelated repo. GitHub responds "Repository not found" to a fetch
-# carrying credentials that don't have access to the target repo, rather than falling back to anonymous public
-# access (confirmed live). Overriding the header to empty for just the clone command
-# (`-c http.https://github.com/.extraheader=`) was tried and made it worse: an explicitly empty header value isn't
-# the same as no header, and produced a fresh "could not read Username" auth prompt instead. Not persisting the
-# credential in the first place means there is nothing to override or inherit.
+# Both jobs below check out LoggingEngine with that same secret and `[patch]` the git dependency to the local
+# path, bypassing Cargo's own git-fetching for this one crate entirely (which would still hit the cold-cache
+# revision-not-found issue above even with valid credentials, since that's a separate Cargo-side quirk). The patch
+# is written at run time into `.cargo/config.toml`, never committed -- local dev keeps depending on the real
+# git+tag reference. Requires the `PERSONAL_ACCESS_TOKEN` repo secret (read-only Contents access to
+# Nwagbara-Group-LLC/LoggingEngine), added 2026-09-30 to match SignalEngine's.
 name: core-workspace-ci
 
 on:
@@ -53,12 +44,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        run: git clone --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
@@ -71,12 +64,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check out LoggingEngine locally and patch ultra-logger to it
-        run: git clone --depth=1 https://github.com/Nwagbara-Group-LLC/LoggingEngine logging-engine-checkout
+        uses: actions/checkout@v4
+        with:
+          repository: Nwagbara-Group-LLC/LoggingEngine
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: logging-engine-checkout
       - run: |
           cat >> .cargo/config.toml <<EOF
           [patch."https://github.com/Nwagbara-Group-LLC/LoggingEngine"]
