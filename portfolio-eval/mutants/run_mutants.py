@@ -25,9 +25,15 @@ ROOT = os.path.dirname(CRATE)
 # (id, description, file relative to the crate, old text (exactly once), new text)
 MUTANTS = [
     # ---- folds: purge / embargo
+    # walk_forward_folds and walk_forward_folds_stratified (#46) independently compute this same
+    # train_end expression -- "old text occurs 2x" once both exist in the file, so each gets its own
+    # mutant with enough surrounding context to target just its own function.
     ("M01", "walk-forward purge off by one (train ends one bar too late)", "src/folds.rs",
-     "let train_end = test_start - purge;",
-     "let train_end = test_start - purge + 1;"),
+     "let test_end = test_start + test_len;\n        let train_end = test_start - purge;",
+     "let test_end = test_start + test_len;\n        let train_end = test_start - purge + 1;"),
+    ("M01b", "regime-stratified walk-forward purge off by one (train ends one bar too late)", "src/folds.rs",
+     "let test_start = test_end - test_len;\n        let train_end = test_start - purge;",
+     "let test_start = test_end - test_len;\n        let train_end = test_start - purge + 1;"),
     ("M02", "K-fold/CPCV purge off by one (one purge bar too few before a test range)", "src/folds.rs",
      "r.start.saturating_sub(purge)..",
      "r.start.saturating_sub(purge.saturating_sub(1)).."),
