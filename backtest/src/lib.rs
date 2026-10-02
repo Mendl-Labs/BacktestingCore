@@ -48,6 +48,7 @@ pub mod fast_signal_eval;
 pub mod pair_simulation;
 pub mod basket_simulation;
 pub mod cross_sectional_simulation;
+pub mod per_bar_weights;
 
 // Python strategy simulation (requires python feature)
 #[cfg(feature = "python")]
@@ -55,7 +56,7 @@ pub mod python_simulation;
 pub mod python_validation;
 
 // Re-export commonly used types at crate root
-pub use types::{BacktestResult, BacktestEvent, MarketDataInput};
+pub use types::{BacktestResult, BacktestEvent, MarketDataInput, PerBarWeights};
 pub use engine::{BacktestEngine, BacktestResults, WalkForwardSummary, AnalysisMetadata, ProgressCallback};
 pub use html_export::HtmlExporter;
 pub use simulation::SimulationLoop;

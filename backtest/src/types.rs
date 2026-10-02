@@ -216,6 +216,22 @@ pub enum BacktestEvent {
     // Add more event types as needed
 }
 
+/// Per-bar signed held weights per instrument (gap-closure plan W3.5), produced only when
+/// `AnalysisConfig::export_per_bar_weights` is on. One row per equity-curve sample point; see
+/// [`crate::per_bar_weights`] for the exact definition of a cell.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PerBarWeights {
+    /// Instrument symbols, in column order of `rows`. The run's data symbol is always the first column (even if
+    /// nothing ever traded); further instruments (option legs) are appended when they first appear and their
+    /// earlier rows are `0.0`.
+    pub symbols: Vec<String>,
+    /// Unix milliseconds of each sampled bar, parallel to `rows` and identical to `equity_curve_timestamps`.
+    pub timestamps: Vec<i64>,
+    /// `rows[bar][column]`: signed held weight at the CLOSE of that bar, after that bar's fills, as a fraction of
+    /// the equity the equity curve records at the same point. Long positive, short negative, flat `0.0`.
+    pub rows: Vec<Vec<f64>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BacktestResult {
     pub total_pnl: f64,
@@ -301,6 +317,13 @@ pub struct BacktestResult {
     /// Cleared before serialization (not included in API response).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub price_series: Vec<f64>,
+    /// Opt-in (`AnalysisConfig::export_per_bar_weights`): the signed held
+    /// weight of every instrument at the close of each sampled bar, for the
+    /// replication ladder's Tier III (gap-closure plan W3.5). `None` unless
+    /// the option is on, and then not serialised, so no existing output
+    /// changes. Exact semantics: [`crate::per_bar_weights`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_bar_weights: Option<PerBarWeights>,
     /// Counts of BUY/SELL/HOLD/CLOSE signals emitted by compute_signals().
     /// None when the per-tick fallback path was used instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -886,6 +909,28 @@ mod tests {
         assert_eq!(deser.num_trades, 50);
         assert_eq!(deser.sharpe_ratio, Some(1.5));
         assert_eq!(deser.equity_curve.len(), 3);
+    }
+
+    #[test]
+    fn test_backtest_result_per_bar_weights_absent_unless_exported() {
+        // Off (the default): the field is `None`, never appears in the JSON, and a JSON without it reads back.
+        let result = BacktestResult::default();
+        assert!(result.per_bar_weights.is_none());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("per_bar_weights"));
+        let back: BacktestResult = serde_json::from_str(&json).unwrap();
+        assert!(back.per_bar_weights.is_none());
+        // On: it round-trips exactly.
+        let mut result = BacktestResult::default();
+        result.per_bar_weights = Some(PerBarWeights {
+            symbols: vec!["BTC/USD".into()],
+            timestamps: vec![1_700_000_000_000, 1_700_000_060_000],
+            rows: vec![vec![0.0], vec![1.0]],
+        });
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("per_bar_weights"));
+        let back: BacktestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.per_bar_weights, result.per_bar_weights);
     }
 
     #[test]

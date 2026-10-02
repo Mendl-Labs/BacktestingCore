@@ -2320,6 +2320,14 @@ pub struct AnalysisConfig {
     pub validation_min_trades: u64,
     /// GA seeding configuration for strategy optimization
     pub ga_seed_params: Option<GASeedParams>,
+    /// Export the per-bar signed held weight of every instrument on the
+    /// result (`backtest::BacktestResult::per_bar_weights`), sampled at the
+    /// equity curve's own sample points. Gap-closure plan W3.5: this is the
+    /// series the replication ladder's Tier III (`weightsim_rules::ladder`)
+    /// needs from the general engine. `false` (the default) is byte-for-byte
+    /// the pre-existing result: the field stays `None` and is not serialised.
+    #[serde(default)]
+    pub export_per_bar_weights: bool,
 }
 
 /// Baseline parameters to seed genetic algorithm population
@@ -2379,6 +2387,7 @@ impl Default for AnalysisConfig {
                 window_ms: 60_000,              // 1 minute
                 min_quote_lifetime_ms: 200,     // 200ms
             }),
+            export_per_bar_weights: false,
         }
     }
 }

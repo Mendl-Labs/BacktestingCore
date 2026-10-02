@@ -25,7 +25,8 @@ use strategy::traits::{
 use strategy::Strategy; // trait import — required for .initialize() / .generate_signals()
 use strategy::executor::{self, StrategyExecutor, ExecutionTier};
 
-use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel};
+use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel, PerBarWeights};
+use crate::per_bar_weights::PerBarWeightTracker;
 use crate::python_validation::OptionSpreadLeg;
 use crate::rolling_window::RollingWindow;
 use genetic::adaptive_sampling::StableRegionDetector;
@@ -460,6 +461,14 @@ async fn run_with_input(
         1
     };
     let equity_capacity = (input.len() / equity_sample_interval) + 100;
+
+    // W3.5: opt-in per-bar held weights, sampled at exactly the equity curve's sample points
+    // (see `crate::per_bar_weights`). `None` (the default) leaves the result untouched.
+    let mut per_bar_weights: Option<PerBarWeightTracker> = if config.backtest_config.analysis.export_per_bar_weights {
+        Some(PerBarWeightTracker::new(input_symbol(&input), equity_capacity))
+    } else {
+        None
+    };
 
     // Tracking state
     let mut equity_curve: Vec<f64> = Vec::with_capacity(equity_capacity);
@@ -1117,6 +1126,9 @@ async fn run_with_input(
                 let eq = portfolio.equity_at(current_price);
                 equity_curve.push(eq);
                 equity_curve_timestamps.push(timestamp.timestamp_millis());
+                if let Some(t) = per_bar_weights.as_mut() {
+                    t.sample(&portfolio, current_price, eq, timestamp.timestamp_millis());
+                }
             }
             continue;
         }
@@ -1588,6 +1600,9 @@ async fn run_with_input(
         if tick_idx % equity_sample_interval == 0 || tick_idx == total_ticks - 1 {
             equity_curve.push(total_value);
             equity_curve_timestamps.push(timestamp.timestamp_millis());
+            if let Some(t) = per_bar_weights.as_mut() {
+                t.sample(&portfolio, current_price, total_value, timestamp.timestamp_millis());
+            }
         }
 
         // -- Progress callback --
@@ -1668,6 +1683,7 @@ async fn run_with_input(
             volume_constrained_fills,
             config.option_instrument.as_ref(),
             config.option_spread.as_deref(),
+            per_bar_weights.map(PerBarWeightTracker::finish),
         ),
         total_commission,
         pending_limits_at_end: pending_limits.len(),
@@ -2728,6 +2744,7 @@ fn build_backtest_result(
     volume_constrained_fills: usize,
     option_instrument: Option<&DerivativeMetadata>,
     option_spread: Option<&[OptionSpreadLeg]>,
+    per_bar_weights: Option<PerBarWeights>,
 ) -> BacktestResult {
     // Use actual round-trip percentage returns from trade_log instead of per-fill
     // pseudo-returns in trade_returns (which are just cash flow proportions, not real P&L).
@@ -3047,7 +3064,21 @@ fn build_backtest_result(
             None
         },
         option_summary: build_option_summary(option_instrument, option_spread, portfolio),
+        per_bar_weights,
         ..Default::default()
+    }
+}
+
+/// The run's data symbol (column 0 of the per-bar weight export): the sim-ticks symbol, or the first candle's or
+/// trade's symbol of a slice. `None` when the slice carries no symbol at all.
+fn input_symbol(input: &MarketDataInput<'_>) -> Option<String> {
+    match input {
+        MarketDataInput::SimTicks { symbol, .. } => Some(symbol.to_string()),
+        MarketDataInput::Slice(s) => s.iter().find_map(|d| match d {
+            MarketData::Candle(c) => Some(c.symbol.to_string()),
+            MarketData::Trade(t) => Some(t.symbol.to_string()),
+            _ => None,
+        }),
     }
 }
 
