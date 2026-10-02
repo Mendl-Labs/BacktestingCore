@@ -61,7 +61,8 @@ impl CostModel {
         CostModel {
             id,
             slippage_bps: self.slippage_bps + extra_slippage_bps,
-            source_note: "live-realistic layer: the base preset plus the pre-registered slippage (weightsim::preregistered)",
+            source_note:
+                "live-realistic layer: the base preset plus the pre-registered slippage (weightsim::preregistered)",
             ..*self
         }
     }
