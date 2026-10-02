@@ -18,6 +18,7 @@ use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS};
 use weightsim::{sha256_hex, Date, Panel, PriceSource};
 
 use super::json::{self, Json};
+use super::registry::{PanelSpec, SleeveFixture};
 
 /// sha256 of `MANIFEST.json` as recorded in `ANCHOR.json` and Amendment 11.
 pub const REAL_MANIFEST_SHA256: &str = "d51444c33fc2630e12315e936f79580e13dca834ca0fdbc40a242ef496bd6d90";
@@ -152,6 +153,37 @@ pub struct Fixtures {
     pub shadow_s1: Vec<(Date, f64)>,
     pub shadow_s3: Vec<(Date, f64)>,
     pub expected_mutants: Vec<ExpectedMutant>,
+}
+
+impl Fixtures {
+    /// The pinned panel of a universe.
+    pub fn panel(&self, spec: PanelSpec) -> &Panel {
+        match spec {
+            PanelSpec::Etf => &self.etf_panel,
+            PanelSpec::Crypto => &self.crypto_panel,
+        }
+    }
+
+    /// Everything this set holds for one answer-key sleeve, by its code (`S1`, `S3`), or `None` for a code the set
+    /// does not carry. This is the one place that knows which field is which sleeve; the registry
+    /// (`ladder::registry`) addresses sleeves by code only.
+    pub fn sleeve(&self, code: &str) -> Option<SleeveFixture<'_>> {
+        match code {
+            "S1" => Some(SleeveFixture {
+                panel: &self.etf_panel,
+                key: &self.s1,
+                recorded: &self.recorded_s1,
+                shadow: &self.shadow_s1,
+            }),
+            "S3" => Some(SleeveFixture {
+                panel: &self.crypto_panel,
+                key: &self.s3,
+                recorded: &self.recorded_s3,
+                shadow: &self.shadow_s3,
+            }),
+            _ => None,
+        }
+    }
 }
 
 type Reader<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, String>;

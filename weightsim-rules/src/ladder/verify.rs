@@ -40,10 +40,11 @@ pub use weightsim::{ColumnsError, SeriesColumns};
 
 use super::checks::{compare, CAUGHT_TIER1, CAUGHT_TIER2, CAUGHT_TIER3};
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
-use super::mutants::{run_mutant, Mutant, MutantSleeve};
+use super::mutants::{run_mutant, MutantSleeve};
+use super::registry::{RegisteredRule, Registry, RegistryError, LIBRARY_RULES};
 use super::runner::{entry_date, flips_by_key_convention, key_rows_for_mutants, rows_from_sim, sleeve_config, Basis};
 use super::{basis_report, mismatches_with_expected, BasisReport};
-use crate::adapters::{CryptoTrendRule, EtfTrendRule, FlatUntil};
+use crate::adapters::FlatUntil;
 
 /// The cost preset of the net run of a replication unless the request names another: the certification's flat 10 bps
 /// per side (the answer key's own cost model).
@@ -56,8 +57,9 @@ pub const GROSS_COST_MODEL_ID: &str = CostModel::ZERO.id;
 /// not specified across platforms; every other claimed number must match bit for bit.
 pub const CLAIMED_CAGR_TOL: f64 = 1e-12;
 
-/// The library rules this module can replicate, by id.
-pub const LIBRARY_RULE_IDS: [&str; 2] = ["etf_trend_faber", "crypto_trend_100d"];
+/// The library rules this module can replicate, by id: a derived view of the registry table (`ladder::registry`),
+/// in table order.
+pub const LIBRARY_RULE_IDS: [&str; 2] = [LIBRARY_RULES[0].id, LIBRARY_RULES[1].id];
 
 // ------------------------------------------------------------------------------------------------------ rule facts
 
@@ -74,10 +76,11 @@ pub struct RuleFacts {
     pub min_history_bars: usize,
 }
 
-fn facts_of<R: WeightRule>(rule: &R, sleeve_code: &'static str) -> RuleFacts {
+fn facts_of(entry: &RegisteredRule) -> RuleFacts {
+    let rule = (entry.factory)();
     RuleFacts {
         id: rule.id(),
-        sleeve_code,
+        sleeve_code: entry.key.sleeve_code,
         universe: rule.universe().to_vec(),
         declared_parameters: rule.declared_parameters(),
         decision_schedule: rule.decision_schedule(),
@@ -86,15 +89,9 @@ fn facts_of<R: WeightRule>(rule: &R, sleeve_code: &'static str) -> RuleFacts {
     }
 }
 
-/// The facts of a library rule, or `None` for an id this crate does not implement.
+/// The facts of a library rule, or `None` for an id the registry does not carry.
 pub fn rule_facts(rule_id: &str) -> Option<RuleFacts> {
-    if rule_id == EtfTrendRule.id() {
-        Some(facts_of(&EtfTrendRule, "S1"))
-    } else if rule_id == CryptoTrendRule.id() {
-        Some(facts_of(&CryptoTrendRule, "S3"))
-    } else {
-        None
-    }
+    Registry::library().get(rule_id).ok().map(facts_of)
 }
 
 /// A library rule wired to its panel and key on a fixture set.
@@ -105,27 +102,26 @@ struct Prepared<'a> {
     sleeve: MutantSleeve,
 }
 
-fn library_rule<'a>(fx: &'a Fixtures, rule_id: &str) -> Result<Prepared<'a>, ReplicateError> {
-    // Each sleeve starts flat at the bar before its window (the key ledger's convention, see `FlatUntil`).
-    if rule_id == EtfTrendRule.id() {
-        let entry = entry_date(&fx.etf_panel, &fx.s1)?;
-        Ok(Prepared {
-            rule: Box::new(FlatUntil::new(EtfTrendRule, entry)),
-            panel: &fx.etf_panel,
-            key: &fx.s1,
-            sleeve: MutantSleeve::S1,
-        })
-    } else if rule_id == CryptoTrendRule.id() {
-        let entry = entry_date(&fx.crypto_panel, &fx.s3)?;
-        Ok(Prepared {
-            rule: Box::new(FlatUntil::new(CryptoTrendRule, entry)),
-            panel: &fx.crypto_panel,
-            key: &fx.s3,
-            sleeve: MutantSleeve::S3,
-        })
-    } else {
-        Err(ReplicateError::UnknownRule { rule_id: rule_id.to_string() })
+impl From<RegistryError> for ReplicateError {
+    fn from(e: RegistryError) -> Self {
+        match e {
+            RegistryError::UnknownRule { rule_id } => ReplicateError::UnknownRule { rule_id },
+            other => ReplicateError::Ladder(LadderError::Inconsistent(other.to_string())),
+        }
     }
+}
+
+fn library_rule<'a>(fx: &'a Fixtures, rule_id: &str) -> Result<Prepared<'a>, ReplicateError> {
+    let entry = Registry::library().get(rule_id)?;
+    let sf = entry.fixture(fx)?;
+    // Each sleeve starts flat at the bar before its window (the key ledger's convention, see `FlatUntil`).
+    let first_trade = entry_date(sf.panel, sf.key)?;
+    Ok(Prepared {
+        rule: Box::new(FlatUntil::new((entry.factory)(), first_trade)),
+        panel: sf.panel,
+        key: sf.key,
+        sleeve: entry.sleeve()?,
+    })
 }
 
 // --------------------------------------------------------------------------------------------------------- summary
@@ -578,15 +574,10 @@ impl Tier4Report {
 
 /// Run the named mutants of one sleeve against the fixtures' key (Tier IV). Pure and deterministic.
 pub fn tier4(fx: &Fixtures, sleeve: MutantSleeve) -> Result<Tier4Report, LadderError> {
-    let key = match sleeve {
-        MutantSleeve::S1 => &fx.s1,
-        MutantSleeve::S3 => &fx.s3,
-    };
+    let entry = Registry::library().by_sleeve(sleeve).map_err(|e| LadderError::Inconsistent(e.to_string()))?;
+    let key = entry.fixture(fx)?.key;
     let mut mutants = Vec::new();
-    for m in Mutant::ALL {
-        if m.sleeve() != sleeve {
-            continue;
-        }
+    for &m in entry.mutants {
         let run = run_mutant(fx, m)?;
         let cmp = compare(&key_rows_for_mutants(key), &run.rows)?;
         let caught_by = cmp.failed_tiers();

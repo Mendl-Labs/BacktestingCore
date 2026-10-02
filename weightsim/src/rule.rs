@@ -109,5 +109,35 @@ pub trait WeightRule: Send + Sync {
     fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal>;
 }
 
+/// A boxed rule is a rule: every method forwards to the inner one, so a `Box<dyn WeightRule>` (what a rule registry
+/// hands out) can be wrapped, scheduled and simulated exactly like the concrete rule it holds. Nothing in the
+/// simulation path changes: the forwarding is the only thing this impl does.
+impl<R: WeightRule + ?Sized> WeightRule for Box<R> {
+    fn id(&self) -> &'static str {
+        (**self).id()
+    }
+    fn impl_version(&self) -> String {
+        (**self).impl_version()
+    }
+    fn universe(&self) -> &[&'static str] {
+        (**self).universe()
+    }
+    fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
+        (**self).declared_parameters()
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        (**self).decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        (**self).rebalance_policy()
+    }
+    fn min_history_bars(&self) -> usize {
+        (**self).min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        (**self).target_weights(h)
+    }
+}
+
 /// The name used by the task text; identical to [`WeightRule`].
 pub use self::WeightRule as Rule;
