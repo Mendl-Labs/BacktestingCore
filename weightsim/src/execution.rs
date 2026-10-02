@@ -14,7 +14,6 @@
 //! carries the `+live_realistic` suffix ([`crate::CostModel::with_live_slippage`]), and `CostModel::by_id` does not
 //! resolve such an id, so a verifier can never mistake the one for the other.
 
-use crate::costs::CostModel;
 use crate::sim::{SimConfig, SimError};
 use std::fmt;
 
@@ -116,7 +115,7 @@ impl fmt::Display for ExecutionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::costs::Financing;
+    use crate::costs::{CostModel, Financing};
     use crate::rule::OnRefusal;
 
     #[test]
