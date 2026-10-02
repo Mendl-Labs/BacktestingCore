@@ -1778,7 +1778,7 @@ fn extract_price_volume_ts(data: &MarketData) -> (f64, f64, DateTime<Utc>) {
 /// real candle (trades / generic ticks without OHLC columns) the bar
 /// degenerates to the tick price — open=high=low=close=price — so close-bar
 /// behavior is preserved while candle datasets surface true OHLC.
-fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
+pub(crate) fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
     match data {
         MarketData::Trade(t) => (
             t.price, t.price, t.price, t.price,
