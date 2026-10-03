@@ -57,6 +57,13 @@ smartrouter = { path = "../smartrouter" }
 # verification infra, slice A3: `backtest` is only a CALLER of
 # `portfolio_eval::folds` here, never a modifier of it.
 portfolio-eval = { path = "../portfolio-eval" }
+# Same pattern as `portfolio-eval` above: excluded from the workspace (root Cargo.toml `exclude`) so a hosted
+# runner never has to resolve this crate's own `[workspace]`, but still consumable as an ordinary path dependency.
+# W3.2 (gap-closure plan): `backtest` is only a CALLER of `weightsim_rules::ladder::checks::SeriesRows` and
+# `weightsim::Date` here (`ladder_bridge`), never a modifier of either; neither depends back on `backtest`, so this
+# creates no cycle.
+weightsim = { path = "../weightsim" }
+weightsim-rules = { path = "../weightsim-rules" }
 databaseschema = { git = "https://github.com/Mendl-Labs/databaseschema", tag = "v0.1.1", optional = true }
 quant-diagnostics = { path = "../quant-diagnostics" }
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
