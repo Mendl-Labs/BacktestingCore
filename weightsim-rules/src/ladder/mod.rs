@@ -18,6 +18,7 @@ pub mod fixtures;
 pub mod json;
 pub mod live;
 pub mod mutants;
+pub mod registry;
 pub mod runner;
 pub mod verify;
 
@@ -34,13 +35,14 @@ pub use live::{
     LiveRealisticError, LiveRealisticRun, CERTIFIED_LAYER, LIVE_REALISTIC_LAYER,
 };
 pub use mutants::Mutant;
+pub use registry::{Canary, KeyRef, PanelSpec, RegisteredRule, Registry, RegistryError, SleeveFixture, LIBRARY_RULES};
 pub use verify::{
     analyze_columns, replicate, replicate_with, rule_facts, verify, verify_with, Claims, ReplicateError,
     ReplicationConfig, ReplicationRun, RuleFacts, RunSummary, SeriesColumns, VerifiedRun, VerifyError, VerifyOptions,
     VerifyRequest,
 };
 
-use crate::adapters::{CryptoTrendRule, EtfTrendRule, FlatUntil};
+use crate::adapters::FlatUntil;
 use checks::{compare, trades_within_band};
 use fixtures::{ExpectedMutant, RecordedMetrics, SleeveKey};
 use runner::{
@@ -312,11 +314,10 @@ where
     F: Fn(&Panel) -> R,
 {
     let mut col = Collector { checks: Vec::new() };
-    let (panel, key, recorded, shadow) = match sleeve {
-        mutants::MutantSleeve::S1 => (&fx.etf_panel, &fx.s1, &fx.recorded_s1, &fx.shadow_s1),
-        mutants::MutantSleeve::S3 => (&fx.crypto_panel, &fx.s3, &fx.recorded_s3, &fx.shadow_s3),
-    };
-    let (report, _) = run_sleeve(&mut col, panel, make_rule, key, recorded, shadow)?;
+    let sf = fx
+        .sleeve(sleeve.code())
+        .ok_or_else(|| LadderError::Inconsistent(format!("the fixture set has no sleeve `{}`", sleeve.code())))?;
+    let (report, _) = run_sleeve(&mut col, sf.panel, make_rule, sf.key, sf.recorded, sf.shadow)?;
     Ok((report, col.checks))
 }
 
@@ -580,33 +581,29 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
         ),
     );
 
-    // Each sleeve starts flat at the bar before its window (the key ledger's convention, see `FlatUntil`).
-    let entry1 = entry_date(&fx.etf_panel, &fx.s1)?;
-    let entry3 = entry_date(&fx.crypto_panel, &fx.s3)?;
-    let (s1, _) = run_sleeve(
-        &mut col,
-        &fx.etf_panel,
-        &|_p: &Panel| FlatUntil::new(EtfTrendRule, entry1),
-        &fx.s1,
-        &fx.recorded_s1,
-        &fx.shadow_s1,
-    )?;
-    let (s3, _) = run_sleeve(
-        &mut col,
-        &fx.crypto_panel,
-        &|_p: &Panel| FlatUntil::new(CryptoTrendRule, entry3),
-        &fx.s3,
-        &fx.recorded_s3,
-        &fx.shadow_s3,
-    )?;
+    // Every registered rule, in table order; each sleeve starts flat at the bar before its window (the key ledger's
+    // convention, see `FlatUntil`).
+    let registry = Registry::library();
+    let mut sleeves = Vec::with_capacity(registry.len());
+    for entry in registry.iter() {
+        let sf = entry.fixture(fx)?;
+        let first_trade = entry_date(sf.panel, sf.key)?;
+        let (report, _) = run_sleeve(
+            &mut col,
+            sf.panel,
+            &|_p: &Panel| FlatUntil::new((entry.factory)(), first_trade),
+            sf.key,
+            sf.recorded,
+            sf.shadow,
+        )?;
+        sleeves.push(report);
+    }
 
-    // Tier IV
+    // Tier IV: the mutants in the amendment's table order (`Mutant::ALL`), each against its own sleeve's key.
     let mut mutant_reports = Vec::new();
     for m in Mutant::ALL {
-        let key = match m.sleeve() {
-            mutants::MutantSleeve::S1 => &fx.s1,
-            mutants::MutantSleeve::S3 => &fx.s3,
-        };
+        let key =
+            registry.by_sleeve(m.sleeve()).map_err(|e| LadderError::Inconsistent(e.to_string()))?.fixture(fx)?.key;
         let run = mutants::run_mutant(fx, m)?;
         let cmp = compare(&key_rows_for_mutants(key), &run.rows)?;
         let caught_by = cmp.failed_tiers();
@@ -666,11 +663,9 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
         ),
     );
     if opts.check_canaries {
-        for (check, mutant, (centre, tol)) in [
-            ("canary.s3_same_day_peek_sharpe", Mutant::S3SameDayPeek, CANARY_PEEK_SHARPE),
-            ("canary.s3_extra_delay_sharpe", Mutant::S3ExtraDelay, CANARY_DELAY_SHARPE),
-        ] {
-            match mutant_reports.iter().find(|m| m.name == mutant.name()) {
+        for canary in registry.iter().flat_map(|e| e.canaries.iter()) {
+            let (check, centre, tol) = (canary.check, canary.sharpe.0, canary.sharpe.1);
+            match mutant_reports.iter().find(|m| m.name == canary.mutant.name()) {
                 Some(m) => col.push(
                     check,
                     (m.cmp.run_sharpe - centre).abs() <= tol,
@@ -687,7 +682,7 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
     h.push('\n');
     h.push_str(&fx.candles_sha256);
     h.push('\n');
-    for s in [&s1, &s3] {
+    for s in &sleeves {
         h.push_str(&format!("{} {} {}\n", s.code, s.gross.series_sha256, s.net.series_sha256));
     }
     for m in &mutant_reports {
@@ -702,7 +697,7 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
         manifest_sha256: fx.manifest_sha256.clone(),
         candles_sha256: fx.candles_sha256.clone(),
         verified_files: fx.verified_files.len(),
-        sleeves: vec![s1, s3],
+        sleeves,
         mutants: mutant_reports,
         checks: col.checks,
         digest,

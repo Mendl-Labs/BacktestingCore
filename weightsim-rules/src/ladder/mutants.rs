@@ -43,6 +43,24 @@ pub enum MutantSleeve {
     S3,
 }
 
+impl MutantSleeve {
+    /// The sleeve code the registry and the fixtures address this sleeve by.
+    pub fn code(self) -> &'static str {
+        match self {
+            MutantSleeve::S1 => "S1",
+            MutantSleeve::S3 => "S3",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<MutantSleeve> {
+        match code {
+            "S1" => Some(MutantSleeve::S1),
+            "S3" => Some(MutantSleeve::S3),
+            _ => None,
+        }
+    }
+}
+
 impl Mutant {
     pub const ALL: [Mutant; 8] = [
         Mutant::S3SameDayPeek,
@@ -307,24 +325,29 @@ fn from_sim(sim: &SimResult, key: &SleeveKey) -> Result<MutantRun, LadderError> 
 /// The mutants are NOT started flat at the entry bar (`FlatUntil` is for the certified base runs, whose net series
 /// depends on the entry): they are gross replays of the pandas mutants, which trade from their own first decision.
 pub fn run_mutant(fx: &Fixtures, m: Mutant) -> Result<MutantRun, LadderError> {
-    let (etf, cry) = (&fx.etf_panel, &fx.crypto_panel);
+    // The mutant's sleeve names the panel and key it is replayed against.
+    let sleeve = m.sleeve();
+    let sf = fx.sleeve(sleeve.code()).ok_or_else(|| {
+        LadderError::Inconsistent(format!("the fixture set has no sleeve `{}` for mutant {}", sleeve.code(), m.name()))
+    })?;
+    let (panel, key) = (sf.panel, sf.key);
     match m {
-        Mutant::S3SameDayPeek => from_sim(&run_gross(cry, &PeekCrypto::new(cry), &fx.s3, 0)?, &fx.s3),
-        Mutant::S3ExtraDelay => from_sim(&run_gross(cry, &CryptoTrendRule, &fx.s3, 1)?, &fx.s3),
-        Mutant::S3SmaExcludesToday => from_sim(&run_gross(cry, &CryptoSmaExcludesToday, &fx.s3, 0)?, &fx.s3),
+        Mutant::S3SameDayPeek => from_sim(&run_gross(panel, &PeekCrypto::new(panel), key, 0)?, key),
+        Mutant::S3ExtraDelay => from_sim(&run_gross(panel, &CryptoTrendRule, key, 1)?, key),
+        Mutant::S3SmaExcludesToday => from_sim(&run_gross(panel, &CryptoSmaExcludesToday, key, 0)?, key),
         Mutant::S3HalfSizing => {
             let rule = Wrapped { inner: CryptoTrendRule, name: "mutant_s3_half_sizing", scale: 0.5, policy: None };
-            from_sim(&run_gross(cry, &rule, &fx.s3, 0)?, &fx.s3)
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
         Mutant::S3DriftingSubaccounts => Ok(MutantRun {
             // The sub-accounts are fed by the unmutated rule's own signals over the WHOLE history (they hold
             // positions, and so drift, from the rule's first signal in 2015, not from the entry bar).
-            rows: drifting_subaccounts(cry, &run_gross(cry, &CryptoTrendRule, &fx.s3, 0)?, &fx.s3)?,
+            rows: drifting_subaccounts(panel, &run_gross(panel, &CryptoTrendRule, key, 0)?, key)?,
             flips: None,
             series_sha256: None,
         }),
-        Mutant::S1SmaExcludesCurrent => from_sim(&run_gross(etf, &EtfSmaExcludesCurrent, &fx.s1, 0)?, &fx.s1),
-        Mutant::S1OneBarLate => from_sim(&run_gross(etf, &EtfTrendRule, &fx.s1, 1)?, &fx.s1),
+        Mutant::S1SmaExcludesCurrent => from_sim(&run_gross(panel, &EtfSmaExcludesCurrent, key, 0)?, key),
+        Mutant::S1OneBarLate => from_sim(&run_gross(panel, &EtfTrendRule, key, 1)?, key),
         Mutant::S1WrongRebalanceMode => {
             let rule = Wrapped {
                 inner: EtfTrendRule,
@@ -332,7 +355,7 @@ pub fn run_mutant(fx: &Fixtures, m: Mutant) -> Result<MutantRun, LadderError> {
                 scale: 1.0,
                 policy: Some(RebalancePolicy::EveryBar),
             };
-            from_sim(&run_gross(etf, &rule, &fx.s1, 0)?, &fx.s1)
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
     }
 }
