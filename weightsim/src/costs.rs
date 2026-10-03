@@ -44,6 +44,34 @@ impl CostModel {
         }
     }
 
+    /// Suffix of the id of a preset that carries the live-realistic slippage overlay (W7.4, R10).
+    pub const LIVE_REALISTIC_SUFFIX: &'static str = "+live_realistic";
+
+    /// This preset plus `extra_slippage_bps` of slippage per side, under the live-realistic id (`<base id>` +
+    /// [`Self::LIVE_REALISTIC_SUFFIX`]; an id that is neither declared preset becomes `custom+live_realistic`).
+    /// Such an id is NOT resolvable by [`CostModel::by_id`]: a live-realistic run can never be selected, or verified,
+    /// as a certified one. Applying the overlay to a preset that already carries it is the caller's error
+    /// (`ExecutionModel::apply_to` refuses it).
+    pub fn with_live_slippage(&self, extra_slippage_bps: f64) -> CostModel {
+        let id = match self.id {
+            "zero" => "zero+live_realistic",
+            "certification_flat_10bps_per_side" => "certification_flat_10bps_per_side+live_realistic",
+            _ => "custom+live_realistic",
+        };
+        CostModel {
+            id,
+            slippage_bps: self.slippage_bps + extra_slippage_bps,
+            source_note:
+                "live-realistic layer: the base preset plus the pre-registered slippage (weightsim::preregistered)",
+            ..*self
+        }
+    }
+
+    /// `true` when the id carries the live-realistic overlay.
+    pub fn is_live_realistic(&self) -> bool {
+        self.id.ends_with(Self::LIVE_REALISTIC_SUFFIX)
+    }
+
     /// Total bps charged per unit of traded notional.
     pub fn rate_bps(&self) -> f64 {
         self.commission_bps + self.half_spread_bps + self.slippage_bps
@@ -126,6 +154,20 @@ mod tests {
         assert!(!c.is_valid());
         c.slippage_bps = f64::NAN;
         assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn live_slippage_overlay_adds_bps_under_an_unresolvable_id() {
+        let live = CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE.with_live_slippage(5.0);
+        assert_eq!(live.id, "certification_flat_10bps_per_side+live_realistic");
+        assert_eq!(live.rate_bps(), 15.0);
+        assert_eq!(live.commission_bps, 10.0);
+        assert!(live.is_live_realistic() && !CostModel::ZERO.is_live_realistic());
+        assert_eq!(CostModel::by_id(live.id), None);
+        let z = CostModel::ZERO.with_live_slippage(10.0);
+        assert_eq!((z.id, z.rate_bps()), ("zero+live_realistic", 10.0));
+        let c = CostModel { id: "venue_x", ..CostModel::ZERO }.with_live_slippage(1.0);
+        assert_eq!(c.id, "custom+live_realistic");
     }
 
     #[test]

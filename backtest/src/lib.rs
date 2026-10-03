@@ -50,6 +50,7 @@ pub mod basket_simulation;
 pub mod cross_sectional_simulation;
 // W2.1 / G1: causality-by-truncation gate (pure parts always compiled; the runner needs `python`).
 pub mod causality_gate;
+pub mod per_bar_weights;
 
 // Python strategy simulation (requires python feature)
 #[cfg(feature = "python")]
@@ -57,7 +58,7 @@ pub mod python_simulation;
 pub mod python_validation;
 
 // Re-export commonly used types at crate root
-pub use types::{BacktestResult, BacktestEvent, MarketDataInput};
+pub use types::{BacktestResult, BacktestEvent, MarketDataInput, PerBarWeights};
 pub use engine::{BacktestEngine, BacktestResults, WalkForwardSummary, AnalysisMetadata, ProgressCallback};
 pub use html_export::HtmlExporter;
 pub use simulation::SimulationLoop;
