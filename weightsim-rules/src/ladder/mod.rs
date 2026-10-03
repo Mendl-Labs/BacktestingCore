@@ -16,6 +16,7 @@
 pub mod checks;
 pub mod fixtures;
 pub mod json;
+pub mod live;
 pub mod mutants;
 pub mod registry;
 pub mod runner;
@@ -29,6 +30,10 @@ use weightsim::{answer_key_metrics, sha256_hex, CostModel, Date, Panel, WeightRu
 
 pub use checks::{Comparison, SeriesRows, Tier3};
 pub use fixtures::{Fixtures, LadderError, Pins};
+pub use live::{
+    live_realistic_model_for, replicate_live_realistic, replicate_live_realistic_with, sleeve_class_of,
+    LiveRealisticError, LiveRealisticRun, CERTIFIED_LAYER, LIVE_REALISTIC_LAYER,
+};
 pub use mutants::Mutant;
 pub use registry::{Canary, KeyRef, PanelSpec, RegisteredRule, Registry, RegistryError, SleeveFixture, LIBRARY_RULES};
 pub use verify::{

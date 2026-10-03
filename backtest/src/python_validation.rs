@@ -926,6 +926,11 @@ pub struct ValidationResult {
     /// Whether look-ahead bias was detected (Stage 0 perturbation test).
     #[serde(default)]
     pub look_ahead_detected: Option<bool>,
+    /// W2.1 / G1: the typed result of the causality-by-truncation gate (Stage 0, BLOCKING). `None` when the gate
+    /// could not run (the strategy failed to build or its full run failed -- Stage 1 reports that) or on results
+    /// persisted before the gate existed.
+    #[serde(default)]
+    pub causality_truncation: Option<crate::causality_gate::CausalityTruncationReport>,
     /// Total elapsed time in seconds.
     pub elapsed_seconds: f64,
 }
@@ -1358,6 +1363,7 @@ pub async fn run_validation_pipeline(
                 ),
                 stage_verdicts: stages,
                 look_ahead_detected: None,
+            causality_truncation: None,
                 elapsed_seconds: timing_start.elapsed().as_secs_f64(),
             });
         }
@@ -1366,26 +1372,102 @@ pub async fn run_validation_pipeline(
     }
 
     // -----------------------------------------------------------------------
-    // Stage 0: Look-ahead bias detection (perturbation test)
+    // Stage 0: Look-ahead bias detection.
+    //
+    // 0a (W2.1 / G1, BLOCKING): the causality-by-truncation gate. For each
+    // sampled bar t the strategy's compute_signals() is re-run on the series
+    // that ENDS at t; the signal at t must not change. This is the exact
+    // defect ("end-of-array") behind 7 of the 9 failures of the 2026-09-21
+    // benchmark, which the legacy 60%-vs-full trade-count test (0b) does not
+    // catch. Mode knob: `PYTHON_LOOKAHEAD_SCAN_MODE` = sampled (default, K
+    // bars per asset) | full (every bar, plus the legacy test 0b).
+    //
+    // 0b (legacy, advisory): the 60%-vs-full perturbation test. Runs only in
+    // `full` mode; in `sampled` mode `look_ahead_detected` is derived from 0a.
     // -----------------------------------------------------------------------
-    report_progress(0, "lookahead_detection", 0, 1);
-    log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0: Look-ahead bias detection");
-
-    let look_ahead_detected = match detect_lookahead_bias(market_data, &config).await {
-        Ok(detected) => {
-            if detected {
-                log_warn!(BACKTEST_LOGGER, "[VALIDATION] LOOK-AHEAD BIAS DETECTED: strategy signals change when future data is present");
-            } else {
-                log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0 passed: no look-ahead bias detected");
-            }
-            Some(detected)
-        }
+    let gate_cfg = crate::causality_gate::CausalityGateConfig::from_env();
+    report_progress(0, "causality_truncation", 0, 1);
+    log_info!(
+        BACKTEST_LOGGER,
+        "[VALIDATION] Stage 0a: causality-by-truncation gate ({} mode, K={}, seed={:#x})",
+        gate_cfg.mode.as_str(), gate_cfg.sample_bars_per_asset, gate_cfg.seed
+    );
+    let causality_truncation = match crate::causality_gate::causality_truncation_check(
+        market_data,
+        &config.python_source,
+        config.parameters.clone(),
+        &gate_cfg,
+    )
+    .await
+    {
+        Ok(report) => Some(report),
         Err(e) => {
-            log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0 skipped (error): {}", e);
+            // A strategy that cannot be built or whose FULL run fails is Stage 1's error to report; the gate has no
+            // evidence either way, so it neither passes nor fails here.
+            log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0a skipped (error): {}", e);
             None
         }
     };
-    report_progress(0, "lookahead_detection", 1, 1);
+    if let Some(report) = &causality_truncation {
+        stages.push(StageVerdict {
+            stage: 0,
+            name: "Causality (truncation)".into(),
+            passed: report.passed(),
+            message: report.message.clone(),
+        });
+    }
+    report_progress(0, "causality_truncation", 1, 1);
+    if let Some(report) = causality_truncation.as_ref().filter(|r| !r.passed()) {
+        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CAUSALITY GATE FAILED: {}", report.message);
+        return Ok(ValidationResult {
+            stages_completed: 0,
+            quick_backtest: None,
+            walk_forward: None,
+            monte_carlo: None,
+            block_bootstrap: None,
+            regime_mc: None,
+            ga_report: None,
+            optimized_backtest: None,
+            cpcv_pbo: None,
+            cpcv_deflated_sharpe: None,
+            cpcv_parameter_stability: None,
+            verdict: "fail".into(),
+            summary: format!(
+                "Causality gate failed: {}. Compute each bar's signal from bars up to and including that bar only (no `prices[-k:]` anchored to the array end, no `len(prices) - 1` as a decision point).",
+                report.message
+            ),
+            stage_verdicts: stages,
+            look_ahead_detected: Some(true),
+            causality_truncation: causality_truncation.clone(),
+            elapsed_seconds: timing_start.elapsed().as_secs_f64(),
+        });
+    }
+
+    let look_ahead_detected = match gate_cfg.mode {
+        crate::causality_gate::LookaheadScanMode::Full => {
+            report_progress(0, "lookahead_detection", 0, 1);
+            log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b: Look-ahead bias detection (legacy perturbation test)");
+            let detected = match detect_lookahead_bias(market_data, &config).await {
+                Ok(detected) => {
+                    if detected {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] LOOK-AHEAD BIAS DETECTED: strategy signals change when future data is present");
+                    } else {
+                        log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b passed: no look-ahead bias detected");
+                    }
+                    Some(detected)
+                }
+                Err(e) => {
+                    log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b skipped (error): {}", e);
+                    None
+                }
+            };
+            report_progress(0, "lookahead_detection", 1, 1);
+            detected
+        }
+        crate::causality_gate::LookaheadScanMode::Sampled => {
+            causality_truncation.as_ref().filter(|r| r.applicable).map(|r| !r.passed())
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Stage 1: Quick single-pass backtest (subsampled for speed)
@@ -1465,6 +1547,7 @@ pub async fn run_validation_pipeline(
             summary: "Strategy generated no trades — check entry/exit logic and date range.".into(),
             stage_verdicts: stages,
             look_ahead_detected,
+            causality_truncation: causality_truncation.clone(),
             elapsed_seconds: timing_start.elapsed().as_secs_f64(),
         });
     }
@@ -1542,6 +1625,7 @@ pub async fn run_validation_pipeline(
             summary: fail_msg,
             stage_verdicts: stages,
             look_ahead_detected,
+            causality_truncation: causality_truncation.clone(),
             elapsed_seconds: timing_start.elapsed().as_secs_f64(),
         });
     }
@@ -2724,6 +2808,7 @@ pub async fn run_validation_pipeline(
         summary,
         stage_verdicts: stages,
         look_ahead_detected,
+        causality_truncation,
         elapsed_seconds: timing_start.elapsed().as_secs_f64(),
     })
 }
@@ -3776,7 +3861,7 @@ pub fn extract_parameter_schema(_python_source: &str) -> Option<Arc<ParameterSch
 /// cost only lands on strategies mentioning these APIs (regime models, MC
 /// sampling), never on plain indicator strategies.
 #[cfg(feature = "python")]
-fn source_may_be_stochastic(source: &str) -> bool {
+pub(crate) fn source_may_be_stochastic(source: &str) -> bool {
     const MARKERS: &[&str] = &[
         "random", "default_rng", "RandomState", "np.random", "numpy.random",
         "shuffle", "permutation", "KMeans", "GaussianMixture", ".sample(",
@@ -5137,6 +5222,7 @@ mod tests {
             summary: "Strategy passed all stages".into(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 42.5,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -5233,6 +5319,7 @@ mod tests {
             summary: String::new(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 0.0,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -5262,6 +5349,7 @@ mod tests {
                 message: "P(ruin) > 20%".into(),
             }],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 100.0,
         };
         let cloned = result.clone();
@@ -5288,6 +5376,7 @@ mod tests {
             summary: "OK".into(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 1.0,
         };
         let debug = format!("{:?}", result);
@@ -5468,6 +5557,7 @@ mod tests {
             summary: "High ruin probability".into(),
             stage_verdicts: verdicts,
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 120.0,
         };
         assert_eq!(result.stage_verdicts.len(), 3);

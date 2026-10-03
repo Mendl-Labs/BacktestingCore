@@ -95,11 +95,11 @@ pub fn rule_facts(rule_id: &str) -> Option<RuleFacts> {
 }
 
 /// A library rule wired to its panel and key on a fixture set.
-struct Prepared<'a> {
-    rule: Box<dyn WeightRule>,
-    panel: &'a Panel,
-    key: &'a SleeveKey,
-    sleeve: MutantSleeve,
+pub(crate) struct Prepared<'a> {
+    pub(crate) rule: Box<dyn WeightRule>,
+    pub(crate) panel: &'a Panel,
+    pub(crate) key: &'a SleeveKey,
+    pub(crate) sleeve: MutantSleeve,
 }
 
 impl From<RegistryError> for ReplicateError {
@@ -111,7 +111,7 @@ impl From<RegistryError> for ReplicateError {
     }
 }
 
-fn library_rule<'a>(fx: &'a Fixtures, rule_id: &str) -> Result<Prepared<'a>, ReplicateError> {
+pub(crate) fn library_rule<'a>(fx: &'a Fixtures, rule_id: &str) -> Result<Prepared<'a>, ReplicateError> {
     let entry = Registry::library().get(rule_id)?;
     let sf = entry.fixture(fx)?;
     // Each sleeve starts flat at the bar before its window (the key ledger's convention, see `FlatUntil`).
@@ -141,7 +141,7 @@ pub struct RunSummary {
     pub flips: u64,
 }
 
-fn summarize(m: &Metrics, flips: u64) -> RunSummary {
+pub(crate) fn summarize(m: &Metrics, flips: u64) -> RunSummary {
     RunSummary {
         n: m.n,
         first_date: m.first_date,
@@ -223,6 +223,12 @@ pub struct ReplicationRun {
 }
 
 impl ReplicationRun {
+    /// The layer this run is: always the certified one (`"certified"`). The live-realistic layer is a separate
+    /// type, `super::live::LiveRealisticRun` (W7.4, R10).
+    pub fn layer(&self) -> weightsim::Layer {
+        weightsim::Layer::Certified
+    }
+
     /// The digests, summaries and fixture identity of this run as a verifier's claims (what a store would keep next
     /// to the columns).
     pub fn claims(&self) -> Claims {
@@ -277,7 +283,7 @@ pub fn replicate_with(
     })
 }
 
-fn key_span(key: &SleeveKey) -> (Date, Date) {
+pub(crate) fn key_span(key: &SleeveKey) -> (Date, Date) {
     (key.bars[0].date, key.bars[key.bars.len() - 1].date)
 }
 

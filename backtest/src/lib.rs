@@ -48,6 +48,9 @@ pub mod fast_signal_eval;
 pub mod pair_simulation;
 pub mod basket_simulation;
 pub mod cross_sectional_simulation;
+// W2.1 / G1: causality-by-truncation gate (pure parts always compiled; the runner needs `python`).
+pub mod causality_gate;
+pub mod per_bar_weights;
 
 // Python strategy simulation (requires python feature)
 #[cfg(feature = "python")]
@@ -55,12 +58,15 @@ pub mod python_simulation;
 pub mod python_validation;
 
 // Re-export commonly used types at crate root
-pub use types::{BacktestResult, BacktestEvent, MarketDataInput};
+pub use types::{BacktestResult, BacktestEvent, MarketDataInput, PerBarWeights};
 pub use engine::{BacktestEngine, BacktestResults, WalkForwardSummary, AnalysisMetadata, ProgressCallback};
 pub use html_export::HtmlExporter;
 pub use simulation::SimulationLoop;
 pub use monte_carlo::{MonteCarloResult, run_monte_carlo_simulation};
 pub use python_validation::{ValidationConfig, ValidationResult, WalkForwardResult, extract_parameter_schema};
+pub use causality_gate::{
+    CausalityGateConfig, CausalityTruncationReport, CausalityViolation, LookaheadScanMode, sample_truncation_bars,
+};
 pub use portfolio_simulation::{
     PortfolioSimulator,
     PortfolioSimResult,
