@@ -51,6 +51,8 @@ pub mod cross_sectional_simulation;
 // W2.1 / G1: causality-by-truncation gate (pure parts always compiled; the runner needs `python`).
 pub mod causality_gate;
 pub mod per_bar_weights;
+// W3.2: BacktestResult -> SeriesRows bridge for the replication ladder (Tier II path over general-engine results).
+pub mod ladder_bridge;
 
 // Python strategy simulation (requires python feature)
 #[cfg(feature = "python")]
