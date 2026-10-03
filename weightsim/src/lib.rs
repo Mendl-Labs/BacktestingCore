@@ -147,6 +147,20 @@
 //!   [`STANDARD_DELAYS`] (`0, 1, 2, 3, 5`) and returns one [`DelayRow`] per delay: gross and net metrics, the correlation of
 //!   the net returns to the baseline row, cost and the pinned digest. It selects nothing; the delay a product states is
 //!   pre-registered (Ruling 12).
+//!
+//! # W7.4 (council Ruling R10): the live-realistic execution layer
+//! Additive; `simulate` is untouched and every pinned digest is unchanged (the regression tests of
+//! `tests/execution_model.rs` and `weightsim-rules/tests/live_realistic_real.rs` pin that).
+//! * **P17 [`ExecutionModel`]** `{ delay_bars, slippage_bps }` ([`execution`]): a decision at the close of `t` is executed
+//!   at the close of `t + delay_bars` at that close plus slippage, applied to a [`SimConfig`] by
+//!   [`ExecutionModel::apply_to`] (sets `execution_delay_bars`, overlays the slippage on the cost preset under a
+//!   `+live_realistic` id). [`ExecutionModel::certification`] (`{0, 0}`) is the identity: the certified path is the
+//!   same code, same configuration, same digest. Slippage is charged on turnover, so it reduces the net result by
+//!   exactly `turnover x bps` per bar and the Layer C cost identity stays exact.
+//! * **P18 [`Layer`]** labels a result `certified` or `live_realistic`; the two are produced by separate functions and
+//!   never mixed (the live cost id does not resolve through `CostModel::by_id`).
+//! * **P19 [`preregistered`]**: the per-sleeve defaults (ETF trend: delay 1, 5 bps; crypto trend: delay 0, 10 bps) under
+//!   [`LIVE_REALISTIC_CONFIG_VERSION`], pre-registered 2026-10-02, changeable by amendment only.
 
 // Deliberate, crate-wide clippy exceptions:
 //  * `needless_range_loop`: the simulation path indexes several parallel per-asset vectors in lock step with plain
@@ -166,9 +180,11 @@ pub mod construct;
 pub mod costs;
 pub mod date;
 pub mod delay;
+pub mod execution;
 pub mod harness;
 pub mod metrics;
 pub mod panel;
+pub mod preregistered;
 pub mod rule;
 pub mod sha256;
 pub mod sim;
@@ -196,8 +212,13 @@ pub use date::{Date, DateError};
 pub use delay::{
     aligned_correlation, book_with_delay, delay_sensitivity, format_delay_table, DelayRow, DelayScope, STANDARD_DELAYS,
 };
+pub use execution::{ExecutionModel, Layer};
 pub use metrics::{answer_key_metrics, Metrics, METRIC_DEFINITIONS};
 pub use panel::{HistoryView, Panel, PanelError, PriceSource};
+pub use preregistered::{
+    live_realistic_default_for, SleeveClass, CRYPTO_LIVE_DELAY_BARS, CRYPTO_LIVE_SLIPPAGE_BPS, ETF_LIVE_DELAY_BARS,
+    ETF_LIVE_SLIPPAGE_BPS, LIVE_REALISTIC_CONFIG_VERSION,
+};
 pub use rule::{DecisionSchedule, OnRefusal, RebalancePolicy, RefusalKind, Rule, RuleRefusal, WeightRule};
 pub use sha256::{sha256, sha256_hex};
 pub use sim::{simulate, simulate_gross_and_net, ExposureStats, Refusal, SimConfig, SimError, SimResult, Window};
