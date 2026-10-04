@@ -95,6 +95,9 @@ MUTANTS = [
     ("M24", "day_of_week: wrong default target (Tuesday instead of Monday)", "src/day_of_week.rs",
      "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Mon;",
      "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Tue;"),
+    ("M25", "top_n_winners: ranking direction flipped (buys LOSERS instead of winners)", "src/top_n_winners.rs",
+     "        rb.partial_cmp(&ra)",
+     "        ra.partial_cmp(&rb)"),
 ]
 
 

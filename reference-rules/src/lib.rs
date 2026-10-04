@@ -78,11 +78,13 @@ pub mod series;
 mod checks;
 mod crypto;
 mod day_of_week;
+mod donchian_breakout;
 mod dual_ma_crossover;
 mod etf;
 mod exact;
 mod fx;
 mod sma_crossover_trend;
+mod top_n_winners;
 mod turn_of_month;
 
 pub use crypto::{
@@ -110,5 +112,9 @@ pub use dual_ma_crossover::{
 pub use sma_crossover_trend::{
     SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
 };
+pub use top_n_winners::{
+    TopNRanking, TopNWinners, TOP_N_WINNERS_DEFAULT_LOOKBACK, TOP_N_WINNERS_VERSION,
+};
 pub use turn_of_month::{decide_turn_of_month, decide_turn_of_month_on, TradingDays, TURN_OF_MONTH_FOLLOWING_DAYS, TURN_OF_MONTH_WEIGHT};
 pub use day_of_week::{decide_day_of_week, decide_day_of_week_default, decide_day_of_week_on, DAY_OF_WEEK_DEFAULT_TARGET, DAY_OF_WEEK_WEIGHT};
+pub use donchian_breakout::{decide_donchian_breakout, DonchianError, HlcSeries, DONCHIAN_DEFAULT_N};
