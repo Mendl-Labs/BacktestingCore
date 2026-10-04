@@ -98,6 +98,9 @@ MUTANTS = [
     ("M25", "top_n_winners: ranking direction flipped (buys LOSERS instead of winners)", "src/top_n_winners.rs",
      "        rb.partial_cmp(&ra)",
      "        ra.partial_cmp(&rb)"),
+    ("M26", "donchian_breakout: wrong breakout direction (sign flip on the upper/lower comparison)", "src/donchian_breakout.rs",
+     "if close > upper {",
+     "if close < upper {"),
 ]
 
 
