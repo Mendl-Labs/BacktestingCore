@@ -30,6 +30,10 @@ fn identity_against_independent_python_implementation() {
     // DIA wins the DIA/EEM tie alphabetically; it is the sole bottom-quintile holding (weight 1.0).
     let want = [1.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-        assert!((g - w).abs() < TOL, "asset {i} ({}): got {g}, want {w}", LOW_VOL_QUINTILE_SYMBOLS[i]);
+        assert!(
+            (g - w).abs() < TOL,
+            "asset {i} ({}): got {g}, want {w}",
+            LOW_VOL_QUINTILE_SYMBOLS[i]
+        );
     }
 }

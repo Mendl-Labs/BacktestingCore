@@ -133,7 +133,10 @@ mod tests {
     /// panel whose symbols are not exactly the rule's `universe()`).
     fn panel_from(symbols_closes: Vec<Vec<f64>>, dates: Vec<Date>) -> Panel {
         assert_eq!(symbols_closes.len(), N);
-        let symbols: Vec<String> = EQUAL_WEIGHT_REBALANCE_SYMBOLS.iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = EQUAL_WEIGHT_REBALANCE_SYMBOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         Panel::new(symbols, dates, symbols_closes).unwrap()
     }
 
@@ -156,9 +159,18 @@ mod tests {
     fn declared_parameters_reflect_the_resolved_schedule_choice() {
         let rule = EqualWeightRebalanceRule;
         let params = rule.declared_parameters();
-        assert_eq!(params.get("rebalance_frequency").map(|s| s.as_str()), Some("\"monthly\""));
-        assert_eq!(params.get("schedule").map(|s| s.as_str()), Some("\"last_bar_of_month\""));
-        assert_eq!(params.get("rebalance_policy").map(|s| s.as_str()), Some("\"on_decision\""));
+        assert_eq!(
+            params.get("rebalance_frequency").map(|s| s.as_str()),
+            Some("\"monthly\"")
+        );
+        assert_eq!(
+            params.get("schedule").map(|s| s.as_str()),
+            Some("\"last_bar_of_month\"")
+        );
+        assert_eq!(
+            params.get("rebalance_policy").map(|s| s.as_str()),
+            Some("\"on_decision\"")
+        );
         assert_eq!(rule.min_history_bars(), 1);
         assert_eq!(rule.decision_schedule(), DecisionSchedule::LastBarOfMonth);
         assert_eq!(rule.rebalance_policy(), RebalancePolicy::OnDecision);
@@ -170,23 +182,41 @@ mod tests {
         // A short panel confined to a single calendar month: the ONLY decision bar is the panel's final bar (the
         // end-of-panel rule), and every asset must receive exactly 1/N there, regardless of its price path (choice
         // 1: the target never depends on price history at all).
-        let dates: Vec<Date> = (1..=10).map(|day| d(&format!("2021-01-{day:02}"))).collect();
+        let dates: Vec<Date> = (1..=10)
+            .map(|day| d(&format!("2021-01-{day:02}")))
+            .collect();
         let a = vec![100.0; 10];
         let b = vec![50.0, 51.0, 49.0, 52.0, 48.0, 53.0, 47.0, 54.0, 46.0, 55.0];
         let c = vec![10.0; 10];
-        let e = vec![200.0, 199.0, 201.0, 198.0, 202.0, 197.0, 203.0, 196.0, 204.0, 195.0];
+        let e = vec![
+            200.0, 199.0, 201.0, 198.0, 202.0, 197.0, 203.0, 196.0, 204.0, 195.0,
+        ];
         let p = panel_from(vec![a, b, c, e], dates);
 
         let r = simulate(&p, &EqualWeightRebalanceRule, &SimConfig::default()).unwrap();
         let last = p.n_bars() - 1;
-        assert!(r.decision[last], "the panel's final bar must be a decision bar (end-of-panel rule)");
-        assert!(r.decision[..last].iter().all(|&dd| !dd), "no earlier bar within the same month is a decision");
+        assert!(
+            r.decision[last],
+            "the panel's final bar must be a decision bar (end-of-panel rule)"
+        );
+        assert!(
+            r.decision[..last].iter().all(|&dd| !dd),
+            "no earlier bar within the same month is a decision"
+        );
 
         let target = r.row(&r.target_weights, last);
         let held = r.row(&r.held_weights, last);
         for i in 0..N {
-            assert!((target[i] - 0.25).abs() < 1e-12, "target[{i}] must be exactly 1/N, got {}", target[i]);
-            assert!((held[i] - 0.25).abs() < 1e-12, "held[{i}] must be exactly 1/N right after the trade, got {}", held[i]);
+            assert!(
+                (target[i] - 0.25).abs() < 1e-12,
+                "target[{i}] must be exactly 1/N, got {}",
+                target[i]
+            );
+            assert!(
+                (held[i] - 0.25).abs() < 1e-12,
+                "held[{i}] must be exactly 1/N right after the trade, got {}",
+                held[i]
+            );
         }
     }
 
@@ -220,38 +250,64 @@ mod tests {
 
         // Bar 30: first decision, first trade. Held weights must be exactly 1/N (all four assets priced equally
         // at the moment of the trade, so the equal-notional 1/N target produces equal-notional, 1/N units).
-        assert!(r.decision[30], "bar 30 (Jan 31) must be the first decision (last bar of January)");
+        assert!(
+            r.decision[30],
+            "bar 30 (Jan 31) must be the first decision (last bar of January)"
+        );
         let held_30 = r.row(&r.held_weights, 30);
         for (i, &w) in held_30.iter().enumerate() {
-            assert!((w - 0.25).abs() < 1e-9, "held[{i}] at bar 30 must be 1/N, got {w}");
+            assert!(
+                (w - 0.25).abs() < 1e-9,
+                "held[{i}] at bar 30 must be 1/N, got {w}"
+            );
         }
 
         // No bar strictly between the two decisions is itself a decision (OnDecision: no retrade, so no snap-back
         // until bar 40), and the held weights at an interior bar (bar 35, Feb 5) must have moved measurably away
         // from 1/N, in the direction implied by each asset's growth factor.
         for t in 31..40 {
-            assert!(!r.decision[t], "bar {t} (strictly between the two decisions) must not be a decision bar");
+            assert!(
+                !r.decision[t],
+                "bar {t} (strictly between the two decisions) must not be a decision bar"
+            );
         }
         let held_35 = r.row(&r.held_weights, 35);
         assert!(
             held_35.iter().any(|&w| (w - 0.25).abs() > 1e-6),
             "held weights must have drifted away from 1/N by bar 35, got {held_35:?}"
         );
-        assert!(held_35[1] > 0.25, "asset 1 (the grower) must be overweight by bar 35, got {}", held_35[1]);
-        assert!(held_35[2] < 0.25, "asset 2 (the shrinker) must be underweight by bar 35, got {}", held_35[2]);
+        assert!(
+            held_35[1] > 0.25,
+            "asset 1 (the grower) must be overweight by bar 35, got {}",
+            held_35[1]
+        );
+        assert!(
+            held_35[2] < 0.25,
+            "asset 2 (the shrinker) must be underweight by bar 35, got {}",
+            held_35[2]
+        );
         // Held weights must still sum to 1.0 (fully invested, zero cost/financing): drift redistributes weight
         // among assets, it does not change the total.
         let sum_35: f64 = held_35.iter().sum();
-        assert!((sum_35 - 1.0).abs() < 1e-9, "held weights must still sum to 1.0 while drifting, got {sum_35}");
+        assert!(
+            (sum_35 - 1.0).abs() < 1e-9,
+            "held weights must still sum to 1.0 while drifting, got {sum_35}"
+        );
 
         // Bar 40 (Feb 10, the panel's final bar): a decision again (end-of-panel rule), so the book snaps back to
         // exactly 1/N, even though the four assets' prices are now very different from each other and from bar 30.
         let last = n_bars - 1;
         assert_eq!(last, 40);
-        assert!(r.decision[last], "bar 40 (the panel's final bar) must be a decision bar");
+        assert!(
+            r.decision[last],
+            "bar 40 (the panel's final bar) must be a decision bar"
+        );
         let held_40 = r.row(&r.held_weights, last);
         for (i, &w) in held_40.iter().enumerate() {
-            assert!((w - 0.25).abs() < 1e-9, "held[{i}] at bar 40 must snap back to 1/N, got {w}");
+            assert!(
+                (w - 0.25).abs() < 1e-9,
+                "held[{i}] at bar 40 must snap back to 1/N, got {w}"
+            );
         }
     }
 
@@ -260,7 +316,12 @@ mod tests {
         // Choice 1 and 2 as a direct, minimal check on the method itself (bypassing the simulator): whatever
         // prices and however many bars are visible, `target_weights` always returns `Ok(vec![1/N; N])`.
         let dates: Vec<Date> = (1..=3).map(|day| d(&format!("2021-06-{day:02}"))).collect();
-        let wild = vec![vec![1.0, 1_000_000.0, 0.0001], vec![5.0, 5.0, 5.0], vec![9.0, 1.0, 9.0], vec![2.0, 2.0, 2.0]];
+        let wild = vec![
+            vec![1.0, 1_000_000.0, 0.0001],
+            vec![5.0, 5.0, 5.0],
+            vec![9.0, 1.0, 9.0],
+            vec![2.0, 2.0, 2.0],
+        ];
         let p = panel_from(wild, dates);
         let rule = EqualWeightRebalanceRule;
         for t in 0..p.n_bars() {
@@ -275,7 +336,10 @@ mod tests {
             }
         }
         let r = simulate(&p, &rule, &SimConfig::default()).unwrap();
-        assert!(r.refused.iter().all(|&ref_| !ref_), "this rule never refuses");
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "this rule never refuses"
+        );
         assert!(!r.refusals.iter().any(|_| true));
     }
 }

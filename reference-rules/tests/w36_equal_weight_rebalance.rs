@@ -38,33 +38,54 @@ fn identity_against_independent_python_implementation() {
     // held weights are all 0.0 (no position invented ahead of the rule's first successful decision).
     let held_20 = r.row(&r.held_weights, 20);
     for &w in held_20 {
-        assert!(w.abs() < TOL, "pre-decision held weight must be 0.0, got {w}");
+        assert!(
+            w.abs() < TOL,
+            "pre-decision held weight must be 0.0, got {w}"
+        );
     }
 
     // Bar 30: first decision/trade. Held weights snap to exactly 1/N (all four assets priced equally at the
     // moment of the trade).
     let held_30 = r.row(&r.held_weights, 30);
     for &w in held_30 {
-        assert!((w - 0.25).abs() < TOL, "held weight at the first decision must be 0.25, got {w}");
+        assert!(
+            (w - 0.25).abs() < TOL,
+            "held weight at the first decision must be 0.25, got {w}"
+        );
     }
 
     // Bar 45 (2024-02-15), strictly between the Jan-31 and Feb-29 decisions: weights have drifted away from
     // 1/N by each asset's own compounding since the bar-30 trade. Values below are the independently-computed
     // (Kimi + by-hand) ground truth, symbol order [SPY, AGG, GLD, VNQ].
     let held_45 = r.row(&r.held_weights, 45);
-    let want_45 = [0.2480999473522632_f64, 0.2518476102818976, 0.24440438608888776, 0.25564805627695153];
+    let want_45 = [
+        0.2480999473522632_f64,
+        0.2518476102818976,
+        0.24440438608888776,
+        0.25564805627695153,
+    ];
     for (i, (&g, &w)) in held_45.iter().zip(want_45.iter()).enumerate() {
-        assert!((g - w).abs() < TOL, "asset {i} ({}) at bar 45: got {g}, want {w}", EQUAL_WEIGHT_REBALANCE_SYMBOLS[i]);
+        assert!(
+            (g - w).abs() < TOL,
+            "asset {i} ({}) at bar 45: got {g}, want {w}",
+            EQUAL_WEIGHT_REBALANCE_SYMBOLS[i]
+        );
     }
     let sum_45: f64 = held_45.iter().sum();
-    assert!((sum_45 - 1.0).abs() < TOL, "held weights must still sum to 1.0 while drifting, got {sum_45}");
+    assert!(
+        (sum_45 - 1.0).abs() < TOL,
+        "held weights must still sum to 1.0 while drifting, got {sum_45}"
+    );
 
     // Bar 59 (2024-02-29, last bar of February) and bar 69 (2024-03-10, panel's final bar) are both decisions:
     // the book snaps back to exactly 1/N at each.
     for &t in &[59usize, 69usize] {
         let held = r.row(&r.held_weights, t);
         for &w in held {
-            assert!((w - 0.25).abs() < TOL, "held weight at decision bar {t} must be 0.25, got {w}");
+            assert!(
+                (w - 0.25).abs() < TOL,
+                "held weight at decision bar {t} must be 0.25, got {w}"
+            );
         }
     }
 }

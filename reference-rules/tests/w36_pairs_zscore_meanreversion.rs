@@ -43,21 +43,36 @@ fn identity_against_independent_python_implementation() {
 
     // Bar 59: one short of L+1=61 bars -- silent skip, flat.
     let w59 = r.row(&r.target_weights, 59);
-    assert!((w59[0]).abs() < TOL && (w59[1]).abs() < TOL, "bar 59 must be flat (insufficient history): {w59:?}");
+    assert!(
+        (w59[0]).abs() < TOL && (w59[1]).abs() < TOL,
+        "bar 59 must be flat (insufficient history): {w59:?}"
+    );
 
     // Bar 60: first eligible bar (61 bars visible), smooth relationship, no signal -- flat.
     let w60 = r.row(&r.target_weights, 60);
-    assert!((w60[0]).abs() < TOL && (w60[1]).abs() < TOL, "bar 60 must be flat (no signal yet): {w60:?}");
+    assert!(
+        (w60[0]).abs() < TOL && (w60[1]).abs() < TOL,
+        "bar 60 must be flat (no signal yet): {w60:?}"
+    );
 
     // Bar 78: calibrated entry -- z far below -entry_threshold -> long-KO/short-PEP.
     let w78 = r.row(&r.target_weights, 78);
-    assert!((w78[0] - 0.5).abs() < TOL && (w78[1] + 0.5).abs() < TOL, "bar 78 must enter long-KO/short-PEP: {w78:?}");
+    assert!(
+        (w78[0] - 0.5).abs() < TOL && (w78[1] + 0.5).abs() < TOL,
+        "bar 78 must enter long-KO/short-PEP: {w78:?}"
+    );
 
     // Bar 79: calibrated hysteresis band (exit_threshold < |z| < entry_threshold) -- HOLD unchanged.
     let w79 = r.row(&r.target_weights, 79);
-    assert!((w79[0] - 0.5).abs() < TOL && (w79[1] + 0.5).abs() < TOL, "bar 79 must hold the position: {w79:?}");
+    assert!(
+        (w79[0] - 0.5).abs() < TOL && (w79[1] + 0.5).abs() < TOL,
+        "bar 79 must hold the position: {w79:?}"
+    );
 
     // Bar 80: calibrated exit -- |z| < exit_threshold -> flat.
     let w80 = r.row(&r.target_weights, 80);
-    assert!((w80[0]).abs() < TOL && (w80[1]).abs() < TOL, "bar 80 must exit to flat: {w80:?}");
+    assert!(
+        (w80[0]).abs() < TOL && (w80[1]).abs() < TOL,
+        "bar 80 must exit to flat: {w80:?}"
+    );
 }

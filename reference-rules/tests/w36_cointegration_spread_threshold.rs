@@ -37,25 +37,45 @@ const FIXTURE: &str = include_str!("data/w36_cointegration_spread_threshold.csv"
 fn identity_against_independent_python_implementation() {
     let panel = Panel::from_long_csv(FIXTURE, &COINT_SYMBOLS).unwrap();
     assert_eq!(panel.n_bars(), 105);
-    let r = simulate(&panel, &CointegrationSpreadThresholdRule, &SimConfig::default()).unwrap();
+    let r = simulate(
+        &panel,
+        &CointegrationSpreadThresholdRule,
+        &SimConfig::default(),
+    )
+    .unwrap();
 
     // Bar 89: one short of L+1=91 bars -- silent skip, flat.
     let w89 = r.row(&r.target_weights, 89);
-    assert!(w89[0].abs() < TOL && w89[1].abs() < TOL, "bar 89 must be flat (insufficient history): {w89:?}");
+    assert!(
+        w89[0].abs() < TOL && w89[1].abs() < TOL,
+        "bar 89 must be flat (insufficient history): {w89:?}"
+    );
 
     // Bar 90: first eligible bar (91 bars visible), smooth relationship, no signal -- flat.
     let w90 = r.row(&r.target_weights, 90);
-    assert!(w90[0].abs() < TOL && w90[1].abs() < TOL, "bar 90 must be flat (no signal yet): {w90:?}");
+    assert!(
+        w90[0].abs() < TOL && w90[1].abs() < TOL,
+        "bar 90 must be flat (no signal yet): {w90:?}"
+    );
 
     // Bar 102: calibrated entry -- z far below -entry_threshold -> long-EWA/short-EWC.
     let w102 = r.row(&r.target_weights, 102);
-    assert!((w102[0] - 0.5).abs() < TOL && (w102[1] + 0.5).abs() < TOL, "bar 102 must enter long-EWA/short-EWC: {w102:?}");
+    assert!(
+        (w102[0] - 0.5).abs() < TOL && (w102[1] + 0.5).abs() < TOL,
+        "bar 102 must enter long-EWA/short-EWC: {w102:?}"
+    );
 
     // Bar 103: calibrated hysteresis band -- HOLD unchanged.
     let w103 = r.row(&r.target_weights, 103);
-    assert!((w103[0] - 0.5).abs() < TOL && (w103[1] + 0.5).abs() < TOL, "bar 103 must hold the position: {w103:?}");
+    assert!(
+        (w103[0] - 0.5).abs() < TOL && (w103[1] + 0.5).abs() < TOL,
+        "bar 103 must hold the position: {w103:?}"
+    );
 
     // Bar 104: calibrated exit -- |z| < exit_threshold -> flat.
     let w104 = r.row(&r.target_weights, 104);
-    assert!(w104[0].abs() < TOL && w104[1].abs() < TOL, "bar 104 must exit to flat: {w104:?}");
+    assert!(
+        w104[0].abs() < TOL && w104[1].abs() < TOL,
+        "bar 104 must exit to flat: {w104:?}"
+    );
 }

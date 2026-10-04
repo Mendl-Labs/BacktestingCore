@@ -89,7 +89,10 @@ impl WeightRule for InverseVolatilityWeightRule {
 
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
         BTreeMap::from([
-            ("lookback_days", INVERSE_VOLATILITY_LOOKBACK_DAYS.to_string()),
+            (
+                "lookback_days",
+                INVERSE_VOLATILITY_LOOKBACK_DAYS.to_string(),
+            ),
             ("schedule", "\"daily\"".to_string()),
             ("rebalance_policy", "\"every_bar\"".to_string()),
         ])
@@ -197,8 +200,10 @@ mod tests {
                 }
             })
             .collect();
-        let symbols: Vec<String> =
-            INVERSE_VOLATILITY_SYMBOLS[..closes.len()].iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = INVERSE_VOLATILITY_SYMBOLS[..closes.len()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         Panel::new(symbols, dates, closes).unwrap()
     }
 
@@ -220,7 +225,11 @@ mod tests {
         let mut p = start;
         for i in 0..n_bars {
             v.push(p);
-            let g = if i % 2 == 0 { 1.0 + amplitude } else { 1.0 / (1.0 + amplitude) };
+            let g = if i % 2 == 0 {
+                1.0 + amplitude
+            } else {
+                1.0 / (1.0 + amplitude)
+            };
             p *= g;
         }
         v
@@ -257,7 +266,10 @@ mod tests {
         let w = last_weights(&p);
         assert_eq!(w.len(), INVERSE_VOLATILITY_SYMBOLS.len());
         let sum: f64 = w.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-12, "weights must sum to 1.0, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "weights must sum to 1.0, got {sum}"
+        );
     }
 
     #[test]
@@ -267,7 +279,10 @@ mod tests {
         let volatile = noisy_series(100.0, L + 1, 0.05);
         let p = panel_from(vec![calm, volatile]);
         let w = last_weights(&p);
-        assert!(w[0] > w[1], "calmer asset should get the higher weight: {w:?}");
+        assert!(
+            w[0] > w[1],
+            "calmer asset should get the higher weight: {w:?}"
+        );
     }
 
     #[test]
@@ -281,8 +296,14 @@ mod tests {
         let b = noisy_series(50.0, L, 0.02);
         let p = panel_from(vec![a, b]);
         let r = simulate(&p, &InverseVolatilityWeightRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&d| !d), "no bar has enough history to decide");
-        assert!(r.refused.iter().all(|&ref_| !ref_), "a silent skip must not be recorded as a refusal");
+        assert!(
+            r.decision.iter().all(|&d| !d),
+            "no bar has enough history to decide"
+        );
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "a silent skip must not be recorded as a refusal"
+        );
         assert!(r.target_weights.iter().all(|&w| w == 0.0));
 
         // One bar later (L + 1 bars) both assets clear the threshold and the final bar decides successfully.
@@ -290,7 +311,10 @@ mod tests {
         let b2 = noisy_series(50.0, L + 1, 0.02);
         let p2 = panel_from(vec![a2, b2]);
         let r2 = simulate(&p2, &InverseVolatilityWeightRule, &SimConfig::default()).unwrap();
-        assert!(r2.decision[p2.n_bars() - 1], "L + 1 bars must be enough to decide");
+        assert!(
+            r2.decision[p2.n_bars() - 1],
+            "L + 1 bars must be enough to decide"
+        );
     }
 
     #[test]

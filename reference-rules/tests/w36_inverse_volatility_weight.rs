@@ -34,8 +34,15 @@ fn identity_against_independent_python_implementation() {
         0.22988505747126514,
     ];
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-        assert!((g - w).abs() < TOL, "asset {i} ({}): got {g}, want {w}", INVERSE_VOLATILITY_SYMBOLS[i]);
+        assert!(
+            (g - w).abs() < TOL,
+            "asset {i} ({}): got {g}, want {w}",
+            INVERSE_VOLATILITY_SYMBOLS[i]
+        );
     }
     let sum: f64 = got.iter().sum();
-    assert!((sum - 1.0).abs() < TOL, "weights must sum to 1.0, got {sum}");
+    assert!(
+        (sum - 1.0).abs() < TOL,
+        "weights must sum to 1.0, got {sum}"
+    );
 }

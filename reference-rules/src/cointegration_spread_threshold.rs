@@ -203,7 +203,10 @@ impl CointegrationSpreadThresholdRule {
     /// zero/non-finite variance in `ln(close_B)` over that window).
     fn hedge_ratio_for_refresh(closes_a: &[f64], closes_b: &[f64], r: usize) -> Option<f64> {
         let l = COINT_LOOKBACK_DAYS;
-        debug_assert!(r >= l, "a refresh point must have a full L-bar window strictly before it");
+        debug_assert!(
+            r >= l,
+            "a refresh point must have a full L-bar window strictly before it"
+        );
         let start = r - l;
         let end = r - 1; // inclusive
         let window_a = &closes_a[start..=end];
@@ -216,7 +219,11 @@ impl CointegrationSpreadThresholdRule {
         let mean_a = ln_a.iter().sum::<f64>() / l_f;
         let mean_b = ln_b.iter().sum::<f64>() / l_f;
 
-        let cov_ab: f64 = ln_a.iter().zip(&ln_b).map(|(a, b)| (a - mean_a) * (b - mean_b)).sum();
+        let cov_ab: f64 = ln_a
+            .iter()
+            .zip(&ln_b)
+            .map(|(a, b)| (a - mean_a) * (b - mean_b))
+            .sum();
         let var_b: f64 = ln_b.iter().map(|b| (b - mean_b) * (b - mean_b)).sum();
         if !(var_b.is_finite() && var_b > 0.0) {
             return None; // degenerate hedge ratio (choice 8): zero/non-finite variance in ln(close_B).
@@ -232,7 +239,10 @@ impl CointegrationSpreadThresholdRule {
     /// stdev in the window).
     fn zscore_at(closes_a: &[f64], closes_b: &[f64], s: usize, hedge_ratio: f64) -> Option<f64> {
         let l = COINT_LOOKBACK_DAYS;
-        debug_assert!(s + 1 >= l, "caller must only evaluate bars with a full L-bar window");
+        debug_assert!(
+            s + 1 >= l,
+            "caller must only evaluate bars with a full L-bar window"
+        );
         let start = s + 1 - l;
         let window_a = &closes_a[start..=s];
         let window_b = &closes_b[start..=s];
@@ -241,10 +251,17 @@ impl CointegrationSpreadThresholdRule {
         let ln_b: Vec<f64> = window_b.iter().map(|x| x.ln()).collect();
 
         let l_f = l as f64;
-        let spreads: Vec<f64> = ln_a.iter().zip(&ln_b).map(|(a, b)| a - hedge_ratio * b).collect();
+        let spreads: Vec<f64> = ln_a
+            .iter()
+            .zip(&ln_b)
+            .map(|(a, b)| a - hedge_ratio * b)
+            .collect();
         let mean_spread = spreads.iter().sum::<f64>() / l_f;
-        let var_spread: f64 =
-            spreads.iter().map(|sp| (sp - mean_spread) * (sp - mean_spread)).sum::<f64>() / l_f; // ddof = 0
+        let var_spread: f64 = spreads
+            .iter()
+            .map(|sp| (sp - mean_spread) * (sp - mean_spread))
+            .sum::<f64>()
+            / l_f; // ddof = 0
         let stdev_spread = var_spread.sqrt();
         if !(stdev_spread.is_finite() && stdev_spread > 0.0) {
             return None; // degenerate z-score (choice 8): zero/non-finite spread stdev.
@@ -375,7 +392,8 @@ mod tests {
     /// per call here is simpler for a one-off calibration probe and produces an identical answer).
     fn rule_zscore_at(closes_a: &[f64], closes_b: &[f64], s: usize) -> Option<f64> {
         let r = CointegrationSpreadThresholdRule::refresh_point(s);
-        let hedge_ratio = CointegrationSpreadThresholdRule::hedge_ratio_for_refresh(closes_a, closes_b, r)?;
+        let hedge_ratio =
+            CointegrationSpreadThresholdRule::hedge_ratio_for_refresh(closes_a, closes_b, r)?;
         CointegrationSpreadThresholdRule::zscore_at(closes_a, closes_b, s, hedge_ratio)
     }
 
@@ -410,9 +428,15 @@ mod tests {
         let rule = CointegrationSpreadThresholdRule;
         let params = rule.declared_parameters();
         assert_eq!(params.get("lookback_days").map(|s| s.as_str()), Some("90"));
-        assert_eq!(params.get("hedge_ratio_refresh_days").map(|s| s.as_str()), Some("90"));
+        assert_eq!(
+            params.get("hedge_ratio_refresh_days").map(|s| s.as_str()),
+            Some("90")
+        );
         assert_eq!(params.get("entry_threshold").map(|s| s.as_str()), Some("2"));
-        assert_eq!(params.get("exit_threshold").map(|s| s.as_str()), Some("0.5"));
+        assert_eq!(
+            params.get("exit_threshold").map(|s| s.as_str()),
+            Some("0.5")
+        );
         assert_eq!(rule.min_history_bars(), L + 1);
         assert_eq!(rule.decision_schedule(), DecisionSchedule::Daily);
         assert_eq!(rule.rebalance_policy(), RebalancePolicy::OnDecision);
@@ -425,8 +449,14 @@ mod tests {
         let (a, b) = warmup_then_jump(L, -10.0, 0.0);
         let p = panel_from(a, b);
         let r = simulate(&p, &CointegrationSpreadThresholdRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&dec| !dec), "no bar has L + 1 bars visible");
-        assert!(r.refused.iter().all(|&ref_| !ref_), "a silent skip must not be recorded as a refusal");
+        assert!(
+            r.decision.iter().all(|&dec| !dec),
+            "no bar has L + 1 bars visible"
+        );
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "a silent skip must not be recorded as a refusal"
+        );
         assert!(r.target_weights.iter().all(|&w| w == 0.0));
     }
 
@@ -434,14 +464,22 @@ mod tests {
     fn large_negative_zscore_enters_long_a_short_b() {
         let (a, b) = warmup_then_jump(L + 5, -5.0, 0.0);
         let w = last_weights(a, b);
-        assert_eq!(w, vec![0.5, -0.5], "z far below -entry_threshold must enter long-A/short-B: {w:?}");
+        assert_eq!(
+            w,
+            vec![0.5, -0.5],
+            "z far below -entry_threshold must enter long-A/short-B: {w:?}"
+        );
     }
 
     #[test]
     fn large_positive_zscore_enters_short_a_long_b() {
         let (a, b) = warmup_then_jump(L + 5, 5.0, 0.0);
         let w = last_weights(a, b);
-        assert_eq!(w, vec![-0.5, 0.5], "z far above +entry_threshold must enter short-A/long-B: {w:?}");
+        assert_eq!(
+            w,
+            vec![-0.5, 0.5],
+            "z far above +entry_threshold must enter short-A/long-B: {w:?}"
+        );
     }
 
     #[test]
@@ -477,14 +515,32 @@ mod tests {
         let a = build(exit_jump);
 
         let p_enter = panel_from(a[..=enter_at].to_vec(), b[..=enter_at].to_vec());
-        let r_enter = simulate(&p_enter, &CointegrationSpreadThresholdRule, &SimConfig::default()).unwrap();
+        let r_enter = simulate(
+            &p_enter,
+            &CointegrationSpreadThresholdRule,
+            &SimConfig::default(),
+        )
+        .unwrap();
         let w_enter = r_enter.row(&r_enter.target_weights, enter_at).to_vec();
-        assert_eq!(w_enter, vec![0.5, -0.5], "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}");
+        assert_eq!(
+            w_enter,
+            vec![0.5, -0.5],
+            "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}"
+        );
 
         let p_full = panel_from(a, b);
-        let r_full = simulate(&p_full, &CointegrationSpreadThresholdRule, &SimConfig::default()).unwrap();
+        let r_full = simulate(
+            &p_full,
+            &CointegrationSpreadThresholdRule,
+            &SimConfig::default(),
+        )
+        .unwrap();
         let w_exit = r_full.row(&r_full.target_weights, exit_at).to_vec();
-        assert_eq!(w_exit, vec![0.0, 0.0], "z back inside the exit band must flatten the position: {w_exit:?}");
+        assert_eq!(
+            w_exit,
+            vec![0.0, 0.0],
+            "z back inside the exit band must flatten the position: {w_exit:?}"
+        );
     }
 
     #[test]
@@ -520,8 +576,16 @@ mod tests {
         let r = simulate(&p, &CointegrationSpreadThresholdRule, &SimConfig::default()).unwrap();
         let w_enter = r.row(&r.target_weights, enter_at).to_vec();
         let w_hold = r.row(&r.target_weights, hold_at).to_vec();
-        assert_eq!(w_enter, vec![0.5, -0.5], "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}");
-        assert_eq!(w_hold, vec![0.5, -0.5], "position must hold unchanged inside the hysteresis band: {w_hold:?}");
+        assert_eq!(
+            w_enter,
+            vec![0.5, -0.5],
+            "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}"
+        );
+        assert_eq!(
+            w_hold,
+            vec![0.5, -0.5],
+            "position must hold unchanged inside the hysteresis band: {w_hold:?}"
+        );
     }
 
     /// THE key structural test: proves the hedge ratio is NOT recomputed every bar, but held fixed across a full
@@ -577,7 +641,11 @@ mod tests {
             let l_f = l as f64;
             let mean_a = ln_a.iter().sum::<f64>() / l_f;
             let mean_b = ln_b.iter().sum::<f64>() / l_f;
-            let cov_ab: f64 = ln_a.iter().zip(&ln_b).map(|(x, y)| (x - mean_a) * (y - mean_b)).sum();
+            let cov_ab: f64 = ln_a
+                .iter()
+                .zip(&ln_b)
+                .map(|(x, y)| (x - mean_a) * (y - mean_b))
+                .sum();
             let var_b: f64 = ln_b.iter().map(|y| (y - mean_b) * (y - mean_b)).sum();
             cov_ab / var_b
         };
@@ -607,7 +675,9 @@ mod tests {
         // And the cycle genuinely does end: the NEXT refresh point is different and does pick up regime B.
         let next_refresh = CointegrationSpreadThresholdRule::refresh_point(2 * l);
         assert_eq!(next_refresh, 2 * l);
-        let next_ratio = CointegrationSpreadThresholdRule::hedge_ratio_for_refresh(&a, &b, next_refresh).unwrap();
+        let next_ratio =
+            CointegrationSpreadThresholdRule::hedge_ratio_for_refresh(&a, &b, next_refresh)
+                .unwrap();
         assert!(
             (next_ratio - 3.0 / 5.0).abs() < 1e-9,
             "the cycle immediately after this one must pick up regime B's ratio: {next_ratio}"

@@ -35,7 +35,12 @@ fn identity_against_independent_python_implementation() {
     let got = r.row(&r.target_weights, panel.n_bars() - 1);
 
     // symbol order is INVERSE_VOL_RISK_PARITY_SYMBOLS = [SPY, EFA, AGG, DBC]
-    let want = [0.26086956521738974_f64, 0.08695652173912988, 0.5217391304347856, 0.13043478260869482];
+    let want = [
+        0.26086956521738974_f64,
+        0.08695652173912988,
+        0.5217391304347856,
+        0.13043478260869482,
+    ];
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         assert!(
             (g - w).abs() < TOL,
@@ -44,5 +49,8 @@ fn identity_against_independent_python_implementation() {
         );
     }
     let sum: f64 = got.iter().sum();
-    assert!((sum - 1.0).abs() < TOL, "weights must sum to 1.0, got {sum}");
+    assert!(
+        (sum - 1.0).abs() < TOL,
+        "weights must sum to 1.0, got {sum}"
+    );
 }

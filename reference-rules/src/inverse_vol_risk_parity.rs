@@ -107,7 +107,10 @@ impl WeightRule for InverseVolRiskParityRule {
 
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
         BTreeMap::from([
-            ("lookback_days", INVERSE_VOL_RISK_PARITY_LOOKBACK_DAYS.to_string()),
+            (
+                "lookback_days",
+                INVERSE_VOL_RISK_PARITY_LOOKBACK_DAYS.to_string(),
+            ),
             ("schedule", "\"daily\"".to_string()),
             ("rebalance_policy", "\"every_bar\"".to_string()),
         ])
@@ -213,8 +216,10 @@ mod tests {
                 d(&format!("{y:04}-{m:02}-{day_in_month:02}"))
             })
             .collect();
-        let symbols: Vec<String> =
-            INVERSE_VOL_RISK_PARITY_SYMBOLS[..closes.len()].iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = INVERSE_VOL_RISK_PARITY_SYMBOLS[..closes.len()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         Panel::new(symbols, dates, closes).unwrap()
     }
 
@@ -236,7 +241,11 @@ mod tests {
         let mut p = start;
         for i in 0..n_bars {
             v.push(p);
-            let g = if i % 2 == 0 { 1.0 + amplitude } else { 1.0 / (1.0 + amplitude) };
+            let g = if i % 2 == 0 {
+                1.0 + amplitude
+            } else {
+                1.0 / (1.0 + amplitude)
+            };
             p *= g;
         }
         v
@@ -274,7 +283,10 @@ mod tests {
         let w = last_weights(&p);
         assert_eq!(w.len(), INVERSE_VOL_RISK_PARITY_SYMBOLS.len());
         let sum: f64 = w.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-12, "weights must sum to 1.0, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "weights must sum to 1.0, got {sum}"
+        );
     }
 
     #[test]
@@ -284,7 +296,10 @@ mod tests {
         let volatile = noisy_series(100.0, L + 1, 0.05);
         let p = panel_from(vec![calm, volatile]);
         let w = last_weights(&p);
-        assert!(w[0] > w[1], "calmer asset should get the higher weight: {w:?}");
+        assert!(
+            w[0] > w[1],
+            "calmer asset should get the higher weight: {w:?}"
+        );
     }
 
     #[test]
@@ -299,14 +314,18 @@ mod tests {
         let w = last_weights(&p);
 
         fn population_stdev_of_returns(closes: &[f64]) -> f64 {
-            let returns: Vec<f64> = (1..closes.len()).map(|k| closes[k] / closes[k - 1] - 1.0).collect();
+            let returns: Vec<f64> = (1..closes.len())
+                .map(|k| closes[k] / closes[k - 1] - 1.0)
+                .collect();
             let n = returns.len() as f64;
             let mean = returns.iter().sum::<f64>() / n;
             (returns.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / n).sqrt()
         }
 
-        let inv_vols: Vec<f64> =
-            [&a, &b, &c, &e].iter().map(|s| 1.0 / population_stdev_of_returns(s)).collect();
+        let inv_vols: Vec<f64> = [&a, &b, &c, &e]
+            .iter()
+            .map(|s| 1.0 / population_stdev_of_returns(s))
+            .collect();
         let total: f64 = inv_vols.iter().sum();
         let expected: Vec<f64> = inv_vols.iter().map(|v| v / total).collect();
 
@@ -331,8 +350,14 @@ mod tests {
         let b = noisy_series(50.0, L, 0.02);
         let p = panel_from(vec![a, b]);
         let r = simulate(&p, &InverseVolRiskParityRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&d| !d), "no bar has enough history to decide");
-        assert!(r.refused.iter().all(|&ref_| !ref_), "a silent skip must not be recorded as a refusal");
+        assert!(
+            r.decision.iter().all(|&d| !d),
+            "no bar has enough history to decide"
+        );
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "a silent skip must not be recorded as a refusal"
+        );
         assert!(r.target_weights.iter().all(|&w| w == 0.0));
 
         // One bar later (L + 1 bars) both assets clear the threshold and the final bar decides successfully.
@@ -340,7 +365,10 @@ mod tests {
         let b2 = noisy_series(50.0, L + 1, 0.02);
         let p2 = panel_from(vec![a2, b2]);
         let r2 = simulate(&p2, &InverseVolRiskParityRule, &SimConfig::default()).unwrap();
-        assert!(r2.decision[p2.n_bars() - 1], "L + 1 bars must be enough to decide");
+        assert!(
+            r2.decision[p2.n_bars() - 1],
+            "L + 1 bars must be enough to decide"
+        );
     }
 
     #[test]
@@ -371,7 +399,9 @@ mod tests {
         // this rule's schedule or weightsim's Daily semantics would break this test rather than silently drift.
         let rule = InverseVolRiskParityRule;
         assert_eq!(rule.decision_schedule(), DecisionSchedule::Daily);
-        let dates: Vec<Date> = (0..5).map(|i| d(&format!("2020-01-{:02}", i + 1))).collect();
+        let dates: Vec<Date> = (0..5)
+            .map(|i| d(&format!("2020-01-{:02}", i + 1)))
+            .collect();
         for t in 0..dates.len() {
             assert!(
                 DecisionSchedule::Daily.is_decision_bar(&dates, t),

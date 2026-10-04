@@ -185,7 +185,11 @@ impl WeightRule for LowVolQuintileTiltRule {
         }
 
         // Ascending by (stdev, symbol): stdev primary, symbol breaks exact ties alphabetically (choice 8).
-        eligible.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("non-finite stdev already rejected above").then(a.1.cmp(b.1)));
+        eligible.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .expect("non-finite stdev already rejected above")
+                .then(a.1.cmp(b.1))
+        });
 
         let k = quintile_count(eligible.len());
         let held = &eligible[..k.min(eligible.len())];
@@ -233,8 +237,10 @@ mod tests {
                 }
             })
             .collect();
-        let symbols: Vec<String> =
-            LOW_VOL_QUINTILE_SYMBOLS[..closes.len()].iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = LOW_VOL_QUINTILE_SYMBOLS[..closes.len()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         Panel::new(symbols, dates, closes).unwrap()
     }
 
@@ -257,7 +263,11 @@ mod tests {
         let mut p = start;
         for i in 0..n_bars {
             v.push(p);
-            let g = if i % 2 == 0 { 1.0 + amplitude } else { 1.0 / (1.0 + amplitude) };
+            let g = if i % 2 == 0 {
+                1.0 + amplitude
+            } else {
+                1.0 / (1.0 + amplitude)
+            };
             p *= g;
         }
         v
@@ -311,11 +321,25 @@ mod tests {
         let w = last_weights(&p);
         assert_eq!(w.len(), LOW_VOL_QUINTILE_SYMBOLS.len());
         let held: Vec<usize> = (0..w.len()).filter(|&i| w[i] != 0.0).collect();
-        assert_eq!(held.len(), 1, "exactly quintile_count(7) == 1 asset should be held: {w:?}");
-        assert_eq!(held[0], 0, "the calmest asset (index 0, DIA) must be the one held: {w:?}");
-        assert!((w[0] - 1.0).abs() < 1e-12, "the sole held asset must get weight 1.0, got {}", w[0]);
+        assert_eq!(
+            held.len(),
+            1,
+            "exactly quintile_count(7) == 1 asset should be held: {w:?}"
+        );
+        assert_eq!(
+            held[0], 0,
+            "the calmest asset (index 0, DIA) must be the one held: {w:?}"
+        );
+        assert!(
+            (w[0] - 1.0).abs() < 1e-12,
+            "the sole held asset must get weight 1.0, got {}",
+            w[0]
+        );
         for (i, &wi) in w.iter().enumerate().skip(1) {
-            assert_eq!(wi, 0.0, "asset {i} outside the bottom quintile must get weight 0.0, got {wi}");
+            assert_eq!(
+                wi, 0.0,
+                "asset {i} outside the bottom quintile must get weight 0.0, got {wi}"
+            );
         }
     }
 
@@ -330,8 +354,14 @@ mod tests {
         let efa = noisy_series(70.0, L + 1, 0.05);
         let p = panel_from(vec![dia, eem, efa]);
         let w = last_weights(&p);
-        assert!((w[0] - 1.0).abs() < 1e-12, "DIA (alphabetically first of the tied pair) must be held: {w:?}");
-        assert_eq!(w[1], 0.0, "EEM must lose the alphabetical tie-break and get zero weight: {w:?}");
+        assert!(
+            (w[0] - 1.0).abs() < 1e-12,
+            "DIA (alphabetically first of the tied pair) must be held: {w:?}"
+        );
+        assert_eq!(
+            w[1], 0.0,
+            "EEM must lose the alphabetical tie-break and get zero weight: {w:?}"
+        );
     }
 
     #[test]
@@ -345,8 +375,14 @@ mod tests {
         let b = noisy_series(50.0, L, 0.02);
         let p = panel_from(vec![a, b]);
         let r = simulate(&p, &LowVolQuintileTiltRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&d| !d), "no bar has enough history to decide");
-        assert!(r.refused.iter().all(|&ref_| !ref_), "a silent skip must not be recorded as a refusal");
+        assert!(
+            r.decision.iter().all(|&d| !d),
+            "no bar has enough history to decide"
+        );
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "a silent skip must not be recorded as a refusal"
+        );
         assert!(r.target_weights.iter().all(|&w| w == 0.0));
 
         // One bar later (L + 1 bars) both assets clear the threshold and the final bar decides successfully.
@@ -354,7 +390,10 @@ mod tests {
         let b2 = noisy_series(50.0, L + 1, 0.02);
         let p2 = panel_from(vec![a2, b2]);
         let r2 = simulate(&p2, &LowVolQuintileTiltRule, &SimConfig::default()).unwrap();
-        assert!(r2.decision[p2.n_bars() - 1], "L + 1 bars must be enough to decide");
+        assert!(
+            r2.decision[p2.n_bars() - 1],
+            "L + 1 bars must be enough to decide"
+        );
     }
 
     #[test]
@@ -367,7 +406,10 @@ mod tests {
         let b = noisy_series(60.0, L + 1, 0.03);
         let p = panel_from(vec![flat, a, b]);
         let w = last_weights(&p);
-        assert!((w[0] - 1.0).abs() < 1e-12, "the flat (zero-vol) asset must be held: {w:?}");
+        assert!(
+            (w[0] - 1.0).abs() < 1e-12,
+            "the flat (zero-vol) asset must be held: {w:?}"
+        );
     }
 
     #[test]
@@ -379,7 +421,12 @@ mod tests {
         let p = panel_from(vec![a, b]);
         let w = last_weights(&p);
         let sum: f64 = w.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-12, "held weights must sum to 1.0, got {sum}");
-        assert!(w.iter().all(|&wi| wi == 0.0 || (wi - 1.0 / quintile_count(7) as f64).abs() < 1e-12));
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "held weights must sum to 1.0, got {sum}"
+        );
+        assert!(w
+            .iter()
+            .all(|&wi| wi == 0.0 || (wi - 1.0 / quintile_count(7) as f64).abs() < 1e-12));
     }
 }

@@ -183,7 +183,10 @@ impl PairsZscoreMeanReversionRule {
     /// the z-score cannot be finitely computed (choice 7 above: zero/non-finite variance somewhere in the window).
     fn zscore_at(closes_a: &[f64], closes_b: &[f64], s: usize) -> Option<f64> {
         let l = PAIRS_LOOKBACK_DAYS;
-        debug_assert!(s + 1 >= l, "caller must only evaluate bars with a full L-bar window");
+        debug_assert!(
+            s + 1 >= l,
+            "caller must only evaluate bars with a full L-bar window"
+        );
         let start = s + 1 - l;
         let window_a = &closes_a[start..=s];
         let window_b = &closes_b[start..=s];
@@ -195,7 +198,11 @@ impl PairsZscoreMeanReversionRule {
         let mean_a = ln_a.iter().sum::<f64>() / l_f;
         let mean_b = ln_b.iter().sum::<f64>() / l_f;
 
-        let cov_ab: f64 = ln_a.iter().zip(&ln_b).map(|(a, b)| (a - mean_a) * (b - mean_b)).sum();
+        let cov_ab: f64 = ln_a
+            .iter()
+            .zip(&ln_b)
+            .map(|(a, b)| (a - mean_a) * (b - mean_b))
+            .sum();
         let var_b: f64 = ln_b.iter().map(|b| (b - mean_b) * (b - mean_b)).sum();
         if !(var_b.is_finite() && var_b > 0.0) {
             return None; // degenerate hedge ratio (choice 7): zero/non-finite variance in ln(close_B).
@@ -206,10 +213,17 @@ impl PairsZscoreMeanReversionRule {
         }
 
         // Reconstruct every spread value in the window with this ONE hedge ratio (choice 3).
-        let spreads: Vec<f64> = ln_a.iter().zip(&ln_b).map(|(a, b)| a - hedge_ratio * b).collect();
+        let spreads: Vec<f64> = ln_a
+            .iter()
+            .zip(&ln_b)
+            .map(|(a, b)| a - hedge_ratio * b)
+            .collect();
         let mean_spread = spreads.iter().sum::<f64>() / l_f;
-        let var_spread: f64 =
-            spreads.iter().map(|sp| (sp - mean_spread) * (sp - mean_spread)).sum::<f64>() / l_f; // ddof = 0
+        let var_spread: f64 = spreads
+            .iter()
+            .map(|sp| (sp - mean_spread) * (sp - mean_spread))
+            .sum::<f64>()
+            / l_f; // ddof = 0
         let stdev_spread = var_spread.sqrt();
         if !(stdev_spread.is_finite() && stdev_spread > 0.0) {
             return None; // degenerate z-score (choice 7): zero/non-finite spread stdev.
@@ -364,7 +378,10 @@ mod tests {
         let params = rule.declared_parameters();
         assert_eq!(params.get("lookback_days").map(|s| s.as_str()), Some("60"));
         assert_eq!(params.get("entry_threshold").map(|s| s.as_str()), Some("2"));
-        assert_eq!(params.get("exit_threshold").map(|s| s.as_str()), Some("0.5"));
+        assert_eq!(
+            params.get("exit_threshold").map(|s| s.as_str()),
+            Some("0.5")
+        );
         assert_eq!(rule.min_history_bars(), L + 1);
         assert_eq!(rule.decision_schedule(), DecisionSchedule::Daily);
         assert_eq!(rule.rebalance_policy(), RebalancePolicy::OnDecision);
@@ -377,8 +394,14 @@ mod tests {
         let (a, b) = warmup_then_jump(L, -10.0, 0.0);
         let p = panel_from(a, b);
         let r = simulate(&p, &PairsZscoreMeanReversionRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&dec| !dec), "no bar has L + 1 bars visible");
-        assert!(r.refused.iter().all(|&ref_| !ref_), "a silent skip must not be recorded as a refusal");
+        assert!(
+            r.decision.iter().all(|&dec| !dec),
+            "no bar has L + 1 bars visible"
+        );
+        assert!(
+            r.refused.iter().all(|&ref_| !ref_),
+            "a silent skip must not be recorded as a refusal"
+        );
         assert!(r.target_weights.iter().all(|&w| w == 0.0));
     }
 
@@ -388,7 +411,11 @@ mod tests {
         // relative to its own trailing mean -> z << -entry_threshold -> enter long-A / short-B.
         let (a, b) = warmup_then_jump(L + 5, -5.0, 0.0);
         let w = last_weights(a, b);
-        assert_eq!(w, vec![0.5, -0.5], "z far below -entry_threshold must enter long-A/short-B: {w:?}");
+        assert_eq!(
+            w,
+            vec![0.5, -0.5],
+            "z far below -entry_threshold must enter long-A/short-B: {w:?}"
+        );
     }
 
     #[test]
@@ -397,7 +424,11 @@ mod tests {
         // -> enter short-A / long-B.
         let (a, b) = warmup_then_jump(L + 5, 5.0, 0.0);
         let w = last_weights(a, b);
-        assert_eq!(w, vec![-0.5, 0.5], "z far above +entry_threshold must enter short-A/long-B: {w:?}");
+        assert_eq!(
+            w,
+            vec![-0.5, 0.5],
+            "z far above +entry_threshold must enter short-A/long-B: {w:?}"
+        );
     }
 
     #[test]
@@ -427,7 +458,11 @@ mod tests {
             .into_iter()
             .find(|&candidate| {
                 let a = build(candidate);
-                match PairsZscoreMeanReversionRule::zscore_at(&a[..=exit_at], &b[..=exit_at], exit_at) {
+                match PairsZscoreMeanReversionRule::zscore_at(
+                    &a[..=exit_at],
+                    &b[..=exit_at],
+                    exit_at,
+                ) {
                     Some(z) => z.abs() < PAIRS_EXIT_THRESHOLD,
                     None => false,
                 }
@@ -438,14 +473,32 @@ mod tests {
 
         // Sanity check the setup actually enters at `enter_at` before testing the exit at `exit_at`.
         let p_enter = panel_from(a[..=enter_at].to_vec(), b[..=enter_at].to_vec());
-        let r_enter = simulate(&p_enter, &PairsZscoreMeanReversionRule, &SimConfig::default()).unwrap();
+        let r_enter = simulate(
+            &p_enter,
+            &PairsZscoreMeanReversionRule,
+            &SimConfig::default(),
+        )
+        .unwrap();
         let w_enter = r_enter.row(&r_enter.target_weights, enter_at).to_vec();
-        assert_eq!(w_enter, vec![0.5, -0.5], "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}");
+        assert_eq!(
+            w_enter,
+            vec![0.5, -0.5],
+            "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}"
+        );
 
         let p_full = panel_from(a, b);
-        let r_full = simulate(&p_full, &PairsZscoreMeanReversionRule, &SimConfig::default()).unwrap();
+        let r_full = simulate(
+            &p_full,
+            &PairsZscoreMeanReversionRule,
+            &SimConfig::default(),
+        )
+        .unwrap();
         let w_exit = r_full.row(&r_full.target_weights, exit_at).to_vec();
-        assert_eq!(w_exit, vec![0.0, 0.0], "z back inside the exit band must flatten the position: {w_exit:?}");
+        assert_eq!(
+            w_exit,
+            vec![0.0, 0.0],
+            "z back inside the exit band must flatten the position: {w_exit:?}"
+        );
     }
 
     #[test]
@@ -475,7 +528,11 @@ mod tests {
             .into_iter()
             .find(|&candidate| {
                 let a = build(candidate);
-                match PairsZscoreMeanReversionRule::zscore_at(&a[..=hold_at], &b[..=hold_at], hold_at) {
+                match PairsZscoreMeanReversionRule::zscore_at(
+                    &a[..=hold_at],
+                    &b[..=hold_at],
+                    hold_at,
+                ) {
                     Some(z) => z.abs() > PAIRS_EXIT_THRESHOLD && z.abs() < PAIRS_ENTRY_THRESHOLD,
                     None => false,
                 }
@@ -487,7 +544,15 @@ mod tests {
         let r = simulate(&p, &PairsZscoreMeanReversionRule, &SimConfig::default()).unwrap();
         let w_enter = r.row(&r.target_weights, enter_at).to_vec();
         let w_hold = r.row(&r.target_weights, hold_at).to_vec();
-        assert_eq!(w_enter, vec![0.5, -0.5], "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}");
-        assert_eq!(w_hold, vec![0.5, -0.5], "position must hold unchanged inside the hysteresis band: {w_hold:?}");
+        assert_eq!(
+            w_enter,
+            vec![0.5, -0.5],
+            "setup must enter long-A/short-B at bar {enter_at}: {w_enter:?}"
+        );
+        assert_eq!(
+            w_hold,
+            vec![0.5, -0.5],
+            "position must hold unchanged inside the hysteresis band: {w_hold:?}"
+        );
     }
 }
