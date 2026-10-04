@@ -104,6 +104,9 @@ MUTANTS = [
     ("M27", "volume_confirmed_breakout: volume confirmation multiplier weakened (1.0x instead of 1.5x)", "src/volume_confirmed_breakout.rs",
      "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.5;",
      "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.0;"),
+    ("M28", "momentum_rank_weighted: rank-weight direction flipped (rank 1 gets the SMALLEST weight instead of the largest)", "src/momentum_rank_weighted.rs",
+     "weights[i] = (k + 1 - r) as f64 / denom;",
+     "weights[i] = r as f64 / denom;"),
 ]
 
 
