@@ -89,6 +89,10 @@ MUTANTS = [
      "src/inverse_volatility_weight.rs",
      "inv_vol[i] = 1.0 / stdev;",
      "inv_vol[i] = stdev;"),
+    ("M22", "low_vol_quintile_tilt: alphabetical tie-break reversed (descending instead of ascending ticker order)",
+     "src/low_vol_quintile_tilt.rs",
+     "eligible.sort_by(|a, b| a.0.partial_cmp(&b.0).expect(\"non-finite stdev already rejected above\").then(a.1.cmp(b.1)));",
+     "eligible.sort_by(|a, b| a.0.partial_cmp(&b.0).expect(\"non-finite stdev already rejected above\").then(b.1.cmp(a.1)));"),
 ]
 
 

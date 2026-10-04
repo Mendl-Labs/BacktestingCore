@@ -82,6 +82,7 @@ mod exact;
 mod fx;
 
 pub mod inverse_volatility_weight;
+pub mod low_vol_quintile_tilt;
 
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
@@ -94,6 +95,9 @@ pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_
 pub use fingerprint::data_fingerprint;
 pub use inverse_volatility_weight::{
     InverseVolatilityWeightRule, INVERSE_VOLATILITY_LOOKBACK_DAYS, INVERSE_VOLATILITY_SYMBOLS,
+};
+pub use low_vol_quintile_tilt::{
+    LowVolQuintileTiltRule, LOW_VOL_QUINTILE_FRACTION, LOW_VOL_QUINTILE_LOOKBACK_DAYS, LOW_VOL_QUINTILE_SYMBOLS,
 };
 pub use fx::{
     decide_fx_tsmom, fx_history_start, fx_joint_vol_scale, fx_periods_per_year, FX_JOINT_CALENDAR,
