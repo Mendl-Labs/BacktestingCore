@@ -110,6 +110,9 @@ MUTANTS = [
     ("M29", "vol_target_overlay: leverage cap removed (effectively unbounded scaling factor)", "src/vol_target_overlay.rs",
      "let scale = (target_vol / trailing_realized_vol).min(VOL_TARGET_MAX_LEVERAGE);",
      "let scale = target_vol / trailing_realized_vol;"),
+    ("M30", "stop_loss_overlay: long-stop boundary weakened from inclusive to strict (<= changed to <)", "src/stop_loss_overlay.rs",
+     "if current_price <= stop_level {",
+     "if current_price < stop_level {"),
 ]
 
 

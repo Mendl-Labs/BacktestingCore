@@ -85,6 +85,7 @@ mod exact;
 mod fx;
 mod momentum_rank_weighted;
 mod sma_crossover_trend;
+mod stop_loss_overlay;
 mod top_n_winners;
 mod turn_of_month;
 mod vol_target_overlay;
@@ -126,3 +127,4 @@ pub use momentum_rank_weighted::{
 };
 pub use volume_confirmed_breakout::{decide_volume_confirmed_breakout, OhlcvSeries, VolumeConfirmedBreakoutError, VCB_DEFAULT_PRICE_N, VCB_DEFAULT_VOLUME_N, VCB_VOLUME_MULTIPLIER};
 pub use vol_target_overlay::{vol_target_overlay, VOL_TARGET_DEFAULT_TARGET_VOL, VOL_TARGET_MAX_LEVERAGE};
+pub use stop_loss_overlay::{stop_loss_overlay, STOP_LOSS_OVERLAY_DEFAULT_PCT};
