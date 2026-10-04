@@ -77,6 +77,7 @@ pub mod series;
 
 mod checks;
 mod crypto;
+mod day_of_week;
 mod dual_ma_crossover;
 mod etf;
 mod exact;
@@ -110,3 +111,4 @@ pub use sma_crossover_trend::{
     SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
 };
 pub use turn_of_month::{decide_turn_of_month, decide_turn_of_month_on, TradingDays, TURN_OF_MONTH_FOLLOWING_DAYS, TURN_OF_MONTH_WEIGHT};
+pub use day_of_week::{decide_day_of_week, decide_day_of_week_default, decide_day_of_week_on, DAY_OF_WEEK_DEFAULT_TARGET, DAY_OF_WEEK_WEIGHT};

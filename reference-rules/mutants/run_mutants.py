@@ -92,6 +92,9 @@ MUTANTS = [
     ("M23", "dual_ma_crossover: fast-window off-by-one (N1+1 bars instead of N1)", "src/dual_ma_crossover.rs",
      "let fast = &closes[closes.len() - n1..];",
      "let fast = &closes[closes.len() - n1 - 1..];"),
+    ("M24", "day_of_week: wrong default target (Tuesday instead of Monday)", "src/day_of_week.rs",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Mon;",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Tue;"),
 ]
 
 
