@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Hand-written mutation testing for `reference-rules` (BACKTESTER_TRUTH_DESIGN.md 6.1, stage T2).
 
 Each mutant is ONE exact source edit (the old text must occur exactly once). For every mutant the script applies the
@@ -116,6 +116,9 @@ MUTANTS = [
     ("M31", "one_day_reversal: zero-return boundary widened from strict to inclusive (< changed to <=)", "src/one_day_reversal.rs",
      "if yesterday_return < 0.0 {",
      "if yesterday_return <= 0.0 {"),
+    ("M32", "five_day_reversal_zscore: off-by-one on the 60-observation window (z-scores the SECOND-to-last 5-day return, not the current/last one)", "src/five_day_reversal_zscore.rs",
+     "let current_return = returns[window - 1];",
+     "let current_return = returns[window - 2];"),
 ]
 
 

@@ -1,4 +1,4 @@
-//! Documented-strategy decision rules for the Mendl Labs rebalancer: ETF trend, crypto trend and FX momentum.
+﻿//! Documented-strategy decision rules for the Mendl Labs rebalancer: ETF trend, crypto trend and FX momentum.
 //!
 //! Pure functions: no I/O, no network, no async, no clock (the run date is an explicit argument).
 //! Ported from the reference tool `stage1-record/tool/ticket.py` (`decide_s1`, `decide_s2`, `decide_s3`); the
@@ -82,6 +82,7 @@ mod donchian_breakout;
 mod dual_ma_crossover;
 mod etf;
 mod exact;
+mod five_day_reversal_zscore;
 mod fx;
 mod momentum_rank_weighted;
 mod one_day_reversal;
@@ -130,3 +131,4 @@ pub use volume_confirmed_breakout::{decide_volume_confirmed_breakout, OhlcvSerie
 pub use vol_target_overlay::{vol_target_overlay, VOL_TARGET_DEFAULT_TARGET_VOL, VOL_TARGET_MAX_LEVERAGE};
 pub use stop_loss_overlay::{stop_loss_overlay, STOP_LOSS_OVERLAY_DEFAULT_PCT};
 pub use one_day_reversal::{OneDayReversal, ONE_DAY_REVERSAL_MIN_HISTORY_BARS, ONE_DAY_REVERSAL_UNIVERSE, ONE_DAY_REVERSAL_VERSION};
+pub use five_day_reversal_zscore::{FiveDayReversalZscore, FIVE_DAY_REVERSAL_LOOKBACK, FIVE_DAY_REVERSAL_MIN_HISTORY_BARS, FIVE_DAY_REVERSAL_UNIVERSE, FIVE_DAY_REVERSAL_VERSION, FIVE_DAY_REVERSAL_ZSCORE_THRESHOLD, FIVE_DAY_REVERSAL_ZSCORE_WINDOW};
