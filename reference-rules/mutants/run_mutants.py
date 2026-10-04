@@ -83,6 +83,12 @@ MUTANTS = [
     ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
      "if pos + 1 < CRYPTO_SMA_DAYS {",
      "if pos + 1 <= CRYPTO_SMA_DAYS {"),
+
+    # --- W3.6 new primitives (SENIOR_RESEARCHER_GAP_CLOSURE_PLAN.md, W3.6 / 9.9 point 2) ---
+    ("M21", "inverse_volatility_weight: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_volatility_weight.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
 ]
 
 

@@ -81,6 +81,8 @@ mod etf;
 mod exact;
 mod fx;
 
+pub mod inverse_volatility_weight;
+
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
 };
@@ -90,6 +92,9 @@ pub use decision::{
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;
+pub use inverse_volatility_weight::{
+    InverseVolatilityWeightRule, INVERSE_VOLATILITY_LOOKBACK_DAYS, INVERSE_VOLATILITY_SYMBOLS,
+};
 pub use fx::{
     decide_fx_tsmom, fx_history_start, fx_joint_vol_scale, fx_periods_per_year, FX_JOINT_CALENDAR,
     FX_MIN_JOINT_BARS, FX_MOMENTUM_MONTH_ENDS, FX_REFERENCE_LOOKBACK_DAYS, FX_SLEEVE_VOL_TARGET,

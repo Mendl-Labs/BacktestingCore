@@ -9,10 +9,16 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
+# `weightsim` is the sibling, zero-dependency, standalone simulator crate (path dependency; same repo). Used directly
+# by `inverse_volatility_weight` (a rule implemented straight against `weightsim::WeightRule`/`HistoryView`, unlike
+# the older Panel/PriceSeries primitives in this crate). A path dependency keeps this crate dependency-free of
+# anything beyond crates.io + one in-repo sibling; it does not reintroduce the workspace's private git dependencies.
+weightsim = { path = "../weightsim" }
 
 # Standalone on purpose (same pattern as `weightsim`): NOT a member of the BacktestingCore workspace (root Cargo.toml
-# `exclude`). Its three dependencies are public crates.io crates, so CI and consumers never have to resolve the
-# workspace's private git dependencies. Consumers depend on it by git tag/rev, e.g.
+# `exclude`). Its three (now four, with the in-repo `weightsim` path dep) dependencies never require resolving the
+# workspace's private git dependencies, so CI and consumers can build this crate alone. Consumers depend on it by
+# git tag/rev, e.g.
 #   reference-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", tag = "vX.Y.Z" }
 # `chrono` is used without default features (no clock, no time zones): the rules take the run date as an argument.
 [workspace]
