@@ -87,6 +87,7 @@ mod momentum_rank_weighted;
 mod sma_crossover_trend;
 mod top_n_winners;
 mod turn_of_month;
+mod vol_target_overlay;
 mod volume_confirmed_breakout;
 
 pub use crypto::{
@@ -124,3 +125,4 @@ pub use momentum_rank_weighted::{
     MomentumRankWeighted, RankWeightedRanking, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK, MOMENTUM_RANK_WEIGHTED_VERSION,
 };
 pub use volume_confirmed_breakout::{decide_volume_confirmed_breakout, OhlcvSeries, VolumeConfirmedBreakoutError, VCB_DEFAULT_PRICE_N, VCB_DEFAULT_VOLUME_N, VCB_VOLUME_MULTIPLIER};
+pub use vol_target_overlay::{vol_target_overlay, VOL_TARGET_DEFAULT_TARGET_VOL, VOL_TARGET_MAX_LEVERAGE};

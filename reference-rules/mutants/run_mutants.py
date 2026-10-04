@@ -107,6 +107,9 @@ MUTANTS = [
     ("M28", "momentum_rank_weighted: rank-weight direction flipped (rank 1 gets the SMALLEST weight instead of the largest)", "src/momentum_rank_weighted.rs",
      "weights[i] = (k + 1 - r) as f64 / denom;",
      "weights[i] = r as f64 / denom;"),
+    ("M29", "vol_target_overlay: leverage cap removed (effectively unbounded scaling factor)", "src/vol_target_overlay.rs",
+     "let scale = (target_vol / trailing_realized_vol).min(VOL_TARGET_MAX_LEVERAGE);",
+     "let scale = target_vol / trailing_realized_vol;"),
 ]
 
 
