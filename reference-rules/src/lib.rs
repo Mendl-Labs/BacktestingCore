@@ -77,6 +77,7 @@ pub mod series;
 
 mod checks;
 mod crypto;
+mod dual_ma_crossover;
 mod etf;
 mod exact;
 mod fx;
@@ -102,6 +103,9 @@ pub use months::{
 };
 pub use options::{GapPolicy, MonthEndMode, Options};
 pub use series::{Panel, PriceSeries};
+pub use dual_ma_crossover::{
+    DualMaCrossover, DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2, DUAL_MA_UNIVERSE, DUAL_MA_VERSION,
+};
 pub use sma_crossover_trend::{
     SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
 };
