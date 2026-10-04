@@ -81,6 +81,7 @@ mod etf;
 mod exact;
 mod fx;
 mod sma_crossover_trend;
+mod turn_of_month;
 
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
@@ -104,3 +105,4 @@ pub use series::{Panel, PriceSeries};
 pub use sma_crossover_trend::{
     SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
 };
+pub use turn_of_month::{decide_turn_of_month, decide_turn_of_month_on, TradingDays, TURN_OF_MONTH_FOLLOWING_DAYS, TURN_OF_MONTH_WEIGHT};

@@ -86,6 +86,9 @@ MUTANTS = [
     ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",
      "let window = &closes[closes.len() - n..];",
      "let window = &closes[closes.len() - n - 1..];"),
+    ("M22", "turn_of_month: window closes one day too early (2 following days instead of 3)", "src/turn_of_month.rs",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 3;",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 2;"),
 ]
 
 
