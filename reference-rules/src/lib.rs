@@ -85,6 +85,7 @@ pub mod equal_weight_rebalance;
 pub mod inverse_vol_risk_parity;
 pub mod inverse_volatility_weight;
 pub mod low_vol_quintile_tilt;
+pub mod pairs_zscore_meanreversion;
 
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
@@ -104,6 +105,9 @@ pub use inverse_volatility_weight::{
 };
 pub use low_vol_quintile_tilt::{
     LowVolQuintileTiltRule, LOW_VOL_QUINTILE_FRACTION, LOW_VOL_QUINTILE_LOOKBACK_DAYS, LOW_VOL_QUINTILE_SYMBOLS,
+};
+pub use pairs_zscore_meanreversion::{
+    PairsZscoreMeanReversionRule, PAIRS_ENTRY_THRESHOLD, PAIRS_EXIT_THRESHOLD, PAIRS_LOOKBACK_DAYS, PAIRS_SYMBOLS,
 };
 pub use fx::{
     decide_fx_tsmom, fx_history_start, fx_joint_vol_scale, fx_periods_per_year, FX_JOINT_CALENDAR,

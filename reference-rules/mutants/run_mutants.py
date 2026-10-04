@@ -101,6 +101,10 @@ MUTANTS = [
      "src/inverse_vol_risk_parity.rs",
      "inv_vol[i] = 1.0 / stdev;",
      "inv_vol[i] = stdev;"),
+    ("M25", "pairs_zscore_meanreversion: entry legs swapped (long-A/short-B and short-A/long-B reversed)",
+     "src/pairs_zscore_meanreversion.rs",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                }",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                }"),
 ]
 
 
