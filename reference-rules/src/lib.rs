@@ -86,6 +86,7 @@ mod fx;
 mod sma_crossover_trend;
 mod top_n_winners;
 mod turn_of_month;
+mod volume_confirmed_breakout;
 
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
@@ -118,3 +119,4 @@ pub use top_n_winners::{
 pub use turn_of_month::{decide_turn_of_month, decide_turn_of_month_on, TradingDays, TURN_OF_MONTH_FOLLOWING_DAYS, TURN_OF_MONTH_WEIGHT};
 pub use day_of_week::{decide_day_of_week, decide_day_of_week_default, decide_day_of_week_on, DAY_OF_WEEK_DEFAULT_TARGET, DAY_OF_WEEK_WEIGHT};
 pub use donchian_breakout::{decide_donchian_breakout, DonchianError, HlcSeries, DONCHIAN_DEFAULT_N};
+pub use volume_confirmed_breakout::{decide_volume_confirmed_breakout, OhlcvSeries, VolumeConfirmedBreakoutError, VCB_DEFAULT_PRICE_N, VCB_DEFAULT_VOLUME_N, VCB_VOLUME_MULTIPLIER};

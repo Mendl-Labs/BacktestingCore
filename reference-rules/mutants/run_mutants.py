@@ -101,6 +101,9 @@ MUTANTS = [
     ("M26", "donchian_breakout: wrong breakout direction (sign flip on the upper/lower comparison)", "src/donchian_breakout.rs",
      "if close > upper {",
      "if close < upper {"),
+    ("M27", "volume_confirmed_breakout: volume confirmation multiplier weakened (1.0x instead of 1.5x)", "src/volume_confirmed_breakout.rs",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.5;",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.0;"),
 ]
 
 
