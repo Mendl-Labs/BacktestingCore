@@ -81,12 +81,17 @@ mod etf;
 mod exact;
 mod fx;
 
+pub mod cointegration_spread_threshold;
 pub mod equal_weight_rebalance;
 pub mod inverse_vol_risk_parity;
 pub mod inverse_volatility_weight;
 pub mod low_vol_quintile_tilt;
 pub mod pairs_zscore_meanreversion;
 
+pub use cointegration_spread_threshold::{
+    CointegrationSpreadThresholdRule, COINT_ENTRY_THRESHOLD, COINT_EXIT_THRESHOLD, COINT_LOOKBACK_DAYS,
+    COINT_SYMBOLS,
+};
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
 };

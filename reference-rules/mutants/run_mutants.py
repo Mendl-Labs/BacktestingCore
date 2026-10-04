@@ -105,6 +105,10 @@ MUTANTS = [
      "src/pairs_zscore_meanreversion.rs",
      "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                }",
      "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                }"),
+    ("M26", "cointegration_spread_threshold: hedge ratio refreshed every bar instead of every L bars (defeats the whole point of the primitive)",
+     "src/cointegration_spread_threshold.rs",
+     "fn refresh_point(s: usize) -> usize {\n        let l = COINT_LOOKBACK_DAYS;\n        l * (s / l)\n    }",
+     "fn refresh_point(s: usize) -> usize {\n        s\n    }"),
 ]
 
 
