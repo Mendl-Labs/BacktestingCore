@@ -1,4 +1,4 @@
-﻿//! Single-asset 5-day reversal, z-scored against its own trailing 60-day distribution of 5-day returns
+//! Single-asset 5-day reversal, z-scored against its own trailing 60-day distribution of 5-day returns
 //! (`weightsim::WeightRule`). Each day, hold the WHOLE sleeve (weight 1.0) in the sleeve's one instrument when the
 //! current 5-day return's z-score against its own trailing 60-observation distribution of 5-day returns is
 //! strictly below -1.0 (oversold), else the whole sleeve is in cash (weight 0.0). Long only, single instrument.
@@ -94,15 +94,19 @@ pub const FIVE_DAY_REVERSAL_ZSCORE_THRESHOLD: f64 = -1.0;
 /// Minimum bars visible before this rule will be asked to decide: `FIVE_DAY_REVERSAL_ZSCORE_WINDOW` (60) overlapping
 /// 5-day returns, the earliest of which needs a close `FIVE_DAY_REVERSAL_LOOKBACK` (5) positions further back than
 /// the oldest of those 60 return-ending positions (interpretation choice 2): `60 + 5 = 65`.
-pub const FIVE_DAY_REVERSAL_MIN_HISTORY_BARS: usize = FIVE_DAY_REVERSAL_ZSCORE_WINDOW + FIVE_DAY_REVERSAL_LOOKBACK;
+pub const FIVE_DAY_REVERSAL_MIN_HISTORY_BARS: usize =
+    FIVE_DAY_REVERSAL_ZSCORE_WINDOW + FIVE_DAY_REVERSAL_LOOKBACK;
 
 /// Generic single-asset universe placeholder (interpretation choice 8): the real instrument is named by the
 /// library entry's `RuleSpec`, not by this rule.
 pub const FIVE_DAY_REVERSAL_UNIVERSE: [&str; 1] = ["ASSET"];
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const FIVE_DAY_REVERSAL_VERSION: &str =
-    concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " five_day_reversal_zscore");
+pub const FIVE_DAY_REVERSAL_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " five_day_reversal_zscore"
+);
 
 /// `five_day_reversal_zscore`: weight 1.0 in the sleeve's one asset when the current 5-day return's z-score
 /// against its own trailing 60-observation distribution of 5-day returns is strictly below -1.0 (oversold), else
@@ -148,7 +152,8 @@ pub(crate) fn five_day_reversal_zscore_weight(closes: &[f64]) -> f64 {
     // sequential summation, same order as `crate::fx::sample_std`'s own internal mean, so the two are consistent.
     let current_return = returns[window - 1];
     let mean = returns.iter().sum::<f64>() / window as f64;
-    let stdev = sample_std(&returns).expect("exactly 60 returns, well above sample_std's 2-value minimum");
+    let stdev =
+        sample_std(&returns).expect("exactly 60 returns, well above sample_std's 2-value minimum");
     let z = (current_return - mean) / stdev;
     if z < FIVE_DAY_REVERSAL_ZSCORE_THRESHOLD {
         1.0
@@ -250,8 +255,14 @@ mod tests {
         let current = -0.5;
         let expected_z = (current - mean) / stdev;
         let closed_form = -59.0 * 240.0f64.sqrt() / 120.0;
-        assert!((expected_z - closed_form).abs() < 1e-9, "two equivalent hand formulas disagree");
-        assert!(expected_z < -1.0, "fixture must actually be oversold by construction, got z={expected_z}");
+        assert!(
+            (expected_z - closed_form).abs() < 1e-9,
+            "two equivalent hand formulas disagree"
+        );
+        assert!(
+            expected_z < -1.0,
+            "fixture must actually be oversold by construction, got z={expected_z}"
+        );
         let w = five_day_reversal_zscore_weight(&closes);
         assert!((w - 1.0).abs() < 1e-9, "expected weight 1.0, got {w}");
     }
@@ -266,7 +277,10 @@ mod tests {
         let stdev = variance.sqrt();
         let current = 0.5;
         let expected_z = (current - mean) / stdev;
-        assert!(expected_z > -1.0, "fixture must NOT be oversold by construction, got z={expected_z}");
+        assert!(
+            expected_z > -1.0,
+            "fixture must NOT be oversold by construction, got z={expected_z}"
+        );
         let w = five_day_reversal_zscore_weight(&closes);
         assert!(w.abs() < 1e-9, "expected weight 0.0, got {w}");
     }
@@ -282,9 +296,15 @@ mod tests {
         // k = 30 (half the window is the current's group): z = -0.5*sqrt(59/15) ~= -0.991659, strictly > -1.0.
         let closes = fixture_two_level(30, 0.0, -0.01);
         let expected_z = -0.5 * (59.0f64 / 15.0).sqrt();
-        assert!(expected_z > -1.0 && expected_z < -0.99, "expected z just above -1.0, got {expected_z}");
+        assert!(
+            expected_z > -1.0 && expected_z < -0.99,
+            "expected z just above -1.0, got {expected_z}"
+        );
         let w = five_day_reversal_zscore_weight(&closes);
-        assert!(w.abs() < 1e-9, "z = {expected_z} is > -1.0 (not oversold), expected weight 0.0, got {w}");
+        assert!(
+            w.abs() < 1e-9,
+            "z = {expected_z} is > -1.0 (not oversold), expected weight 0.0, got {w}"
+        );
     }
 
     #[test]
@@ -292,9 +312,15 @@ mod tests {
         // k = 29: z = -(31/60)*sqrt(3540/899) ~= -1.025059, strictly < -1.0.
         let closes = fixture_two_level(29, 0.0, -0.01);
         let expected_z = -(31.0 / 60.0) * (3540.0f64 / 899.0).sqrt();
-        assert!(expected_z < -1.0 && expected_z > -1.05, "expected z just below -1.0, got {expected_z}");
+        assert!(
+            expected_z < -1.0 && expected_z > -1.05,
+            "expected z just below -1.0, got {expected_z}"
+        );
         let w = five_day_reversal_zscore_weight(&closes);
-        assert!((w - 1.0).abs() < 1e-9, "z = {expected_z} is < -1.0 (oversold), expected weight 1.0, got {w}");
+        assert!(
+            (w - 1.0).abs() < 1e-9,
+            "z = {expected_z} is < -1.0 (oversold), expected weight 1.0, got {w}"
+        );
     }
 
     // (e) Degenerate all-identical-returns case: all 60 trailing 5-day returns are exactly 0.0 (a perfectly flat
@@ -311,7 +337,10 @@ mod tests {
     fn degenerate_zero_variance_history_gives_zero_weight_not_a_panic() {
         let closes = fixture_two_level(0, 0.0, 0.0); // k = 0: every one of the 60 returns is exactly 0.0
         let returns_are_all_bit_exact_zero = closes.windows(6).all(|w| w[5] == w[0]);
-        assert!(returns_are_all_bit_exact_zero, "fixture must be a perfectly flat 65-close series");
+        assert!(
+            returns_are_all_bit_exact_zero,
+            "fixture must be a perfectly flat 65-close series"
+        );
         let w = five_day_reversal_zscore_weight(&closes);
         assert!(
             w.abs() < 1e-9,
@@ -338,6 +367,9 @@ mod tests {
         let mut closes = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 123.0];
         closes.extend_from_slice(&base);
         let w = five_day_reversal_zscore_weight(&closes);
-        assert!((w - 1.0).abs() < 1e-9, "expected weight 1.0 (unaffected by older history), got {w}");
+        assert!(
+            (w - 1.0).abs() < 1e-9,
+            "expected weight 1.0 (unaffected by older history), got {w}"
+        );
     }
 }

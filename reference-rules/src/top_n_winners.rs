@@ -77,7 +77,11 @@ use weightsim::{DecisionSchedule, HistoryView, RebalancePolicy, RuleRefusal, Wei
 pub const TOP_N_WINNERS_DEFAULT_LOOKBACK: usize = 126;
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const TOP_N_WINNERS_VERSION: &str = concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " top_n_winners");
+pub const TOP_N_WINNERS_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " top_n_winners"
+);
 
 /// Default `N` (interpretation choice 8): top 20% of the universe, rounded, floor 1.
 pub(crate) fn default_n_winners(universe_len: usize) -> usize {
@@ -112,18 +116,42 @@ pub struct TopNWinners {
 impl TopNWinners {
     /// A rule over `universe` (must be non-empty), ranking by trailing `lookback`-bar return (`lookback >= 1`),
     /// holding the top `n_winners` (`n_winners >= 1`) equal-weighted, rebalanced on `schedule`.
-    pub fn new(universe: Vec<&'static str>, lookback: usize, n_winners: usize, schedule: DecisionSchedule) -> Self {
-        assert!(!universe.is_empty(), "top_n_winners: universe must be non-empty");
-        assert!(lookback >= 1, "top_n_winners: lookback L must be >= 1, got {lookback}");
-        assert!(n_winners >= 1, "top_n_winners: n_winners N must be >= 1, got {n_winners}");
-        TopNWinners { universe, lookback, n_winners, schedule }
+    pub fn new(
+        universe: Vec<&'static str>,
+        lookback: usize,
+        n_winners: usize,
+        schedule: DecisionSchedule,
+    ) -> Self {
+        assert!(
+            !universe.is_empty(),
+            "top_n_winners: universe must be non-empty"
+        );
+        assert!(
+            lookback >= 1,
+            "top_n_winners: lookback L must be >= 1, got {lookback}"
+        );
+        assert!(
+            n_winners >= 1,
+            "top_n_winners: n_winners N must be >= 1, got {n_winners}"
+        );
+        TopNWinners {
+            universe,
+            lookback,
+            n_winners,
+            schedule,
+        }
     }
 
     /// Convenience constructor (interpretation choice 8): `lookback` = [`TOP_N_WINNERS_DEFAULT_LOOKBACK`] (126),
     /// `n_winners` = top 20% of `universe` (rounded, floor 1), `schedule` = [`DecisionSchedule::Daily`].
     pub fn with_defaults(universe: Vec<&'static str>) -> Self {
         let n_winners = default_n_winners(universe.len());
-        TopNWinners::new(universe, TOP_N_WINNERS_DEFAULT_LOOKBACK, n_winners, DecisionSchedule::Daily)
+        TopNWinners::new(
+            universe,
+            TOP_N_WINNERS_DEFAULT_LOOKBACK,
+            n_winners,
+            DecisionSchedule::Daily,
+        )
     }
 
     /// The configured trailing lookback `L`.
@@ -141,7 +169,12 @@ impl TopNWinners {
     /// `.weights`.
     pub fn rank(&self, h: &HistoryView<'_>) -> TopNRanking {
         let closes_by_asset: Vec<&[f64]> = (0..self.universe.len()).map(|i| h.closes(i)).collect();
-        rank_top_n(&closes_by_asset, &self.universe, self.lookback, self.n_winners)
+        rank_top_n(
+            &closes_by_asset,
+            &self.universe,
+            self.lookback,
+            self.n_winners,
+        )
     }
 }
 
@@ -163,7 +196,11 @@ pub(crate) fn rank_top_n(
     lookback: usize,
     n_winners: usize,
 ) -> TopNRanking {
-    assert_eq!(closes_by_asset.len(), universe.len(), "top_n_winners: one close slice per universe asset");
+    assert_eq!(
+        closes_by_asset.len(),
+        universe.len(),
+        "top_n_winners: one close slice per universe asset"
+    );
     let mut weights = vec![0.0; universe.len()];
     let mut excluded = Vec::new();
     let mut candidates: Vec<(usize, f64)> = Vec::new();
@@ -204,7 +241,10 @@ impl WeightRule for TopNWinners {
         &self.universe
     }
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
-        BTreeMap::from([("L", self.lookback.to_string()), ("N", self.n_winners.to_string())])
+        BTreeMap::from([
+            ("L", self.lookback.to_string()),
+            ("N", self.n_winners.to_string()),
+        ])
     }
     fn decision_schedule(&self) -> DecisionSchedule {
         self.schedule
@@ -232,8 +272,14 @@ mod tests {
 
     #[test]
     fn min_history_bars_is_lookback_plus_one() {
-        assert_eq!(TopNWinners::new(vec!["A", "B"], L, 1, DecisionSchedule::Daily).min_history_bars(), L + 1);
-        assert_eq!(TopNWinners::new(vec!["A", "B"], 37, 1, DecisionSchedule::Daily).min_history_bars(), 38);
+        assert_eq!(
+            TopNWinners::new(vec!["A", "B"], L, 1, DecisionSchedule::Daily).min_history_bars(),
+            L + 1
+        );
+        assert_eq!(
+            TopNWinners::new(vec!["A", "B"], 37, 1, DecisionSchedule::Daily).min_history_bars(),
+            38
+        );
     }
 
     #[test]
@@ -249,7 +295,10 @@ mod tests {
         let daily = TopNWinners::new(vec!["A", "B"], L, 1, DecisionSchedule::Daily);
         assert_eq!(daily.decision_schedule(), DecisionSchedule::Daily);
         let monthly = TopNWinners::new(vec!["A", "B"], L, 1, DecisionSchedule::LastBarOfMonth);
-        assert_eq!(monthly.decision_schedule(), DecisionSchedule::LastBarOfMonth);
+        assert_eq!(
+            monthly.decision_schedule(),
+            DecisionSchedule::LastBarOfMonth
+        );
         assert_eq!(monthly.rebalance_policy(), RebalancePolicy::OnDecision);
         assert_eq!(monthly.id(), "top_n_winners");
     }
@@ -269,11 +318,31 @@ mod tests {
         let r = rank_top_n(&slices(&closes), &universe, L, 2);
         assert!(r.excluded.is_empty());
         assert_eq!(r.weights.len(), 5);
-        assert!((r.weights[0] - 0.5).abs() < 1e-9, "AAA should win, got {}", r.weights[0]); // AAA
-        assert!(r.weights[1].abs() < 1e-9, "BBB should lose, got {}", r.weights[1]); // BBB
-        assert!(r.weights[2].abs() < 1e-9, "CCC should lose, got {}", r.weights[2]); // CCC
-        assert!((r.weights[3] - 0.5).abs() < 1e-9, "DDD should win, got {}", r.weights[3]); // DDD
-        assert!(r.weights[4].abs() < 1e-9, "EEE should lose, got {}", r.weights[4]); // EEE
+        assert!(
+            (r.weights[0] - 0.5).abs() < 1e-9,
+            "AAA should win, got {}",
+            r.weights[0]
+        ); // AAA
+        assert!(
+            r.weights[1].abs() < 1e-9,
+            "BBB should lose, got {}",
+            r.weights[1]
+        ); // BBB
+        assert!(
+            r.weights[2].abs() < 1e-9,
+            "CCC should lose, got {}",
+            r.weights[2]
+        ); // CCC
+        assert!(
+            (r.weights[3] - 0.5).abs() < 1e-9,
+            "DDD should win, got {}",
+            r.weights[3]
+        ); // DDD
+        assert!(
+            r.weights[4].abs() < 1e-9,
+            "EEE should lose, got {}",
+            r.weights[4]
+        ); // EEE
         assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
@@ -289,9 +358,21 @@ mod tests {
         ];
         let r = rank_top_n(&slices(&closes), &universe, L, 1);
         assert_eq!(r.excluded, vec!["CCC"], "CCC must be a typed exclusion");
-        assert!((r.weights[0] - 1.0).abs() < 1e-9, "AAA should be the sole winner, got {}", r.weights[0]);
-        assert!(r.weights[1].abs() < 1e-9, "BBB ranked and lost -> weight 0.0, got {}", r.weights[1]);
-        assert!(r.weights[2].abs() < 1e-9, "CCC excluded -> weight 0.0 in the plain vector too, got {}", r.weights[2]);
+        assert!(
+            (r.weights[0] - 1.0).abs() < 1e-9,
+            "AAA should be the sole winner, got {}",
+            r.weights[0]
+        );
+        assert!(
+            r.weights[1].abs() < 1e-9,
+            "BBB ranked and lost -> weight 0.0, got {}",
+            r.weights[1]
+        );
+        assert!(
+            r.weights[2].abs() < 1e-9,
+            "CCC excluded -> weight 0.0 in the plain vector too, got {}",
+            r.weights[2]
+        );
         // The typed distinction lives ONLY in `excluded`: both BBB (ranked, lost) and CCC (excluded) show 0.0 in
         // `weights`, but only CCC appears in `excluded`.
         assert!(!r.excluded.contains(&"BBB"));
@@ -307,16 +388,32 @@ mod tests {
         let closes = vec![
             vec![100.0, 120.0, 140.0, 150.0], // BBB: 150/100 - 1 = 0.5
             vec![100.0, 120.0, 140.0, 150.0], // AAA: 150/100 - 1 = 0.5 (bit-identical to BBB's)
-            vec![100.0, 95.0, 92.0, 90.0],    // CCC: 90/100 - 1 = -0.1 (clearly lower, no interference)
+            vec![100.0, 95.0, 92.0, 90.0], // CCC: 90/100 - 1 = -0.1 (clearly lower, no interference)
         ];
         // Confirm the fixture really is an exact (bit-identical) tie before trusting the ranking outcome.
         let ret = |c: &[f64]| c[3] / c[0] - 1.0;
-        assert_eq!(ret(&closes[0]).to_bits(), ret(&closes[1]).to_bits(), "fixture must be an EXACT tie by construction");
+        assert_eq!(
+            ret(&closes[0]).to_bits(),
+            ret(&closes[1]).to_bits(),
+            "fixture must be an EXACT tie by construction"
+        );
         let r = rank_top_n(&slices(&closes), &universe, L, 1);
         assert!(r.excluded.is_empty());
-        assert!(r.weights[0].abs() < 1e-9, "BBB loses the tie-break, got {}", r.weights[0]);
-        assert!((r.weights[1] - 1.0).abs() < 1e-9, "AAA (ascending alphabetical) wins the tie, got {}", r.weights[1]);
-        assert!(r.weights[2].abs() < 1e-9, "CCC is clearly behind, got {}", r.weights[2]);
+        assert!(
+            r.weights[0].abs() < 1e-9,
+            "BBB loses the tie-break, got {}",
+            r.weights[0]
+        );
+        assert!(
+            (r.weights[1] - 1.0).abs() < 1e-9,
+            "AAA (ascending alphabetical) wins the tie, got {}",
+            r.weights[1]
+        );
+        assert!(
+            r.weights[2].abs() < 1e-9,
+            "CCC is clearly behind, got {}",
+            r.weights[2]
+        );
     }
 
     // (d) Default N is 20% of the universe, rounded, floor 1.
@@ -331,7 +428,8 @@ mod tests {
         assert_eq!(r.lookback(), TOP_N_WINNERS_DEFAULT_LOOKBACK);
         assert_eq!(TOP_N_WINNERS_DEFAULT_LOOKBACK, 126);
         assert_eq!(r.decision_schedule(), DecisionSchedule::Daily);
-        let r10 = TopNWinners::with_defaults(vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]);
+        let r10 =
+            TopNWinners::with_defaults(vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]);
         assert_eq!(r10.n_winners(), 2);
     }
 
@@ -352,9 +450,20 @@ mod tests {
         let mut excluded_sorted = r.excluded.clone();
         excluded_sorted.sort();
         assert_eq!(excluded_sorted, vec!["CCC", "DDD", "EEE"]);
-        assert!((r.weights[0] - 0.5).abs() < 1e-9, "AAA should win with 1/2, got {}", r.weights[0]);
-        assert!((r.weights[1] - 0.5).abs() < 1e-9, "BBB should win with 1/2, got {}", r.weights[1]);
-        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9, "fully invested among survivors");
+        assert!(
+            (r.weights[0] - 0.5).abs() < 1e-9,
+            "AAA should win with 1/2, got {}",
+            r.weights[0]
+        );
+        assert!(
+            (r.weights[1] - 0.5).abs() < 1e-9,
+            "BBB should win with 1/2, got {}",
+            r.weights[1]
+        );
+        assert!(
+            (r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "fully invested among survivors"
+        );
     }
 
     #[test]
@@ -363,7 +472,10 @@ mod tests {
         // but rank_top_n is exactly what both `rank` and `target_weights` delegate to; this test documents that
         // `target_weights` is a thin wrapper returning only `.weights`, nothing more, nothing less.
         let universe = vec!["AAA", "BBB"];
-        let closes = vec![vec![100.0, 110.0, 120.0, 130.0], vec![100.0, 102.0, 106.0, 110.0]];
+        let closes = vec![
+            vec![100.0, 110.0, 120.0, 130.0],
+            vec![100.0, 102.0, 106.0, 110.0],
+        ];
         let r = rank_top_n(&slices(&closes), &universe, L, 1);
         assert_eq!(r.weights, vec![1.0, 0.0]);
     }

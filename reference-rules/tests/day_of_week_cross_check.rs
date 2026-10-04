@@ -60,7 +60,13 @@ fn every_target_matches_exactly_one_day_matches_python_key() {
         Weekday::Sun,
     ];
     for target in targets {
-        let total: f64 = week().iter().map(|&date| decide_day_of_week(date, target)).sum();
-        assert!((total - 1.0).abs() < 1e-9, "target {target:?}: total {total}");
+        let total: f64 = week()
+            .iter()
+            .map(|&date| decide_day_of_week(date, target))
+            .sum();
+        assert!(
+            (total - 1.0).abs() < 1e-9,
+            "target {target:?}: total {total}"
+        );
     }
 }

@@ -167,7 +167,8 @@ mod tests {
 
     #[test]
     fn decide_day_of_week_on_looks_up_by_date_and_validates_membership() {
-        let days = TradingDays::new("TEST", vec![d(2024, 1, 1), d(2024, 1, 2), d(2024, 1, 5)]).unwrap();
+        let days =
+            TradingDays::new("TEST", vec![d(2024, 1, 1), d(2024, 1, 2), d(2024, 1, 5)]).unwrap();
         assert_eq!(
             decide_day_of_week_on(&days, d(2024, 1, 1), Weekday::Mon).unwrap(),
             1.0

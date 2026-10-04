@@ -113,7 +113,8 @@ fn exact_sum(parts: &[(u64, i32)], emin: i32) -> Option<i128> {
 /// number, either window is empty or longer than 4096 bars, or the values span too wide a scale for the integer
 /// arithmetic (caller refuses).
 pub(crate) fn compare_means(window_a: &[f64], window_b: &[f64]) -> Option<TwoMeanComparison> {
-    if window_a.is_empty() || window_a.len() > 4096 || window_b.is_empty() || window_b.len() > 4096 {
+    if window_a.is_empty() || window_a.len() > 4096 || window_b.is_empty() || window_b.len() > 4096
+    {
         return None;
     }
     let mut parts_a = Vec::with_capacity(window_a.len());
@@ -137,7 +138,11 @@ pub(crate) fn compare_means(window_a: &[f64], window_b: &[f64]) -> Option<TwoMea
     let rhs = sum_b.checked_mul(na)?;
     let mean_a = ldexp(sum_a as f64, emin) / window_a.len() as f64;
     let mean_b = ldexp(sum_b as f64, emin) / window_b.len() as f64;
-    Some(TwoMeanComparison { ordering: lhs.cmp(&rhs), mean_a, mean_b })
+    Some(TwoMeanComparison {
+        ordering: lhs.cmp(&rhs),
+        mean_a,
+        mean_b,
+    })
 }
 
 #[cfg(test)]
@@ -153,7 +158,11 @@ mod tests {
         let a = [0.1f64; 3];
         let b = [0.1f64];
         let naive_mean_a: f64 = a.iter().sum::<f64>() / 3.0;
-        assert_ne!(naive_mean_a.to_bits(), b[0].to_bits(), "fixture must expose the naive-sum rounding artifact");
+        assert_ne!(
+            naive_mean_a.to_bits(),
+            b[0].to_bits(),
+            "fixture must expose the naive-sum rounding artifact"
+        );
         let c = compare_means(&a, &b).unwrap();
         assert_eq!(c.ordering, Ordering::Equal);
     }
@@ -162,8 +171,14 @@ mod tests {
     fn two_mean_strictly_above_and_below() {
         let fast = [100.0, 100.0, 100.0]; // mean 100
         let slow = [50.0, 50.0, 50.0, 50.0]; // mean 50
-        assert_eq!(compare_means(&fast, &slow).unwrap().ordering, Ordering::Greater);
-        assert_eq!(compare_means(&slow, &fast).unwrap().ordering, Ordering::Less);
+        assert_eq!(
+            compare_means(&fast, &slow).unwrap().ordering,
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_means(&slow, &fast).unwrap().ordering,
+            Ordering::Less
+        );
     }
 
     #[test]

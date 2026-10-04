@@ -276,8 +276,7 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    fn series(
-        bars: &[(NaiveDate, f64, f64, f64)], // (date, high, low, close)
+    fn series(bars: &[(NaiveDate, f64, f64, f64)], // (date, high, low, close)
     ) -> HlcSeries {
         let dates = bars.iter().map(|b| b.0).collect();
         let highs = bars.iter().map(|b| b.1).collect();

@@ -50,7 +50,11 @@ pub const SMA_CROSSOVER_DEFAULT_N: usize = 200;
 pub const SMA_CROSSOVER_UNIVERSE: [&str; 1] = ["ASSET"];
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const SMA_CROSSOVER_VERSION: &str = concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " sma_crossover_trend");
+pub const SMA_CROSSOVER_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " sma_crossover_trend"
+);
 
 /// `sma_crossover_trend`: weight 1.0 in the sleeve's one asset when its close is strictly above the simple average
 /// of its last `n` daily closes (today's included), else weight 0.0. See the module doc for the interpretation
@@ -90,7 +94,9 @@ impl Default for SmaCrossoverTrend {
 /// interpretation choice 4); never called by `target_weights` until that holds.
 pub(crate) fn sma_crossover_weight(closes: &[f64], n: usize) -> Result<f64, RuleRefusal> {
     let window = &closes[closes.len() - n..];
-    let close = *closes.last().expect("closes is non-empty: n >= 1 and closes.len() >= n");
+    let close = *closes
+        .last()
+        .expect("closes is non-empty: n >= 1 and closes.len() >= n");
     match compare_to_mean(close, window) {
         Some(cmp) if cmp.ordering.is_gt() => Ok(1.0),
         Some(_) => Ok(0.0),
@@ -138,7 +144,10 @@ mod tests {
     fn min_history_bars_is_n() {
         assert_eq!(SmaCrossoverTrend::new(N).min_history_bars(), N);
         assert_eq!(SmaCrossoverTrend::new(37).min_history_bars(), 37);
-        assert_eq!(SmaCrossoverTrend::default().min_history_bars(), SMA_CROSSOVER_DEFAULT_N);
+        assert_eq!(
+            SmaCrossoverTrend::default().min_history_bars(),
+            SMA_CROSSOVER_DEFAULT_N
+        );
         assert_eq!(SMA_CROSSOVER_DEFAULT_N, 200);
     }
 
@@ -193,7 +202,10 @@ mod tests {
         assert_eq!(mean, 50.0, "fixture must be an EXACT tie by construction");
         assert_eq!(*closes.last().unwrap(), mean);
         let w = sma_crossover_weight(&closes, N).unwrap();
-        assert!(w.abs() < 1e-9, "a tie must be weight 0.0 (>, not >=), got {w}");
+        assert!(
+            w.abs() < 1e-9,
+            "a tie must be weight 0.0 (>, not >=), got {w}"
+        );
     }
 
     // (d) Minimum valid history: exactly N closes visible (h.len() == min_history_bars()), no extra bars at all.
@@ -210,6 +222,9 @@ mod tests {
 
     #[test]
     fn default_constructor_uses_the_documented_default_n() {
-        assert_eq!(SmaCrossoverTrend::default(), SmaCrossoverTrend::new(SMA_CROSSOVER_DEFAULT_N));
+        assert_eq!(
+            SmaCrossoverTrend::default(),
+            SmaCrossoverTrend::new(SMA_CROSSOVER_DEFAULT_N)
+        );
     }
 }

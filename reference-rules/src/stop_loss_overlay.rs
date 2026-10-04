@@ -200,7 +200,10 @@ mod tests {
         assert_eq!(stop_loss_overlay(0.0, 100.0, 1_000_000.0, 0.10), 0.0);
         assert_eq!(stop_loss_overlay(0.0, 100.0, 0.0, 0.10), 0.0);
         assert_eq!(stop_loss_overlay(0.0, -5.0, f64::NAN, 2.0), 0.0);
-        assert_eq!(stop_loss_overlay(0.0, f64::INFINITY, f64::NEG_INFINITY, -1.0), 0.0);
+        assert_eq!(
+            stop_loss_overlay(0.0, f64::INFINITY, f64::NEG_INFINITY, -1.0),
+            0.0
+        );
     }
 
     #[test]

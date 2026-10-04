@@ -58,7 +58,11 @@ pub const ONE_DAY_REVERSAL_MIN_HISTORY_BARS: usize = 3;
 pub const ONE_DAY_REVERSAL_UNIVERSE: [&str; 1] = ["ASSET"];
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const ONE_DAY_REVERSAL_VERSION: &str = concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " one_day_reversal");
+pub const ONE_DAY_REVERSAL_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " one_day_reversal"
+);
 
 /// `one_day_reversal`: weight 1.0 in the sleeve's one asset when YESTERDAY's bar return was strictly negative,
 /// else weight 0.0. See the module doc for the interpretation choices (yesterday vs. today, the strict-negative
@@ -172,9 +176,15 @@ mod tests {
     fn exact_zero_yesterday_return_is_not_negative() {
         let closes = [50.0, 50.0, 999.0];
         let yesterday_return = closes[1] / closes[0] - 1.0;
-        assert_eq!(yesterday_return, 0.0, "fixture must be an EXACT zero return by construction");
+        assert_eq!(
+            yesterday_return, 0.0,
+            "fixture must be an EXACT zero return by construction"
+        );
         let w = one_day_reversal_weight(&closes);
-        assert!(w.abs() < 1e-9, "an exact-zero return must be weight 0.0 (<, not <=), got {w}");
+        assert!(
+            w.abs() < 1e-9,
+            "an exact-zero return must be weight 0.0 (<, not <=), got {w}"
+        );
     }
 
     // (d) Today's close value never affects the result: same (day_before, yesterday) pair, wildly different
@@ -196,7 +206,10 @@ mod tests {
         let mut closes = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 12345.0];
         closes.extend_from_slice(&[100.0, 90.0, 1.0]); // same trailing triple as the down-day test above
         let w = one_day_reversal_weight(&closes);
-        assert!((w - 1.0).abs() < 1e-9, "expected weight 1.0 (unaffected by older history), got {w}");
+        assert!(
+            (w - 1.0).abs() < 1e-9,
+            "expected weight 1.0 (unaffected by older history), got {w}"
+        );
     }
 
     // (f) Minimum valid history: exactly 3 closes visible (h.len() == min_history_bars()), no extra bars at all.

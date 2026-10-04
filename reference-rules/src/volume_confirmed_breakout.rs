@@ -199,7 +199,11 @@ impl OhlcvSeries {
 ///
 /// # Panics
 /// Panics if `price_n == 0` or `volume_n == 0` (a zero-length window is not a meaningful parameter).
-pub fn decide_volume_confirmed_breakout(series: &OhlcvSeries, price_n: usize, volume_n: usize) -> Vec<f64> {
+pub fn decide_volume_confirmed_breakout(
+    series: &OhlcvSeries,
+    price_n: usize,
+    volume_n: usize,
+) -> Vec<f64> {
     assert!(price_n >= 1, "price_n must be >= 1");
     assert!(volume_n >= 1, "volume_n must be >= 1");
     let highs = series.highs();
@@ -417,7 +421,9 @@ mod tests {
                 vec![4.5],
                 vec![100.0],
             ),
-            Err(VolumeConfirmedBreakoutError::Hlc(DonchianError::HighBelowLow { .. }))
+            Err(VolumeConfirmedBreakoutError::Hlc(
+                DonchianError::HighBelowLow { .. }
+            ))
         ));
     }
 

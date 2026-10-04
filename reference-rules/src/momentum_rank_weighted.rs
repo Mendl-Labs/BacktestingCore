@@ -56,8 +56,11 @@ use weightsim::{DecisionSchedule, HistoryView, RebalancePolicy, RuleRefusal, Wei
 pub const MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK: usize = 126;
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const MOMENTUM_RANK_WEIGHTED_VERSION: &str =
-    concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " momentum_rank_weighted");
+pub const MOMENTUM_RANK_WEIGHTED_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " momentum_rank_weighted"
+);
 
 /// Typed per-bar ranking result (interpretation choice 3). `weights` is aligned to `universe()` order and is
 /// exactly what [`MomentumRankWeighted::target_weights`] returns; `excluded` additionally names which universe
@@ -89,15 +92,29 @@ impl MomentumRankWeighted {
     /// rebalanced on `schedule`. There is no winner count: every eligible asset participates at a rank-proportional
     /// weight.
     pub fn new(universe: Vec<&'static str>, lookback: usize, schedule: DecisionSchedule) -> Self {
-        assert!(!universe.is_empty(), "momentum_rank_weighted: universe must be non-empty");
-        assert!(lookback >= 1, "momentum_rank_weighted: lookback L must be >= 1, got {lookback}");
-        MomentumRankWeighted { universe, lookback, schedule }
+        assert!(
+            !universe.is_empty(),
+            "momentum_rank_weighted: universe must be non-empty"
+        );
+        assert!(
+            lookback >= 1,
+            "momentum_rank_weighted: lookback L must be >= 1, got {lookback}"
+        );
+        MomentumRankWeighted {
+            universe,
+            lookback,
+            schedule,
+        }
     }
 
     /// Convenience constructor: `lookback` = [`MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK`] (126),
     /// `schedule` = [`DecisionSchedule::Daily`].
     pub fn with_defaults(universe: Vec<&'static str>) -> Self {
-        MomentumRankWeighted::new(universe, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK, DecisionSchedule::Daily)
+        MomentumRankWeighted::new(
+            universe,
+            MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+            DecisionSchedule::Daily,
+        )
     }
 
     /// The configured trailing lookback `L`.
@@ -133,7 +150,11 @@ pub(crate) fn rank_weighted(
     universe: &[&'static str],
     lookback: usize,
 ) -> RankWeightedRanking {
-    assert_eq!(closes_by_asset.len(), universe.len(), "momentum_rank_weighted: one close slice per universe asset");
+    assert_eq!(
+        closes_by_asset.len(),
+        universe.len(),
+        "momentum_rank_weighted: one close slice per universe asset"
+    );
     let mut weights = vec![0.0; universe.len()];
     let mut excluded = Vec::new();
     let mut candidates: Vec<(usize, f64)> = Vec::new();
@@ -203,8 +224,16 @@ mod tests {
 
     #[test]
     fn min_history_bars_is_lookback_plus_one() {
-        assert_eq!(MomentumRankWeighted::new(vec!["A", "B"], L, DecisionSchedule::Daily).min_history_bars(), L + 1);
-        assert_eq!(MomentumRankWeighted::new(vec!["A", "B"], 37, DecisionSchedule::Daily).min_history_bars(), 38);
+        assert_eq!(
+            MomentumRankWeighted::new(vec!["A", "B"], L, DecisionSchedule::Daily)
+                .min_history_bars(),
+            L + 1
+        );
+        assert_eq!(
+            MomentumRankWeighted::new(vec!["A", "B"], 37, DecisionSchedule::Daily)
+                .min_history_bars(),
+            38
+        );
     }
 
     #[test]
@@ -212,15 +241,23 @@ mod tests {
         let r = MomentumRankWeighted::new(vec!["A", "B"], 126, DecisionSchedule::Daily);
         let params = r.declared_parameters();
         assert_eq!(params["L"], "126");
-        assert_eq!(params.len(), 1, "no N parameter: every eligible asset participates");
+        assert_eq!(
+            params.len(),
+            1,
+            "no N parameter: every eligible asset participates"
+        );
     }
 
     #[test]
     fn schedule_is_a_constructor_parameter_and_policy_is_on_decision() {
         let daily = MomentumRankWeighted::new(vec!["A", "B"], L, DecisionSchedule::Daily);
         assert_eq!(daily.decision_schedule(), DecisionSchedule::Daily);
-        let monthly = MomentumRankWeighted::new(vec!["A", "B"], L, DecisionSchedule::LastBarOfMonth);
-        assert_eq!(monthly.decision_schedule(), DecisionSchedule::LastBarOfMonth);
+        let monthly =
+            MomentumRankWeighted::new(vec!["A", "B"], L, DecisionSchedule::LastBarOfMonth);
+        assert_eq!(
+            monthly.decision_schedule(),
+            DecisionSchedule::LastBarOfMonth
+        );
         assert_eq!(monthly.rebalance_policy(), RebalancePolicy::OnDecision);
         assert_eq!(monthly.id(), "momentum_rank_weighted");
     }
@@ -245,19 +282,50 @@ mod tests {
         assert!(r.excluded.is_empty());
         assert_eq!(r.weights.len(), 5);
         let denom = 15.0_f64; // K=5 -> 5*6/2
-        assert!((r.weights[3] - 5.0 / denom).abs() < 1e-9, "DDD (highest momentum) should get the LARGEST weight, got {}", r.weights[3]);
-        assert!((r.weights[0] - 4.0 / denom).abs() < 1e-9, "AAA rank 2, got {}", r.weights[0]);
-        assert!((r.weights[1] - 3.0 / denom).abs() < 1e-9, "BBB rank 3, got {}", r.weights[1]);
-        assert!((r.weights[2] - 2.0 / denom).abs() < 1e-9, "CCC rank 4, got {}", r.weights[2]);
+        assert!(
+            (r.weights[3] - 5.0 / denom).abs() < 1e-9,
+            "DDD (highest momentum) should get the LARGEST weight, got {}",
+            r.weights[3]
+        );
+        assert!(
+            (r.weights[0] - 4.0 / denom).abs() < 1e-9,
+            "AAA rank 2, got {}",
+            r.weights[0]
+        );
+        assert!(
+            (r.weights[1] - 3.0 / denom).abs() < 1e-9,
+            "BBB rank 3, got {}",
+            r.weights[1]
+        );
+        assert!(
+            (r.weights[2] - 2.0 / denom).abs() < 1e-9,
+            "CCC rank 4, got {}",
+            r.weights[2]
+        );
         assert!((r.weights[4] - 1.0 / denom).abs() < 1e-9, "EEE (lowest momentum, negative) should get the SMALLEST but still positive weight, got {}", r.weights[4]);
-        assert!(r.weights[3] > r.weights[0], "DDD (rank 1) must outweigh AAA (rank 2)");
-        assert!(r.weights[0] > r.weights[1], "AAA (rank 2) must outweigh BBB (rank 3)");
-        assert!(r.weights[1] > r.weights[2], "BBB (rank 3) must outweigh CCC (rank 4)");
-        assert!(r.weights[2] > r.weights[4], "CCC (rank 4) must outweigh EEE (rank 5)");
+        assert!(
+            r.weights[3] > r.weights[0],
+            "DDD (rank 1) must outweigh AAA (rank 2)"
+        );
+        assert!(
+            r.weights[0] > r.weights[1],
+            "AAA (rank 2) must outweigh BBB (rank 3)"
+        );
+        assert!(
+            r.weights[1] > r.weights[2],
+            "BBB (rank 3) must outweigh CCC (rank 4)"
+        );
+        assert!(
+            r.weights[2] > r.weights[4],
+            "CCC (rank 4) must outweigh EEE (rank 5)"
+        );
         for &w in &r.weights {
             assert!(w > 0.0, "every eligible asset, even negative-momentum ones, must get a strictly positive weight, got {w}");
         }
-        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9, "weights must sum to exactly 1.0");
+        assert!(
+            (r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "weights must sum to exactly 1.0"
+        );
     }
 
     // (b) One asset excluded for insufficient history: CCC has only L=3 bars (needs L+1=4), so it must be a TYPED
@@ -273,10 +341,25 @@ mod tests {
         ];
         let r = rank_weighted(&slices(&closes), &universe, L);
         assert_eq!(r.excluded, vec!["CCC"], "CCC must be a typed exclusion");
-        assert!((r.weights[0] - 2.0 / 3.0).abs() < 1e-9, "AAA should get 2/3 (rank 1 of K=2), got {}", r.weights[0]);
-        assert!((r.weights[1] - 1.0 / 3.0).abs() < 1e-9, "BBB should get 1/3 (rank 2 of K=2), got {}", r.weights[1]);
-        assert!(r.weights[2].abs() < 1e-9, "CCC excluded -> weight 0.0 in the plain vector too, got {}", r.weights[2]);
-        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9, "fully invested among the eligible K=2, denominator must NOT count CCC");
+        assert!(
+            (r.weights[0] - 2.0 / 3.0).abs() < 1e-9,
+            "AAA should get 2/3 (rank 1 of K=2), got {}",
+            r.weights[0]
+        );
+        assert!(
+            (r.weights[1] - 1.0 / 3.0).abs() < 1e-9,
+            "BBB should get 1/3 (rank 2 of K=2), got {}",
+            r.weights[1]
+        );
+        assert!(
+            r.weights[2].abs() < 1e-9,
+            "CCC excluded -> weight 0.0 in the plain vector too, got {}",
+            r.weights[2]
+        );
+        assert!(
+            (r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "fully invested among the eligible K=2, denominator must NOT count CCC"
+        );
         assert!(!r.excluded.contains(&"AAA"));
         assert!(!r.excluded.contains(&"BBB"));
     }
@@ -291,16 +374,35 @@ mod tests {
         let closes = vec![
             vec![100.0, 120.0, 140.0, 150.0], // BBB: 150/100 - 1 = 0.5
             vec![100.0, 120.0, 140.0, 150.0], // AAA: 150/100 - 1 = 0.5 (bit-identical to BBB's)
-            vec![100.0, 95.0, 92.0, 90.0],    // CCC: 90/100 - 1 = -0.1 (clearly lower, no interference)
+            vec![100.0, 95.0, 92.0, 90.0], // CCC: 90/100 - 1 = -0.1 (clearly lower, no interference)
         ];
         let ret = |c: &[f64]| c[3] / c[0] - 1.0;
-        assert_eq!(ret(&closes[0]).to_bits(), ret(&closes[1]).to_bits(), "fixture must be an EXACT tie by construction");
+        assert_eq!(
+            ret(&closes[0]).to_bits(),
+            ret(&closes[1]).to_bits(),
+            "fixture must be an EXACT tie by construction"
+        );
         let r = rank_weighted(&slices(&closes), &universe, L);
         assert!(r.excluded.is_empty());
-        assert!((r.weights[1] - 3.0 / 6.0).abs() < 1e-9, "AAA (ascending alphabetical) wins the tie -> rank 1, got {}", r.weights[1]);
-        assert!((r.weights[0] - 2.0 / 6.0).abs() < 1e-9, "BBB loses the tie-break -> rank 2, got {}", r.weights[0]);
-        assert!((r.weights[2] - 1.0 / 6.0).abs() < 1e-9, "CCC is clearly lowest -> rank 3, got {}", r.weights[2]);
-        assert!(r.weights[1] > r.weights[0], "tie-break winner AAA must strictly outweigh BBB");
+        assert!(
+            (r.weights[1] - 3.0 / 6.0).abs() < 1e-9,
+            "AAA (ascending alphabetical) wins the tie -> rank 1, got {}",
+            r.weights[1]
+        );
+        assert!(
+            (r.weights[0] - 2.0 / 6.0).abs() < 1e-9,
+            "BBB loses the tie-break -> rank 2, got {}",
+            r.weights[0]
+        );
+        assert!(
+            (r.weights[2] - 1.0 / 6.0).abs() < 1e-9,
+            "CCC is clearly lowest -> rank 3, got {}",
+            r.weights[2]
+        );
+        assert!(
+            r.weights[1] > r.weights[0],
+            "tie-break winner AAA must strictly outweigh BBB"
+        );
     }
 
     // (d) Degenerate K=1 case: a single eligible asset must get weight exactly 1.0 (denominator 1*2/2 = 1).
@@ -313,7 +415,11 @@ mod tests {
         ];
         let r = rank_weighted(&slices(&closes), &universe, L);
         assert_eq!(r.excluded, vec!["BBB"]);
-        assert!((r.weights[0] - 1.0).abs() < 1e-9, "sole eligible asset must get weight exactly 1.0, got {}", r.weights[0]);
+        assert!(
+            (r.weights[0] - 1.0).abs() < 1e-9,
+            "sole eligible asset must get weight exactly 1.0, got {}",
+            r.weights[0]
+        );
         assert!(r.weights[1].abs() < 1e-9);
     }
 
@@ -322,8 +428,8 @@ mod tests {
     fn all_excluded_yields_all_zero_weights_no_panic() {
         let universe = vec!["AAA", "BBB", "CCC"];
         let closes = vec![
-            vec![100.0, 110.0], // AAA: 2 bars, excluded (needs 4)
-            vec![100.0],        // BBB: 1 bar, excluded
+            vec![100.0, 110.0],      // AAA: 2 bars, excluded (needs 4)
+            vec![100.0],             // BBB: 1 bar, excluded
             vec![100.0, 90.0, 80.0], // CCC: 3 bars, excluded (needs 4)
         ];
         let r = rank_weighted(&slices(&closes), &universe, L);
@@ -340,7 +446,10 @@ mod tests {
         // `target_weights` is a thin wrapper returning only `.weights`, nothing more, nothing less. K=2 eligible
         // assets -> denominator 2*3/2 = 3: AAA (rank 1) gets 2/3, BBB (rank 2) gets 1/3.
         let universe = vec!["AAA", "BBB"];
-        let closes = vec![vec![100.0, 110.0, 120.0, 130.0], vec![100.0, 102.0, 106.0, 110.0]];
+        let closes = vec![
+            vec![100.0, 110.0, 120.0, 130.0],
+            vec![100.0, 102.0, 106.0, 110.0],
+        ];
         let r = rank_weighted(&slices(&closes), &universe, L);
         assert!((r.weights[0] - 2.0 / 3.0).abs() < 1e-9);
         assert!((r.weights[1] - 1.0 / 3.0).abs() < 1e-9);

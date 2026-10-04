@@ -54,7 +54,11 @@ pub const DUAL_MA_DEFAULT_N2: usize = 200;
 pub const DUAL_MA_UNIVERSE: [&str; 1] = ["ASSET"];
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const DUAL_MA_VERSION: &str = concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " dual_ma_crossover");
+pub const DUAL_MA_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " dual_ma_crossover"
+);
 
 /// `dual_ma_crossover`: weight 1.0 in the sleeve's one asset when the fast SMA (last `n1` daily closes) is
 /// strictly above the slow SMA (last `n2` daily closes), both including today's close, else weight 0.0. See the
@@ -71,7 +75,10 @@ impl DualMaCrossover {
     /// `target_weights` before `n2` closes are visible, see `min_history_bars`; `n1 < n2` is also what makes `n2`
     /// alone the binding history requirement -- see interpretation choice 4).
     pub fn new(n1: usize, n2: usize) -> Self {
-        assert!(n1 < n2, "dual_ma_crossover: N1 must be < N2, got N1={n1}, N2={n2}");
+        assert!(
+            n1 < n2,
+            "dual_ma_crossover: N1 must be < N2, got N1={n1}, N2={n2}"
+        );
         DualMaCrossover { n1, n2 }
     }
 
@@ -153,7 +160,10 @@ mod tests {
     fn min_history_bars_is_n2() {
         assert_eq!(DualMaCrossover::new(N1, N2).min_history_bars(), N2);
         assert_eq!(DualMaCrossover::new(10, 37).min_history_bars(), 37);
-        assert_eq!(DualMaCrossover::default().min_history_bars(), DUAL_MA_DEFAULT_N2);
+        assert_eq!(
+            DualMaCrossover::default().min_history_bars(),
+            DUAL_MA_DEFAULT_N2
+        );
         assert_eq!(DUAL_MA_DEFAULT_N1, 50);
         assert_eq!(DUAL_MA_DEFAULT_N2, 200);
     }
@@ -217,10 +227,19 @@ mod tests {
         let fast = &closes[closes.len() - N1..];
         let slow_mean: f64 = slow.iter().sum::<f64>() / N2 as f64;
         let fast_mean: f64 = fast.iter().sum::<f64>() / N1 as f64;
-        assert_eq!(slow_mean, 50.0, "fixture must be an EXACT tie by construction");
-        assert_eq!(fast_mean, slow_mean, "fixture must be an EXACT tie by construction");
+        assert_eq!(
+            slow_mean, 50.0,
+            "fixture must be an EXACT tie by construction"
+        );
+        assert_eq!(
+            fast_mean, slow_mean,
+            "fixture must be an EXACT tie by construction"
+        );
         let w = dual_ma_weight(&closes, N1, N2).unwrap();
-        assert!(w.abs() < 1e-9, "a tie must be weight 0.0 (>, not >=), got {w}");
+        assert!(
+            w.abs() < 1e-9,
+            "a tie must be weight 0.0 (>, not >=), got {w}"
+        );
     }
 
     // (d) Minimum valid history: exactly N2 closes visible (h.len() == min_history_bars()), no extra bars at all.
@@ -242,11 +261,17 @@ mod tests {
         let mut closes = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 12345.0];
         closes.extend_from_slice(&[10.0, 10.0, 100.0, 100.0, 100.0]); // same tail as the N2-boundary test above
         let w = dual_ma_weight(&closes, N1, N2).unwrap();
-        assert!((w - 1.0).abs() < 1e-9, "expected weight 1.0 (unaffected by older history), got {w}");
+        assert!(
+            (w - 1.0).abs() < 1e-9,
+            "expected weight 1.0 (unaffected by older history), got {w}"
+        );
     }
 
     #[test]
     fn default_constructor_uses_the_documented_defaults() {
-        assert_eq!(DualMaCrossover::default(), DualMaCrossover::new(DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2));
+        assert_eq!(
+            DualMaCrossover::default(),
+            DualMaCrossover::new(DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2)
+        );
     }
 }

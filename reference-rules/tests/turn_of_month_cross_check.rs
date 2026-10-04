@@ -97,7 +97,11 @@ fn fixture_b_series_ends_mid_window() {
 /// position -- both implementations agree they are 0.0 here.
 #[test]
 fn fixture_c_series_starts_mid_month_with_no_prior_month_data() {
-    let days = TradingDays::new("FIXTURE_C", vec![d(2024, 2, 2), d(2024, 2, 3), d(2024, 2, 20)]).unwrap();
+    let days = TradingDays::new(
+        "FIXTURE_C",
+        vec![d(2024, 2, 2), d(2024, 2, 3), d(2024, 2, 20)],
+    )
+    .unwrap();
     for t in 0..days.len() {
         assert_eq!(decide_turn_of_month(&days, t), 0.0, "bar {t}");
     }

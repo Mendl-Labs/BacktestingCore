@@ -40,7 +40,10 @@ fn breakout_with_volume_confirmation_matches_python_key() {
         (d(2024, 1, 2), 10.0, 5.0, 7.0, 100.0),
         (d(2024, 1, 3), 12.0, 4.0, 11.0, 300.0),
     ]);
-    assert_close(&decide_volume_confirmed_breakout(&s, 2, 2), &[0.0, 0.0, 1.0]);
+    assert_close(
+        &decide_volume_confirmed_breakout(&s, 2, 2),
+        &[0.0, 0.0, 1.0],
+    );
 }
 
 /// Cross-checked: price breakout WITHOUT volume confirmation holds unchanged.
@@ -51,7 +54,10 @@ fn breakout_without_volume_confirmation_matches_python_key() {
         (d(2024, 1, 2), 10.0, 5.0, 7.0, 100.0),
         (d(2024, 1, 3), 12.0, 4.0, 11.0, 120.0),
     ]);
-    assert_close(&decide_volume_confirmed_breakout(&s, 2, 2), &[0.0, 0.0, 0.0]);
+    assert_close(
+        &decide_volume_confirmed_breakout(&s, 2, 2),
+        &[0.0, 0.0, 0.0],
+    );
 }
 
 /// Cross-checked: a volume spike with no price breakout never flips anything.
@@ -62,7 +68,10 @@ fn volume_spike_without_price_breakout_matches_python_key() {
         (d(2024, 1, 2), 10.0, 5.0, 7.0, 100.0),
         (d(2024, 1, 3), 9.0, 6.0, 8.0, 1000.0),
     ]);
-    assert_close(&decide_volume_confirmed_breakout(&s, 2, 2), &[0.0, 0.0, 0.0]);
+    assert_close(
+        &decide_volume_confirmed_breakout(&s, 2, 2),
+        &[0.0, 0.0, 0.0],
+    );
 }
 
 /// Cross-checked: insufficient-history threshold is `max`, not `min`, of two DIFFERENT lookback windows
@@ -76,7 +85,10 @@ fn max_not_min_history_threshold_matches_python_key() {
         (d(2024, 1, 4), 20.0, 3.0, 15.0, 10000.0),
         (d(2024, 1, 5), 10.0, 5.0, 7.0, 100.0),
     ]);
-    assert_close(&decide_volume_confirmed_breakout(&s, 2, 4), &[0.0, 0.0, 0.0, 0.0, 0.0]);
+    assert_close(
+        &decide_volume_confirmed_breakout(&s, 2, 4),
+        &[0.0, 0.0, 0.0, 0.0, 0.0],
+    );
 }
 
 /// Cross-checked: off-by-one boundary on the volume window (price_n=volume_n=2) -- an outlier volume exactly

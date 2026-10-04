@@ -39,7 +39,10 @@ fn leverage_cap_bites_matches_python_key() {
     let out = vol_target_overlay(0.1, 0.03, 0.15);
     assert_close(out, 0.1 * VOL_TARGET_MAX_LEVERAGE);
     assert_close(out, 0.2);
-    assert!((out - 0.5).abs() > 1e-9, "must not equal the uncapped ratio's output");
+    assert!(
+        (out - 0.5).abs() > 1e-9,
+        "must not equal the uncapped ratio's output"
+    );
 }
 
 /// Cross-checked: realized vol moderately below target (ratio 1.5) -> cap does not bite, uncapped ratio applies.
