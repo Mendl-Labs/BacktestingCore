@@ -82,6 +82,7 @@ mod exact;
 mod fx;
 
 pub mod equal_weight_rebalance;
+pub mod inverse_vol_risk_parity;
 pub mod inverse_volatility_weight;
 pub mod low_vol_quintile_tilt;
 
@@ -95,6 +96,9 @@ pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANC
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;
+pub use inverse_vol_risk_parity::{
+    InverseVolRiskParityRule, INVERSE_VOL_RISK_PARITY_LOOKBACK_DAYS, INVERSE_VOL_RISK_PARITY_SYMBOLS,
+};
 pub use inverse_volatility_weight::{
     InverseVolatilityWeightRule, INVERSE_VOLATILITY_LOOKBACK_DAYS, INVERSE_VOLATILITY_SYMBOLS,
 };

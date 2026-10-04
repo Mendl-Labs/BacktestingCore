@@ -97,6 +97,10 @@ MUTANTS = [
      "src/equal_weight_rebalance.rs",
      "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::OnDecision\n    }",
      "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::EveryBar\n    }"),
+    ("M24", "inverse_vol_risk_parity: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_vol_risk_parity.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
 ]
 
 
