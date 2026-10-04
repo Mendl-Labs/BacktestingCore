@@ -81,6 +81,7 @@ mod etf;
 mod exact;
 mod fx;
 
+pub mod equal_weight_rebalance;
 pub mod inverse_volatility_weight;
 pub mod low_vol_quintile_tilt;
 
@@ -90,6 +91,7 @@ pub use crypto::{
 pub use decision::{
     CryptoDecision, EtfDecision, FxInstrumentDecision, FxTsmomDecision, InstrumentDecision, Signal,
 };
+pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANCE_SYMBOLS};
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;

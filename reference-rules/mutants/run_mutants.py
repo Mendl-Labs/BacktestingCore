@@ -93,6 +93,10 @@ MUTANTS = [
      "src/low_vol_quintile_tilt.rs",
      "eligible.sort_by(|a, b| a.0.partial_cmp(&b.0).expect(\"non-finite stdev already rejected above\").then(a.1.cmp(b.1)));",
      "eligible.sort_by(|a, b| a.0.partial_cmp(&b.0).expect(\"non-finite stdev already rejected above\").then(b.1.cmp(a.1)));"),
+    ("M23", "equal_weight_rebalance: every_bar instead of on_decision (drift never happens)",
+     "src/equal_weight_rebalance.rs",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::OnDecision\n    }",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::EveryBar\n    }"),
 ]
 
 
