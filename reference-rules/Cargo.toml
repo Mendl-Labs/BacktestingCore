@@ -9,6 +9,10 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
+# Path dependency for the one rule in this crate (`sma_crossover_trend`) that implements `weightsim::WeightRule`
+# directly. `weightsim` has zero dependencies of its own (confirmed in its Cargo.toml), so this keeps the
+# "standalone, dependency-light" spirit of both crates intact.
+weightsim = { path = "../weightsim" }
 
 # Standalone on purpose (same pattern as `weightsim`): NOT a member of the BacktestingCore workspace (root Cargo.toml
 # `exclude`). Its three dependencies are public crates.io crates, so CI and consumers never have to resolve the

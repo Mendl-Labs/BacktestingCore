@@ -83,6 +83,9 @@ MUTANTS = [
     ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
      "if pos + 1 < CRYPTO_SMA_DAYS {",
      "if pos + 1 <= CRYPTO_SMA_DAYS {"),
+    ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",
+     "let window = &closes[closes.len() - n..];",
+     "let window = &closes[closes.len() - n - 1..];"),
 ]
 
 
