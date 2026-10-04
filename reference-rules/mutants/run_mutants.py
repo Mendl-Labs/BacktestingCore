@@ -113,6 +113,9 @@ MUTANTS = [
     ("M30", "stop_loss_overlay: long-stop boundary weakened from inclusive to strict (<= changed to <)", "src/stop_loss_overlay.rs",
      "if current_price <= stop_level {",
      "if current_price < stop_level {"),
+    ("M31", "one_day_reversal: zero-return boundary widened from strict to inclusive (< changed to <=)", "src/one_day_reversal.rs",
+     "if yesterday_return < 0.0 {",
+     "if yesterday_return <= 0.0 {"),
 ]
 
 

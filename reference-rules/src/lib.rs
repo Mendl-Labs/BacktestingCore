@@ -84,6 +84,7 @@ mod etf;
 mod exact;
 mod fx;
 mod momentum_rank_weighted;
+mod one_day_reversal;
 mod sma_crossover_trend;
 mod stop_loss_overlay;
 mod top_n_winners;
@@ -128,3 +129,4 @@ pub use momentum_rank_weighted::{
 pub use volume_confirmed_breakout::{decide_volume_confirmed_breakout, OhlcvSeries, VolumeConfirmedBreakoutError, VCB_DEFAULT_PRICE_N, VCB_DEFAULT_VOLUME_N, VCB_VOLUME_MULTIPLIER};
 pub use vol_target_overlay::{vol_target_overlay, VOL_TARGET_DEFAULT_TARGET_VOL, VOL_TARGET_MAX_LEVERAGE};
 pub use stop_loss_overlay::{stop_loss_overlay, STOP_LOSS_OVERLAY_DEFAULT_PCT};
+pub use one_day_reversal::{OneDayReversal, ONE_DAY_REVERSAL_MIN_HISTORY_BARS, ONE_DAY_REVERSAL_UNIVERSE, ONE_DAY_REVERSAL_VERSION};
