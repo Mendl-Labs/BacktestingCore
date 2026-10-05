@@ -17,7 +17,7 @@ name: core-pure-crates
 
 on:
   push:
-    branches: [local-dev]
+    branches: [local-dev, master]
     paths:
       - "weightsim/**"
       - "reference-rules/**"
@@ -28,7 +28,6 @@ on:
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
   pull_request:
-    branches: [local-dev]
     paths:
       - "weightsim/**"
       - "reference-rules/**"
@@ -38,6 +37,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/core-ci.yml"
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -353,3 +355,37 @@ jobs:
           workspaces: portfolio-eval
       - name: run every hand-written mutant against the suite
         run: python3 portfolio-eval/mutants/run_mutants.py
+
+  dependency-audit:
+    # Runs `cargo audit` against each standalone pure crate's own Cargo.lock (they are excluded
+    # from the root [workspace] in Cargo.toml and vendor their own lockfiles, so they must each be
+    # audited individually; the root workspace's Cargo.lock is covered by Dependabot directly).
+    name: dependency audit (cargo-audit, one standalone crate's lockfile at a time)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - weightsim
+          - reference-rules
+          - weightsim-rules
+          - portfolio-construct
+          - portfolio-eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit (${{ matrix.crate }})
+        working-directory: ${{ matrix.crate }}
+        run: cargo audit --file Cargo.lock

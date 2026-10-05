@@ -1,0 +1,42 @@
+version: 2
+updates:
+  # Root workspace (backtest, orderbook, dataloader, walkforward, data_prep, metrics,
+  # derivatives, greeks, signal, smartrouter, portfoliomanager, quant-diagnostics,
+  # riskmanager, genetic, strategy, config).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # The following five crates are excluded from the root [workspace] (see Cargo.toml) and
+  # each carries its own standalone Cargo.lock, so each needs its own dependabot entry or it
+  # would never be scanned.
+  - package-ecosystem: "cargo"
+    directory: "/weightsim"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/reference-rules"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/weightsim-rules"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/portfolio-construct"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/portfolio-eval"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
