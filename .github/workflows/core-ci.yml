@@ -214,6 +214,29 @@ jobs:
       - name: fmt
         run: cargo fmt -- --check
 
+      - name: TEMP DIAGNOSTIC -- read only, no file writes except a scratch copy (will be reverted)
+        run: |
+          echo "=== 1) baseline: cargo check --locked against the committed Cargo.lock ==="
+          cargo check --locked 2>&1 ; echo "baseline exit=$?"
+          echo
+          echo "=== 2) does the lockfile contain [[patch.unused]] entries? ==="
+          grep -c '\[\[patch.unused\]\]' Cargo.lock || echo "0"
+          echo
+          echo "=== 3) scratch copy with every [[patch.unused]] block deleted (3-line blocks: header, name, version) ==="
+          cp Cargo.lock /tmp/Cargo.lock.nopatch
+          awk '/^\[\[patch\.unused\]\]$/{skip=3} skip>0{skip--; next} {print}' Cargo.lock > /tmp/Cargo.lock.stripped
+          diff -u /tmp/Cargo.lock.nopatch /tmp/Cargo.lock.stripped | head -60
+          echo
+          echo "=== 4) cargo check --locked against the stripped copy ==="
+          cp Cargo.lock /tmp/Cargo.lock.backup
+          cp /tmp/Cargo.lock.stripped Cargo.lock
+          cargo check --locked 2>&1 ; echo "stripped exit=$?"
+          echo
+          echo "=== 5) restoring the original committed Cargo.lock (no permanent change) ==="
+          cp /tmp/Cargo.lock.backup Cargo.lock
+          git diff --stat -- Cargo.lock
+          echo "=== end diagnostic ==="
+
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets --locked -- -D warnings
 
