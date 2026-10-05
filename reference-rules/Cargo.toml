@@ -9,10 +9,11 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
-# `weightsim` is the sibling, zero-dependency, standalone simulator crate (path dependency; same repo). Used directly
-# by `inverse_volatility_weight` (a rule implemented straight against `weightsim::WeightRule`/`HistoryView`, unlike
-# the older Panel/PriceSeries primitives in this crate). A path dependency keeps this crate dependency-free of
-# anything beyond crates.io + one in-repo sibling; it does not reintroduce the workspace's private git dependencies.
+# `weightsim` is the sibling, zero-dependency, standalone simulator crate (path dependency; same repo). Several
+# W3.6 primitives implement `weightsim::WeightRule`/`HistoryView` directly (e.g. `sma_crossover_trend`,
+# `inverse_volatility_weight`), unlike the older Panel/PriceSeries primitives in this crate. A path dependency keeps
+# this crate dependency-free of anything beyond crates.io + one in-repo sibling; it does not reintroduce the
+# workspace's private git dependencies.
 weightsim = { path = "../weightsim" }
 
 # Standalone on purpose (same pattern as `weightsim`): NOT a member of the BacktestingCore workspace (root Cargo.toml
