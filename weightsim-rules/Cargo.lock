@@ -79,9 +79,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "num-traits"
@@ -136,3 +136,79 @@ dependencies = [
  "reference-rules",
  "weightsim",
 ]
+
+[[patch.unused]]
+name = "backtest"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "config"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "data_prep"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "dataloader"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "derivatives"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "genetic"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "greeks"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "metrics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "orderbook"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portfolio-eval"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "portfoliomanager"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "quant-diagnostics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "riskmanager"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "signal"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "smartrouter"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "strategy"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "walkforward"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "weightsim"
+version = "0.3.0"
+
+[[patch.unused]]
+name = "weightsim-rules"
+version = "0.1.0"
