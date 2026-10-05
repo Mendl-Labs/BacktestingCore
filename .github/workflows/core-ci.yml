@@ -214,6 +214,19 @@ jobs:
       - name: fmt
         run: cargo fmt -- --check
 
+      - name: TEMP DIAGNOSTIC (remove before merge)
+        run: |
+          echo "--- cargo/rustc verbose ---"
+          cargo --version --verbose
+          rustc --version --verbose
+          echo "--- cargo update dry-run verbose ---"
+          cargo update --dry-run --verbose 2>&1 || true
+          echo "--- cargo tree --locked -v ---"
+          cargo tree --locked -v 2>&1 || true
+          echo "--- Cargo.lock libc entry ---"
+          grep -A3 'name = "libc"' Cargo.lock || true
+          echo "--- end diagnostic ---"
+
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets --locked -- -D warnings
 
