@@ -281,7 +281,7 @@ MUTANTS = [
     ("V31", "columns from a run: units taken from the held weights", WC,
      "units: r.units.clone(),", "units: r.held_weights.clone(),"),
     ("V32", "answer-key metrics use ppy = 365 instead of n / years", WM,
-     "let ppy = n as f64 / years;", "let ppy = 365.0;"),
+     "let ppy = n as f64 / years;", "let ppy: f64 = 365.0;"),
     ("V33", "analyze_columns skips the NaN and infinity check", V,
      "    if let Some((column, bar)) = cols.first_non_finite() {\n        return Err(VerifyError::NonFinite { basis: name, column, bar });",
      "    if let Some((column, bar)) = None::<(&'static str, usize)> {\n        return Err(VerifyError::NonFinite { basis: name, column, bar });"),
