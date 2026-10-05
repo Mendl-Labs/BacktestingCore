@@ -77,26 +77,79 @@ pub mod series;
 
 mod checks;
 mod crypto;
+mod day_of_week;
+mod donchian_breakout;
+mod dual_ma_crossover;
 mod etf;
 mod exact;
+mod five_day_reversal_zscore;
 mod fx;
+mod momentum_rank_weighted;
+mod one_day_reversal;
+mod sma_crossover_trend;
+mod stop_loss_overlay;
+mod top_n_winners;
+mod turn_of_month;
+mod vol_target_overlay;
+mod volume_confirmed_breakout;
 
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
 };
+pub use day_of_week::{
+    decide_day_of_week, decide_day_of_week_default, decide_day_of_week_on,
+    DAY_OF_WEEK_DEFAULT_TARGET, DAY_OF_WEEK_WEIGHT,
+};
 pub use decision::{
     CryptoDecision, EtfDecision, FxInstrumentDecision, FxTsmomDecision, InstrumentDecision, Signal,
+};
+pub use donchian_breakout::{
+    decide_donchian_breakout, DonchianError, HlcSeries, DONCHIAN_DEFAULT_N,
+};
+pub use dual_ma_crossover::{
+    DualMaCrossover, DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2, DUAL_MA_UNIVERSE, DUAL_MA_VERSION,
 };
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;
+pub use five_day_reversal_zscore::{
+    FiveDayReversalZscore, FIVE_DAY_REVERSAL_LOOKBACK, FIVE_DAY_REVERSAL_MIN_HISTORY_BARS,
+    FIVE_DAY_REVERSAL_UNIVERSE, FIVE_DAY_REVERSAL_VERSION, FIVE_DAY_REVERSAL_ZSCORE_THRESHOLD,
+    FIVE_DAY_REVERSAL_ZSCORE_WINDOW,
+};
 pub use fx::{
     decide_fx_tsmom, fx_history_start, fx_joint_vol_scale, fx_periods_per_year, FX_JOINT_CALENDAR,
     FX_MIN_JOINT_BARS, FX_MOMENTUM_MONTH_ENDS, FX_REFERENCE_LOOKBACK_DAYS, FX_SLEEVE_VOL_TARGET,
     FX_SYMBOLS, FX_VOL_WINDOW, FX_WEIGHT_CAP,
 };
+pub use momentum_rank_weighted::{
+    MomentumRankWeighted, RankWeightedRanking, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+    MOMENTUM_RANK_WEIGHTED_VERSION,
+};
 pub use months::{
     completed_month_end_dates, is_calendar_month_end, latest_decision_date, month_end_dates,
 };
+pub use one_day_reversal::{
+    OneDayReversal, ONE_DAY_REVERSAL_MIN_HISTORY_BARS, ONE_DAY_REVERSAL_UNIVERSE,
+    ONE_DAY_REVERSAL_VERSION,
+};
 pub use options::{GapPolicy, MonthEndMode, Options};
 pub use series::{Panel, PriceSeries};
+pub use sma_crossover_trend::{
+    SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
+};
+pub use stop_loss_overlay::{stop_loss_overlay, STOP_LOSS_OVERLAY_DEFAULT_PCT};
+pub use top_n_winners::{
+    TopNRanking, TopNWinners, TOP_N_WINNERS_DEFAULT_LOOKBACK, TOP_N_WINNERS_VERSION,
+};
+pub use turn_of_month::{
+    decide_turn_of_month, decide_turn_of_month_on, TradingDays, TURN_OF_MONTH_FOLLOWING_DAYS,
+    TURN_OF_MONTH_WEIGHT,
+};
+pub use vol_target_overlay::{
+    vol_target_overlay, VOL_TARGET_DEFAULT_TARGET_VOL, VOL_TARGET_MAX_LEVERAGE,
+};
+pub use volume_confirmed_breakout::{
+    decide_volume_confirmed_breakout, OhlcvSeries, VolumeConfirmedBreakoutError,
+    VCB_DEFAULT_PRICE_N, VCB_DEFAULT_VOLUME_N, VCB_VOLUME_MULTIPLIER,
+};

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Hand-written mutation testing for `reference-rules` (BACKTESTER_TRUTH_DESIGN.md 6.1, stage T2).
 
 Each mutant is ONE exact source edit (the old text must occur exactly once). For every mutant the script applies the
@@ -83,6 +83,42 @@ MUTANTS = [
     ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
      "if pos + 1 < CRYPTO_SMA_DAYS {",
      "if pos + 1 <= CRYPTO_SMA_DAYS {"),
+    ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",
+     "let window = &closes[closes.len() - n..];",
+     "let window = &closes[closes.len() - n - 1..];"),
+    ("M22", "turn_of_month: window closes one day too early (2 following days instead of 3)", "src/turn_of_month.rs",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 3;",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 2;"),
+    ("M23", "dual_ma_crossover: fast-window off-by-one (N1+1 bars instead of N1)", "src/dual_ma_crossover.rs",
+     "let fast = &closes[closes.len() - n1..];",
+     "let fast = &closes[closes.len() - n1 - 1..];"),
+    ("M24", "day_of_week: wrong default target (Tuesday instead of Monday)", "src/day_of_week.rs",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Mon;",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Tue;"),
+    ("M25", "top_n_winners: ranking direction flipped (buys LOSERS instead of winners)", "src/top_n_winners.rs",
+     "        rb.partial_cmp(&ra)",
+     "        ra.partial_cmp(&rb)"),
+    ("M26", "donchian_breakout: wrong breakout direction (sign flip on the upper/lower comparison)", "src/donchian_breakout.rs",
+     "if close > upper {",
+     "if close < upper {"),
+    ("M27", "volume_confirmed_breakout: volume confirmation multiplier weakened (1.0x instead of 1.5x)", "src/volume_confirmed_breakout.rs",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.5;",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.0;"),
+    ("M28", "momentum_rank_weighted: rank-weight direction flipped (rank 1 gets the SMALLEST weight instead of the largest)", "src/momentum_rank_weighted.rs",
+     "weights[i] = (k + 1 - r) as f64 / denom;",
+     "weights[i] = r as f64 / denom;"),
+    ("M29", "vol_target_overlay: leverage cap removed (effectively unbounded scaling factor)", "src/vol_target_overlay.rs",
+     "let scale = (target_vol / trailing_realized_vol).min(VOL_TARGET_MAX_LEVERAGE);",
+     "let scale = target_vol / trailing_realized_vol;"),
+    ("M30", "stop_loss_overlay: long-stop boundary weakened from inclusive to strict (<= changed to <)", "src/stop_loss_overlay.rs",
+     "if current_price <= stop_level {",
+     "if current_price < stop_level {"),
+    ("M31", "one_day_reversal: zero-return boundary widened from strict to inclusive (< changed to <=)", "src/one_day_reversal.rs",
+     "if yesterday_return < 0.0 {",
+     "if yesterday_return <= 0.0 {"),
+    ("M32", "five_day_reversal_zscore: off-by-one on the 60-observation window (z-scores the SECOND-to-last 5-day return, not the current/last one)", "src/five_day_reversal_zscore.rs",
+     "let current_return = returns[window - 1];",
+     "let current_return = returns[window - 2];"),
 ]
 
 
