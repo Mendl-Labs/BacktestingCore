@@ -83,6 +83,8 @@ MUTANTS = [
     ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
      "if pos + 1 < CRYPTO_SMA_DAYS {",
      "if pos + 1 <= CRYPTO_SMA_DAYS {"),
+
+    # --- W3.6 new primitives (SENIOR_RESEARCHER_GAP_CLOSURE_PLAN.md, W3.6 / 9.9 point 2) ---
     ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",
      "let window = &closes[closes.len() - n..];",
      "let window = &closes[closes.len() - n - 1..];"),
@@ -119,6 +121,35 @@ MUTANTS = [
     ("M32", "five_day_reversal_zscore: off-by-one on the 60-observation window (z-scores the SECOND-to-last 5-day return, not the current/last one)", "src/five_day_reversal_zscore.rs",
      "let current_return = returns[window - 1];",
      "let current_return = returns[window - 2];"),
+
+    # --- W3.6 batch-2 primitives (volatility ranking, allocation, pairs/spread) --- renumbered M21-M26 -> M33-M38
+    # to resolve a real ID collision: both this batch and the batch above independently claimed M21-M26 while
+    # built in parallel, zero-shared-context, per 9.9's two-agent protocol. Content unchanged from either batch's
+    # own original definition, only the id string changed.
+    ("M33", "inverse_volatility_weight: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_volatility_weight.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
+    ("M34", "low_vol_quintile_tilt: alphabetical tie-break reversed (descending instead of ascending ticker order)",
+     "src/low_vol_quintile_tilt.rs",
+     "                .then(a.1.cmp(b.1))\n        });",
+     "                .then(b.1.cmp(a.1))\n        });"),
+    ("M35", "equal_weight_rebalance: every_bar instead of on_decision (drift never happens)",
+     "src/equal_weight_rebalance.rs",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::OnDecision\n    }",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::EveryBar\n    }"),
+    ("M36", "inverse_vol_risk_parity: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_vol_risk_parity.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
+    ("M37", "pairs_zscore_meanreversion: entry legs swapped (long-A/short-B and short-A/long-B reversed)",
+     "src/pairs_zscore_meanreversion.rs",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                }",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                }"),
+    ("M38", "cointegration_spread_threshold: hedge ratio refreshed every bar instead of every L bars (defeats the whole point of the primitive)",
+     "src/cointegration_spread_threshold.rs",
+     "fn refresh_point(s: usize) -> usize {\n        let l = COINT_LOOKBACK_DAYS;\n        l * (s / l)\n    }",
+     "fn refresh_point(s: usize) -> usize {\n        s\n    }"),
 ]
 
 

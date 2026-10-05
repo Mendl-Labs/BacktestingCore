@@ -93,6 +93,17 @@ mod turn_of_month;
 mod vol_target_overlay;
 mod volume_confirmed_breakout;
 
+pub mod cointegration_spread_threshold;
+pub mod equal_weight_rebalance;
+pub mod inverse_vol_risk_parity;
+pub mod inverse_volatility_weight;
+pub mod low_vol_quintile_tilt;
+pub mod pairs_zscore_meanreversion;
+
+pub use cointegration_spread_threshold::{
+    CointegrationSpreadThresholdRule, COINT_ENTRY_THRESHOLD, COINT_EXIT_THRESHOLD,
+    COINT_LOOKBACK_DAYS, COINT_SYMBOLS,
+};
 pub use crypto::{
     decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
 };
@@ -109,6 +120,7 @@ pub use donchian_breakout::{
 pub use dual_ma_crossover::{
     DualMaCrossover, DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2, DUAL_MA_UNIVERSE, DUAL_MA_VERSION,
 };
+pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANCE_SYMBOLS};
 pub use error::RuleError;
 pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
 pub use fingerprint::data_fingerprint;
@@ -122,6 +134,17 @@ pub use fx::{
     FX_MIN_JOINT_BARS, FX_MOMENTUM_MONTH_ENDS, FX_REFERENCE_LOOKBACK_DAYS, FX_SLEEVE_VOL_TARGET,
     FX_SYMBOLS, FX_VOL_WINDOW, FX_WEIGHT_CAP,
 };
+pub use inverse_vol_risk_parity::{
+    InverseVolRiskParityRule, INVERSE_VOL_RISK_PARITY_LOOKBACK_DAYS,
+    INVERSE_VOL_RISK_PARITY_SYMBOLS,
+};
+pub use inverse_volatility_weight::{
+    InverseVolatilityWeightRule, INVERSE_VOLATILITY_LOOKBACK_DAYS, INVERSE_VOLATILITY_SYMBOLS,
+};
+pub use low_vol_quintile_tilt::{
+    LowVolQuintileTiltRule, LOW_VOL_QUINTILE_FRACTION, LOW_VOL_QUINTILE_LOOKBACK_DAYS,
+    LOW_VOL_QUINTILE_SYMBOLS,
+};
 pub use momentum_rank_weighted::{
     MomentumRankWeighted, RankWeightedRanking, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
     MOMENTUM_RANK_WEIGHTED_VERSION,
@@ -134,6 +157,10 @@ pub use one_day_reversal::{
     ONE_DAY_REVERSAL_VERSION,
 };
 pub use options::{GapPolicy, MonthEndMode, Options};
+pub use pairs_zscore_meanreversion::{
+    PairsZscoreMeanReversionRule, PAIRS_ENTRY_THRESHOLD, PAIRS_EXIT_THRESHOLD, PAIRS_LOOKBACK_DAYS,
+    PAIRS_SYMBOLS,
+};
 pub use series::{Panel, PriceSeries};
 pub use sma_crossover_trend::{
     SmaCrossoverTrend, SMA_CROSSOVER_DEFAULT_N, SMA_CROSSOVER_UNIVERSE, SMA_CROSSOVER_VERSION,
