@@ -11,7 +11,7 @@ edit, runs the test command, records which tests FAILED (or that the build broke
 A mutant that no test kills is reported as SURVIVED and the script exits non-zero.
 
 Usage (from anywhere):
-    WEIGHTSIM_RULES_TEST_CMD="cargo test --locked --no-fail-fast" python3 mutants/run_mutants.py [--only M03,M07] [--check]
+    WEIGHTSIM_RULES_TEST_CMD="cargo test --locked --no-fail-fast" python3 mutants/run_mutants.py [--only M03,M07] [--shard 1/4] [--check]
 `WEIGHTSIM_RULES_TEST_CMD` defaults to the command above and is run with the crate directory as its working directory.
 `--check` only verifies that every mutant's old text occurs exactly once (no test run).
 The real-data tests are env-gated (WEIGHTSIM_RULES_LADDER_DIR) and skip themselves when it is unset, so a table
@@ -310,6 +310,11 @@ def main():
     only = None
     if "--only" in sys.argv:
         only = set(sys.argv[sys.argv.index("--only") + 1].split(","))
+    shard = None
+    if "--shard" in sys.argv:
+        # --shard I/N runs only the mutants at positions where index % N == I-1, so CI can split the list across jobs.
+        i, n = (int(x) for x in sys.argv[sys.argv.index("--shard") + 1].split("/"))
+        shard = (i - 1, n)
     if "--check" in sys.argv:
         bad = []
         for mid, desc, rel, old, new in MUTANTS:
@@ -328,8 +333,10 @@ def main():
     killed = 0
     print("| id | mutant | outcome | failing tests |")
     print("|---|---|---|---|")
-    for mid, desc, rel, old, new in MUTANTS:
+    for index, (mid, desc, rel, old, new) in enumerate(MUTANTS):
         if only and mid not in only:
+            continue
+        if shard and index % shard[1] != shard[0]:
             continue
         path = os.path.join(CRATE, rel)
         with open(path, "r", newline="") as f:
