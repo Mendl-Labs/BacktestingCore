@@ -8,16 +8,22 @@
 //! fixtures, always on) and `tests/ladder_real.rs` (real fixtures, env-gated), so a registry change that alters
 //! behaviour cannot pass unnoticed.
 //!
-//! The registry is keyed by the rule id string today. An entry carries the full structure a composed rule of the
-//! planned OHLCV grammar (plan 9.9 / W3.6: signal x universe x weighting x cadence x overlay) would need to register
-//! the same way: a factory for the compiled rule, the panel it runs on, a reference to its key files inside whichever
-//! fixture set is loaded, its own mutant list and its own canaries. The grammar itself is NOT built here.
+//! The registry is keyed by [`RuleSpec`] (signal x universe x weighting x cadence x overlay, the typed description of a
+//! rule, plan 9.9 / W3.6): [`Registry::get_spec`] is the primary lookup, and the library id string is carried on each
+//! entry as a view ([`Registry::get`], `verify::LIBRARY_RULE_IDS`). An entry also carries a factory for the compiled
+//! rule, the panel it runs on, a reference to its key files inside whichever fixture set is loaded, its own mutant list
+//! and its own canaries. Only the two certified rules are registered; the OHLCV grammar that would build more specs is
+//! NOT built here.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
-use weightsim::{Date, Panel, WeightRule};
+use reference_rules::{
+    CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
+    ETF_WEIGHT_PER_INSTRUMENT,
+};
+use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 
 use super::fixtures::{
     Fixtures, LadderError, RecordedMetrics, SleeveKey, F_S1_PERBAR, F_S3_PERBAR, F_SHADOW_S1, F_SHADOW_S3,
@@ -25,6 +31,52 @@ use super::fixtures::{
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
 use crate::adapters::{CryptoTrendRule, EtfTrendRule};
+
+/// What a rule's signal reads. The sampling of the signal is the rule's decision schedule ([`CadenceSpec::decision`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SignalSpec {
+    /// The close is strictly above the simple average of the last `window` closes sampled on the decision bars (the
+    /// current one included).
+    CloseAboveSma { window: usize },
+}
+
+/// Which instruments a rule trades.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UniverseSpec {
+    /// A fixed, ordered list of symbols.
+    Fixed(&'static [&'static str]),
+}
+
+/// How the sleeve is weighted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeightingSpec {
+    /// Every instrument whose signal is on gets `weight` of the sleeve; the rest is cash.
+    FixedPerInstrument { weight: f64 },
+}
+
+/// When the rule decides, and how the book is traded between decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CadenceSpec {
+    pub decision: DecisionSchedule,
+    pub rebalance: RebalancePolicy,
+}
+
+/// What is applied on top of the weighted book. None is registered yet. The ladder's flat-start entry gate
+/// (`adapters::FlatUntil`) is a run-time harness applied to every rule, not an overlay of the rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlaySpec {
+    None,
+}
+
+/// The typed description of a library rule: the key of the registry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuleSpec {
+    pub signal: SignalSpec,
+    pub universe: UniverseSpec,
+    pub weighting: WeightingSpec,
+    pub cadence: CadenceSpec,
+    pub overlay: OverlaySpec,
+}
 
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
 /// single candles file; a future universe adds a variant here and a panel in the loader.
@@ -61,6 +113,8 @@ pub struct Canary {
 pub struct RegisteredRule {
     /// The library id (`WeightRule::id` of the compiled rule).
     pub id: &'static str,
+    /// The typed description of the rule. The registry is keyed by it ([`Registry::get_spec`]).
+    pub spec: RuleSpec,
     /// Builds the compiled rule, bare. The ladder applies its own `FlatUntil` entry gate at run time.
     pub factory: fn() -> Box<dyn WeightRule>,
     pub panel: PanelSpec,
@@ -132,6 +186,13 @@ fn make_crypto() -> Box<dyn WeightRule> {
 pub const LIBRARY_RULES: [RegisteredRule; 2] = [
     RegisteredRule {
         id: "etf_trend_faber",
+        spec: RuleSpec {
+            signal: SignalSpec::CloseAboveSma { window: ETF_SMA_MONTH_ENDS },
+            universe: UniverseSpec::Fixed(&ETF_SYMBOLS),
+            weighting: WeightingSpec::FixedPerInstrument { weight: ETF_WEIGHT_PER_INSTRUMENT },
+            cadence: CadenceSpec { decision: DecisionSchedule::LastBarOfMonth, rebalance: RebalancePolicy::OnDecision },
+            overlay: OverlaySpec::None,
+        },
         factory: make_etf,
         panel: PanelSpec::Etf,
         key: KeyRef { sleeve_code: "S1", perbar_file: F_S1_PERBAR, shadow_file: F_SHADOW_S1 },
@@ -140,6 +201,13 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
     },
     RegisteredRule {
         id: "crypto_trend_100d",
+        spec: RuleSpec {
+            signal: SignalSpec::CloseAboveSma { window: CRYPTO_SMA_DAYS },
+            universe: UniverseSpec::Fixed(&CRYPTO_SYMBOLS),
+            weighting: WeightingSpec::FixedPerInstrument { weight: CRYPTO_WEIGHT_PER_INSTRUMENT },
+            cadence: CadenceSpec { decision: DecisionSchedule::Daily, rebalance: RebalancePolicy::EveryBar },
+            overlay: OverlaySpec::None,
+        },
         factory: make_crypto,
         panel: PanelSpec::Crypto,
         key: KeyRef { sleeve_code: "S3", perbar_file: F_S3_PERBAR, shadow_file: F_SHADOW_S3 },
@@ -161,8 +229,8 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
     },
 ];
 
-/// Why a registry lookup or construction failed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why a registry lookup or construction failed. (`PartialEq` only: a [`RuleSpec`] holds a weight, an `f64`.)
+#[derive(Clone, Debug, PartialEq)]
 pub enum RegistryError {
     UnknownRule {
         rule_id: String,
@@ -173,6 +241,14 @@ pub enum RegistryError {
     /// Two entries claim the same answer-key sleeve.
     DuplicateSleeve {
         sleeve_code: String,
+    },
+    /// Two entries carry the same [`RuleSpec`].
+    DuplicateSpec {
+        spec: RuleSpec,
+    },
+    /// No entry carries this [`RuleSpec`].
+    UnknownSpec {
+        spec: RuleSpec,
     },
     /// No entry is certified against this sleeve.
     UnknownSleeve {
@@ -186,6 +262,8 @@ impl fmt::Display for RegistryError {
             RegistryError::UnknownRule { rule_id } => write!(f, "`{rule_id}` is not a registered library rule"),
             RegistryError::DuplicateRule { rule_id } => write!(f, "`{rule_id}` is registered twice"),
             RegistryError::DuplicateSleeve { sleeve_code } => write!(f, "sleeve `{sleeve_code}` is claimed twice"),
+            RegistryError::DuplicateSpec { spec } => write!(f, "rule spec {spec:?} is registered twice"),
+            RegistryError::UnknownSpec { spec } => write!(f, "no registered rule has spec {spec:?}"),
             RegistryError::UnknownSleeve { sleeve_code } => {
                 write!(f, "no registered rule is certified on `{sleeve_code}`")
             }
@@ -195,17 +273,18 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-/// A validated set of registered rules (ids and sleeve codes unique), in table order.
+/// A validated set of registered rules (ids, sleeve codes and specs unique), in table order.
 #[derive(Clone, Debug)]
 pub struct Registry {
     rules: Vec<RegisteredRule>,
 }
 
 impl Registry {
-    /// Build from a table, refusing a duplicate id or a duplicate sleeve.
+    /// Build from a table, refusing a duplicate id, a duplicate sleeve or a duplicate spec.
     pub fn from_rules(rules: Vec<RegisteredRule>) -> Result<Registry, RegistryError> {
         let mut ids: BTreeMap<&str, ()> = BTreeMap::new();
         let mut sleeves: BTreeMap<&str, ()> = BTreeMap::new();
+        let mut specs: Vec<RuleSpec> = Vec::with_capacity(rules.len());
         for r in &rules {
             if ids.insert(r.id, ()).is_some() {
                 return Err(RegistryError::DuplicateRule { rule_id: r.id.to_string() });
@@ -213,6 +292,10 @@ impl Registry {
             if sleeves.insert(r.key.sleeve_code, ()).is_some() {
                 return Err(RegistryError::DuplicateSleeve { sleeve_code: r.key.sleeve_code.to_string() });
             }
+            if specs.contains(&r.spec) {
+                return Err(RegistryError::DuplicateSpec { spec: r.spec });
+            }
+            specs.push(r.spec);
         }
         Ok(Registry { rules })
     }
@@ -223,11 +306,17 @@ impl Registry {
         LIBRARY.get_or_init(|| Registry::from_rules(LIBRARY_RULES.to_vec()).expect("LIBRARY_RULES is a reviewed table"))
     }
 
+    /// The entry with this library id (the view of the registry by id string).
     pub fn get(&self, rule_id: &str) -> Result<&RegisteredRule, RegistryError> {
         self.rules
             .iter()
             .find(|r| r.id == rule_id)
             .ok_or_else(|| RegistryError::UnknownRule { rule_id: rule_id.to_string() })
+    }
+
+    /// The entry carrying this [`RuleSpec`] (the registry's own key).
+    pub fn get_spec(&self, spec: &RuleSpec) -> Result<&RegisteredRule, RegistryError> {
+        self.rules.iter().find(|r| r.spec == *spec).ok_or(RegistryError::UnknownSpec { spec: *spec })
     }
 
     /// The entry certified against a sleeve.

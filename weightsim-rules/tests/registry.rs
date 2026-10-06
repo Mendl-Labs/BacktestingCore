@@ -8,12 +8,12 @@
 
 mod common;
 
-use weightsim::WeightRule;
+use weightsim::{DecisionSchedule, RebalancePolicy, WeightRule};
 use weightsim_rules::ladder::mutants::{Mutant, MutantSleeve};
 use weightsim_rules::ladder::verify::LIBRARY_RULE_IDS;
 use weightsim_rules::ladder::{
-    replicate, rule_facts, run_ladder_with, LadderOptions, PanelSpec, RegisteredRule, Registry, RegistryError,
-    ReplicateError, LIBRARY_RULES,
+    replicate, rule_facts, run_ladder_with, CadenceSpec, LadderOptions, OverlaySpec, PanelSpec, RegisteredRule,
+    Registry, RegistryError, ReplicateError, RuleSpec, SignalSpec, UniverseSpec, WeightingSpec, LIBRARY_RULES,
 };
 
 const NO_CANARIES: LadderOptions = LadderOptions { check_canaries: false };
@@ -157,4 +157,44 @@ fn rule_facts_are_the_registry_entrys_facts() {
         assert_eq!(f.rebalance_policy, rule.rebalance_policy());
         assert_eq!(f.min_history_bars, rule.min_history_bars());
     }
+}
+
+#[test]
+fn the_registry_is_keyed_by_rule_spec_and_each_spec_describes_its_compiled_rule() {
+    let reg = Registry::library();
+    for e in reg.iter() {
+        // The spec is the registry's key: looking it up returns the entry that carries it.
+        assert_eq!(reg.get_spec(&e.spec).unwrap().id, e.id);
+        // The cadence and universe the spec declares are the compiled rule's own.
+        let rule = (e.factory)();
+        assert_eq!(e.spec.cadence.decision, rule.decision_schedule(), "{}", e.id);
+        assert_eq!(e.spec.cadence.rebalance, rule.rebalance_policy(), "{}", e.id);
+        let UniverseSpec::Fixed(symbols) = e.spec.universe;
+        assert_eq!(symbols.to_vec(), rule.universe().to_vec(), "{}", e.id);
+        assert_eq!(e.spec.overlay, OverlaySpec::None);
+    }
+    // The two certified specs, exactly as the rules are described in their adapter docs.
+    let s1 = reg.get("etf_trend_faber").unwrap().spec;
+    let s3 = reg.get("crypto_trend_100d").unwrap().spec;
+    assert_eq!(s1.signal, SignalSpec::CloseAboveSma { window: 10 });
+    assert_eq!(s3.signal, SignalSpec::CloseAboveSma { window: 100 });
+    assert_eq!(s1.weighting, WeightingSpec::FixedPerInstrument { weight: 0.20 });
+    assert_eq!(s3.weighting, WeightingSpec::FixedPerInstrument { weight: 0.50 });
+    assert_eq!(
+        s1.cadence,
+        CadenceSpec { decision: DecisionSchedule::LastBarOfMonth, rebalance: RebalancePolicy::OnDecision }
+    );
+    assert_eq!(s3.cadence, CadenceSpec { decision: DecisionSchedule::Daily, rebalance: RebalancePolicy::EveryBar });
+    // A spec that no entry carries is a typed error, and a second entry with the same spec is refused.
+    let unknown = RuleSpec { weighting: WeightingSpec::FixedPerInstrument { weight: 0.10 }, ..s1 };
+    assert_eq!(reg.get_spec(&unknown).err(), Some(RegistryError::UnknownSpec { spec: unknown }));
+    let twin = RegisteredRule {
+        id: "etf_trend_faber_twin",
+        key: weightsim_rules::ladder::KeyRef { sleeve_code: "S9", ..LIBRARY_RULES[0].key },
+        ..LIBRARY_RULES[0]
+    };
+    assert_eq!(
+        Registry::from_rules(vec![LIBRARY_RULES[0], twin]).err(),
+        Some(RegistryError::DuplicateSpec { spec: s1 })
+    );
 }
