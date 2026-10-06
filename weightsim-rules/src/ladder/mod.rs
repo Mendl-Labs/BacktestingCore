@@ -35,7 +35,10 @@ pub use live::{
     LiveRealisticError, LiveRealisticRun, CERTIFIED_LAYER, LIVE_REALISTIC_LAYER,
 };
 pub use mutants::Mutant;
-pub use registry::{Canary, KeyRef, PanelSpec, RegisteredRule, Registry, RegistryError, SleeveFixture, LIBRARY_RULES};
+pub use registry::{
+    CadenceSpec, Canary, KeyRef, OverlaySpec, PanelSpec, RegisteredRule, Registry, RegistryError, RuleSpec, SignalSpec,
+    SleeveFixture, UniverseSpec, WeightingSpec, LIBRARY_RULES,
+};
 pub use verify::{
     analyze_columns, replicate, replicate_with, rule_facts, verify, verify_with, Claims, ReplicateError,
     ReplicationConfig, ReplicationRun, RuleFacts, RunSummary, SeriesColumns, VerifiedRun, VerifyError, VerifyOptions,
