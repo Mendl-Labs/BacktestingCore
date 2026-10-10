@@ -9,6 +9,7 @@ pub mod provider;
 pub mod supplementary;
 pub mod orderbook_csv;
 pub mod massive_provider;
+pub mod fx_cross_source_check;
 pub mod sui_dex_provider;
 pub mod tick;
 
