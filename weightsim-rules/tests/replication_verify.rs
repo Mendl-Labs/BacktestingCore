@@ -179,7 +179,7 @@ fn round_trip_replicate_columns_verify_is_ok_with_identical_digests() {
 fn the_impl_version_string_carries_the_crate_version_and_is_a_digest_input() {
     let w = world();
     assert_eq!(ADAPTER_VERSION, "weightsim-rules 0.1.0 over reference-rules");
-    let entry = entry_date(&w.fx.etf_panel, &w.fx.s1).unwrap();
+    let entry = entry_date(&w.fx.etf_panel, &w.fx.sleeves["S1"].key).unwrap();
     assert_eq!(w.s1.rule_impl_version, format!("{ADAPTER_VERSION}, flat until {entry}"));
     assert_eq!(w.s1.gross.rule_impl_version, w.s1.rule_impl_version);
     // Changing only that string changes the digest.
@@ -319,8 +319,10 @@ fn oracle(dates: &[Date], r: &[f64]) -> Oracle {
 #[test]
 fn metrics_recomputed_from_the_columns_equal_the_runs_own_metrics_bit_for_bit() {
     let w = world();
-    let cases: [(&str, &ReplicationRun, &Panel, &weightsim_rules::ladder::fixtures::SleeveKey, bool); 2] =
-        [(S1, &w.s1, &w.fx.etf_panel, &w.fx.s1, true), (S3, &w.s3, &w.fx.crypto_panel, &w.fx.s3, false)];
+    let cases: [(&str, &ReplicationRun, &Panel, &weightsim_rules::ladder::fixtures::SleeveKey, bool); 2] = [
+        (S1, &w.s1, &w.fx.etf_panel, &w.fx.sleeves["S1"].key, true),
+        (S3, &w.s3, &w.fx.crypto_panel, &w.fx.sleeves["S3"].key, false),
+    ];
     for (rule, run, panel, key, is_etf) in cases {
         // The run's own SimResults, produced independently of `replicate`.
         let entry = entry_date(panel, key).unwrap();
@@ -901,7 +903,7 @@ fn a_genuine_run_that_does_not_reproduce_the_key_is_tier_failed_with_the_numbers
     let w = world();
     // Tier II: one key cell off by 1e-7.
     let mut fx = w.fx.clone();
-    fx.s1.bars[10].ret_net += 1e-7;
+    fx.sleeve_mut("S1").unwrap().key.bars[10].ret_net += 1e-7;
     match expect_err(verify_fast(&fx, S1, &w.s1.gross, &w.s1.net)) {
         VerifyError::TierFailed { failures, run } => {
             assert_eq!(failures, vec![TierFailure { scope: "net", tier: "tier2_identity" }]);
@@ -913,7 +915,7 @@ fn a_genuine_run_that_does_not_reproduce_the_key_is_tier_failed_with_the_numbers
     }
     // Tier I trades band.
     let mut fx = w.fx.clone();
-    fx.s1.flips += 40;
+    fx.sleeve_mut("S1").unwrap().key.flips += 40;
     match expect_err(verify_fast(&fx, S1, &w.s1.gross, &w.s1.net)) {
         VerifyError::TierFailed { failures, .. } => {
             assert!(failures.contains(&TierFailure { scope: "gross", tier: "tier1_trades" }), "{failures:?}");
@@ -923,7 +925,7 @@ fn a_genuine_run_that_does_not_reproduce_the_key_is_tier_failed_with_the_numbers
     }
     // Tier III weights: 20% of the key's target cells are wrong.
     let mut fx = w.fx.clone();
-    for b in &mut fx.s1.bars {
+    for b in &mut fx.sleeve_mut("S1").unwrap().key.bars {
         b.w_target[0] += 0.2;
     }
     match expect_err(verify_fast(&fx, S1, &w.s1.gross, &w.s1.net)) {
@@ -935,7 +937,7 @@ fn a_genuine_run_that_does_not_reproduce_the_key_is_tier_failed_with_the_numbers
     }
     // Tier I bands: the key's net returns shifted enough to move the Sharpe band, so the bands fail on net.
     let mut fx = w.fx.clone();
-    for b in &mut fx.s1.bars {
+    for b in &mut fx.sleeve_mut("S1").unwrap().key.bars {
         b.ret_net = b.ret_net * 0.5 + 0.0005;
     }
     match expect_err(verify_fast(&fx, S1, &w.s1.gross, &w.s1.net)) {

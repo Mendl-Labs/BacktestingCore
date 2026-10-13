@@ -18,7 +18,7 @@ fn failed(checks: &[Check]) -> Vec<String> {
 }
 
 fn entry(fx: &weightsim_rules::ladder::Fixtures) -> Date {
-    weightsim_rules::ladder::runner::entry_date(&fx.crypto_panel, &fx.s3).unwrap()
+    weightsim_rules::ladder::runner::entry_date(&fx.crypto_panel, &fx.sleeves["S3"].key).unwrap()
 }
 
 /// Weight 0.5 on a coin when the NEXT bar closes higher, read from its own copy of the panel. A blatant leak.

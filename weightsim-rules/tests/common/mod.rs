@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use weightsim::*;
 use weightsim_rules::ladder::checks::compare;
 use weightsim_rules::ladder::fixtures::{Fixtures, Pins, F_CANDLES, F_KEY_METRICS, F_MANIFEST, F_MUTANTS};
-use weightsim_rules::ladder::mutants::{run_mutant, Mutant, MutantSleeve};
+use weightsim_rules::ladder::mutants::{run_mutant, Mutant};
 use weightsim_rules::ladder::runner::key_rows_for_mutants;
 
 pub const ETF: [&str; 5] = ["SPY", "EFA", "IEF", "DBC", "VNQ"];
@@ -387,10 +387,7 @@ pub fn with_expected_mutants(base: SyntheticFiles) -> (SyntheticFiles, String, S
     let mut body = String::from("{\n \"mutants\": {\n");
     let mut first = true;
     for m in Mutant::ALL {
-        let key = match m.sleeve() {
-            MutantSleeve::S1 => &fx.s1,
-            MutantSleeve::S3 => &fx.s3,
-        };
+        let key = &fx.sleeves[m.sleeve().code()].key;
         let run = run_mutant(&fx, m).unwrap();
         let c = compare(&key_rows_for_mutants(key), &run.rows).unwrap();
         let caught: Vec<String> = c.failed_tiers().iter().map(|t| format!("\"{t}\"")).collect();

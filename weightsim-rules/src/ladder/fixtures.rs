@@ -18,7 +18,7 @@ use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS};
 use weightsim::{sha256_hex, Date, Panel, PriceSource};
 
 use super::json::{self, Json};
-use super::registry::{PanelSpec, SleeveFixture};
+use super::registry::{PanelSpec, SleeveFixture, LIBRARY_RULES};
 
 /// sha256 of `MANIFEST.json` as recorded in `ANCHOR.json` and Amendment 11.
 pub const REAL_MANIFEST_SHA256: &str = "d51444c33fc2630e12315e936f79580e13dca834ca0fdbc40a242ef496bd6d90";
@@ -27,16 +27,23 @@ pub const REAL_CANDLES_SHA256: &str = "d5cea5f25a4d0d4ecdf4f3c48ba0bd8d50f72fe20
 
 pub const F_MANIFEST: &str = "MANIFEST.json";
 pub const F_CANDLES: &str = "ladder_candles.csv";
-pub const F_S1_PERBAR: &str = "key/S1_etf_trend_faber_perbar.csv";
-pub const F_S3_PERBAR: &str = "key/S3_crypto_trend_100d_perbar.csv";
 pub const F_KEY_METRICS: &str = "key/key_metrics.json";
 pub const F_MUTANTS: &str = "key/mutants.json";
-pub const F_SHADOW_S1: &str = "shadow_saved/shadow_S1_daily_returns.csv";
-pub const F_SHADOW_S3: &str = "shadow_saved/shadow_S3_daily_returns.csv";
 
-/// Files the ladder cannot run without; each must be listed in the manifest.
-pub const REQUIRED_FILES: [&str; 7] =
-    [F_CANDLES, F_S1_PERBAR, F_S3_PERBAR, F_KEY_METRICS, F_MUTANTS, F_SHADOW_S1, F_SHADOW_S3];
+/// Files every fixture set needs regardless of which rules are registered.
+const REQUIRED_FILES_BASE: [&str; 3] = [F_CANDLES, F_KEY_METRICS, F_MUTANTS];
+
+/// Files the ladder cannot run without; each must be listed in the manifest: the base files above, plus, for every
+/// rule in [`LIBRARY_RULES`], its own per-bar key and shadow file (`RegisteredRule::key`). The registry entry is the
+/// single place a sleeve's fixture file names are written down; adding a rule there is enough to extend this list.
+pub fn required_files() -> Vec<&'static str> {
+    let mut files = REQUIRED_FILES_BASE.to_vec();
+    for rule in LIBRARY_RULES.iter() {
+        files.push(rule.key.perbar_file);
+        files.push(rule.key.shadow_file);
+    }
+    files
+}
 
 /// The two hashes a fixture set must match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +143,16 @@ pub struct ExpectedMutant {
     pub tier3: Option<(f64, usize, usize)>,
 }
 
+/// Everything a fixture set holds for one answer-key sleeve, owned. The panel is not here: it belongs to the
+/// universe (a property of [`PanelSpec`], shared by every sleeve that trades that universe), not to the sleeve.
+#[derive(Clone, Debug)]
+pub struct SleeveFixtureOwned {
+    pub key: SleeveKey,
+    pub recorded: [RecordedMetrics; 2],
+    /// The shadow's own saved daily returns (the original key), gross.
+    pub shadow: Vec<(Date, f64)>,
+}
+
 /// Everything the ladder needs, verified.
 #[derive(Clone, Debug)]
 pub struct Fixtures {
@@ -145,13 +162,10 @@ pub struct Fixtures {
     pub verified_files: Vec<(String, String)>,
     pub etf_panel: Panel,
     pub crypto_panel: Panel,
-    pub s1: SleeveKey,
-    pub s3: SleeveKey,
-    pub recorded_s1: [RecordedMetrics; 2],
-    pub recorded_s3: [RecordedMetrics; 2],
-    /// The shadow's own saved daily returns (the original key), gross.
-    pub shadow_s1: Vec<(Date, f64)>,
-    pub shadow_s3: Vec<(Date, f64)>,
+    /// Every answer-key sleeve this set carries, by sleeve code (`S1`, `S3`, ...). Which sleeves exist here is
+    /// driven entirely by [`LIBRARY_RULES`] (`load`): adding a registered rule with a new `KeyRef` is enough to add
+    /// a new entry, no further edit of this module needed.
+    pub sleeves: BTreeMap<String, SleeveFixtureOwned>,
     pub expected_mutants: Vec<ExpectedMutant>,
 }
 
@@ -165,24 +179,23 @@ impl Fixtures {
     }
 
     /// Everything this set holds for one answer-key sleeve, by its code (`S1`, `S3`), or `None` for a code the set
-    /// does not carry. This is the one place that knows which field is which sleeve; the registry
-    /// (`ladder::registry`) addresses sleeves by code only.
+    /// does not carry. The sleeve's panel is the one its registered rule runs on ([`LIBRARY_RULES`]), so a code no
+    /// registered rule claims is `None` here even if `sleeves` happens to carry it.
     pub fn sleeve(&self, code: &str) -> Option<SleeveFixture<'_>> {
-        match code {
-            "S1" => Some(SleeveFixture {
-                panel: &self.etf_panel,
-                key: &self.s1,
-                recorded: &self.recorded_s1,
-                shadow: &self.shadow_s1,
-            }),
-            "S3" => Some(SleeveFixture {
-                panel: &self.crypto_panel,
-                key: &self.s3,
-                recorded: &self.recorded_s3,
-                shadow: &self.shadow_s3,
-            }),
-            _ => None,
-        }
+        let owned = self.sleeves.get(code)?;
+        let spec = LIBRARY_RULES.iter().find(|r| r.key.sleeve_code == code)?.panel;
+        Some(SleeveFixture {
+            panel: self.panel(spec),
+            key: &owned.key,
+            recorded: &owned.recorded,
+            shadow: &owned.shadow,
+        })
+    }
+
+    /// The mutable counterpart of [`Fixtures::sleeve`]'s owned storage, for tests that poison one sleeve's key,
+    /// shadow or recorded metrics in place.
+    pub fn sleeve_mut(&mut self, code: &str) -> Option<&mut SleeveFixtureOwned> {
+        self.sleeves.get_mut(code)
     }
 }
 
@@ -278,7 +291,7 @@ impl Fixtures {
             verified.insert(name.clone(), got);
             contents.insert(name.clone(), bytes);
         }
-        for req in REQUIRED_FILES {
+        for req in required_files() {
             if !verified.contains_key(req) {
                 return Err(LadderError::Pin(format!("{req} is required but not listed in {F_MANIFEST}")));
             }
@@ -296,8 +309,6 @@ impl Fixtures {
 
         let metrics_json =
             json::parse(&text(&contents[F_KEY_METRICS], F_KEY_METRICS)?).map_err(|e| parse_err(F_KEY_METRICS, e))?;
-        let flips1 = num(&metrics_json, &["S1", "flips"], F_KEY_METRICS)? as u64;
-        let flips3 = num(&metrics_json, &["S3", "flips"], F_KEY_METRICS)? as u64;
         let recorded = |sleeve: &str, basis: &str| -> Result<RecordedMetrics, LadderError> {
             Ok(RecordedMetrics {
                 obs: num(&metrics_json, &[sleeve, basis, "obs"], F_KEY_METRICS)?,
@@ -308,15 +319,24 @@ impl Fixtures {
             })
         };
 
-        let s1 =
-            parse_sleeve("S1", "etf_trend_faber", &ETF_SYMBOLS, &text(&contents[F_S1_PERBAR], F_S1_PERBAR)?, flips1)?;
-        let s3 = parse_sleeve(
-            "S3",
-            "crypto_trend_100d",
-            &CRYPTO_SYMBOLS,
-            &text(&contents[F_S3_PERBAR], F_S3_PERBAR)?,
-            flips3,
-        )?;
+        // Every sleeve a registered library rule names, in `LIBRARY_RULES` order (S1 before S3 today): the rule id,
+        // universe (for the per-bar key's weight columns) and the two fixture file names all come from the registry
+        // entry, not from a literal here.
+        let mut sleeves: BTreeMap<String, SleeveFixtureOwned> = BTreeMap::new();
+        for rule in LIBRARY_RULES.iter() {
+            let code = rule.key.sleeve_code;
+            let universe = (rule.factory)().universe().to_vec();
+            let flips = num(&metrics_json, &[code, "flips"], F_KEY_METRICS)? as u64;
+            let perbar_text = text(&contents[rule.key.perbar_file], rule.key.perbar_file)?;
+            let key = parse_sleeve(code, rule.id, &universe, &perbar_text, flips)?;
+            let shadow_text = text(&contents[rule.key.shadow_file], rule.key.shadow_file)?;
+            let shadow = parse_shadow(&shadow_text, rule.key.shadow_file)?;
+            let owned =
+                SleeveFixtureOwned { key, recorded: [recorded(code, "gross")?, recorded(code, "net")?], shadow };
+            if sleeves.insert(code.to_string(), owned).is_some() {
+                return Err(LadderError::Inconsistent(format!("sleeve `{code}` is claimed by two registered rules")));
+            }
+        }
 
         let mutants_json = json::parse(&text(&contents[F_MUTANTS], F_MUTANTS)?).map_err(|e| parse_err(F_MUTANTS, e))?;
         let expected_mutants = parse_expected_mutants(&mutants_json)?;
@@ -327,12 +347,7 @@ impl Fixtures {
             verified_files: verified.into_iter().collect(),
             etf_panel,
             crypto_panel,
-            s1,
-            s3,
-            recorded_s1: [recorded("S1", "gross")?, recorded("S1", "net")?],
-            recorded_s3: [recorded("S3", "gross")?, recorded("S3", "net")?],
-            shadow_s1: parse_shadow(&text(&contents[F_SHADOW_S1], F_SHADOW_S1)?, F_SHADOW_S1)?,
-            shadow_s3: parse_shadow(&text(&contents[F_SHADOW_S3], F_SHADOW_S3)?, F_SHADOW_S3)?,
+            sleeves,
             expected_mutants,
         })
     }

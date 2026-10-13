@@ -25,9 +25,7 @@ use reference_rules::{
 };
 use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 
-use super::fixtures::{
-    Fixtures, LadderError, RecordedMetrics, SleeveKey, F_S1_PERBAR, F_S3_PERBAR, F_SHADOW_S1, F_SHADOW_S3,
-};
+use super::fixtures::{Fixtures, LadderError, RecordedMetrics, SleeveKey};
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
 use crate::adapters::{CryptoTrendRule, EtfTrendRule};
@@ -195,7 +193,11 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
         },
         factory: make_etf,
         panel: PanelSpec::Etf,
-        key: KeyRef { sleeve_code: "S1", perbar_file: F_S1_PERBAR, shadow_file: F_SHADOW_S1 },
+        key: KeyRef {
+            sleeve_code: "S1",
+            perbar_file: "key/S1_etf_trend_faber_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S1_daily_returns.csv",
+        },
         mutants: &[Mutant::S1SmaExcludesCurrent, Mutant::S1OneBarLate, Mutant::S1WrongRebalanceMode],
         canaries: &[],
     },
@@ -210,7 +212,11 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
         },
         factory: make_crypto,
         panel: PanelSpec::Crypto,
-        key: KeyRef { sleeve_code: "S3", perbar_file: F_S3_PERBAR, shadow_file: F_SHADOW_S3 },
+        key: KeyRef {
+            sleeve_code: "S3",
+            perbar_file: "key/S3_crypto_trend_100d_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S3_daily_returns.csv",
+        },
         mutants: &[
             Mutant::S3SameDayPeek,
             Mutant::S3ExtraDelay,
