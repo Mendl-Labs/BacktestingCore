@@ -138,7 +138,7 @@ MUTANTS = [
      "if !candles_sha.eq_ignore_ascii_case(pins.candles_sha256) {",
      "if false && !candles_sha.eq_ignore_ascii_case(pins.candles_sha256) {"),
     ("M45", "S1 key trade counter read from the S3 entry", F,
-     '&metrics_json, &["S1", "flips"]', '&metrics_json, &["S3", "flips"]'),
+     '&[code, "flips"]', '&[LIBRARY_RULES[1].key.sleeve_code, "flips"]'),
     ("M46", "excluded key bars silently accepted", F,
      'if f[c_excl] != "0" {', 'if false && f[c_excl] != "0" {'),
     # ------------------------------------------------------------------------------------------------ ladder

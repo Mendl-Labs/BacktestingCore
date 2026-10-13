@@ -114,16 +114,28 @@ fn canaries_are_real_numbers_of_the_real_data_and_fail_on_other_data() {
 fn tier2_tolerance_is_exactly_one_e_minus_nine_on_every_compared_column() {
     type Tamper = fn(&mut Fixtures, f64);
     let cases: Vec<(&str, Tamper, &str)> = vec![
-        ("S3 net return", |fx, e| fx.s3.bars[50].ret_net += e, "S3.net.tier2.identity"),
-        ("S3 gross return", |fx, e| fx.s3.bars[50].ret_gross += e, "S3.gross.tier2.identity"),
-        ("S1 net return", |fx, e| fx.s1.bars[50].ret_net += e, "S1.net.tier2.identity"),
-        ("S1 gross return", |fx, e| fx.s1.bars[50].ret_gross += e, "S1.gross.tier2.identity"),
-        ("S3 net equity", |fx, e| fx.s3.bars[10].equity_net += e, "S3.net.tier2.identity"),
-        ("S3 gross equity", |fx, e| fx.s3.bars[10].equity_gross += e, "S3.gross.tier2.identity"),
-        ("S3 net cost", |fx, e| fx.s3.bars[10].cost += e, "S3.net.tier2.identity"),
-        ("S3 net turnover", |fx, e| fx.s3.bars[10].turnover += e, "S3.net.tier2.identity"),
-        ("S3 held weight", |fx, e| fx.s3.bars[30].w_held[0] += e, "S3.gross.tier2.identity"),
-        ("S1 held weight", |fx, e| fx.s1.bars[30].w_held[1] += e, "S1.gross.tier2.identity"),
+        ("S3 net return", |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[50].ret_net += e, "S3.net.tier2.identity"),
+        (
+            "S3 gross return",
+            |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[50].ret_gross += e,
+            "S3.gross.tier2.identity",
+        ),
+        ("S1 net return", |fx, e| fx.sleeve_mut("S1").unwrap().key.bars[50].ret_net += e, "S1.net.tier2.identity"),
+        (
+            "S1 gross return",
+            |fx, e| fx.sleeve_mut("S1").unwrap().key.bars[50].ret_gross += e,
+            "S1.gross.tier2.identity",
+        ),
+        ("S3 net equity", |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[10].equity_net += e, "S3.net.tier2.identity"),
+        (
+            "S3 gross equity",
+            |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[10].equity_gross += e,
+            "S3.gross.tier2.identity",
+        ),
+        ("S3 net cost", |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[10].cost += e, "S3.net.tier2.identity"),
+        ("S3 net turnover", |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[10].turnover += e, "S3.net.tier2.identity"),
+        ("S3 held weight", |fx, e| fx.sleeve_mut("S3").unwrap().key.bars[30].w_held[0] += e, "S3.gross.tier2.identity"),
+        ("S1 held weight", |fx, e| fx.sleeve_mut("S1").unwrap().key.bars[30].w_held[1] += e, "S1.gross.tier2.identity"),
     ];
     // A changed return also moves the metrics recomputed from the key, which the (separate, looser) key
     // self-consistency check may notice; it is not a tier, so it is filtered out here.
@@ -148,18 +160,18 @@ fn tier2_tolerance_is_exactly_one_e_minus_nine_on_every_compared_column() {
 fn target_weights_are_tier2_and_tier3_and_tier3_tolerates_small_disagreement() {
     // Both bases share the same standing target, so both fail; the net key has no held weights.
     let mut fx = fixtures();
-    fx.s3.bars[40].w_target[0] += 2e-9;
+    fx.sleeve_mut("S3").unwrap().key.bars[40].w_target[0] += 2e-9;
     let f = failed(&run(&fx));
     assert_eq!(f, vec!["S3.gross.tier2.identity".to_string(), "S3.net.tier2.identity".to_string()]);
     // 1e-7 is still inside Tier III's 1e-6 cell tolerance.
     let mut fx = fixtures();
-    fx.s3.bars[40].w_target[0] += 1e-7;
+    fx.sleeve_mut("S3").unwrap().key.bars[40].w_target[0] += 1e-7;
     let r = run(&fx);
     assert_eq!(failed(&r), vec!["S3.gross.tier2.identity".to_string(), "S3.net.tier2.identity".to_string()]);
     assert_eq!(r.sleeves[1].gross.cmp.tier3.unwrap().disagreeing, 0);
     // A block of grossly wrong targets breaks Tier III as well.
     let mut fx = fixtures();
-    for b in fx.s3.bars.iter_mut().take(40) {
+    for b in fx.sleeve_mut("S3").unwrap().key.bars.iter_mut().take(40) {
         b.w_target[0] += 0.5;
         b.w_target[1] += 0.5;
     }
@@ -176,7 +188,7 @@ fn target_weights_are_tier2_and_tier3_and_tier3_tolerates_small_disagreement() {
 fn tier1_bands_fail_on_a_wrong_key_and_the_verdict_names_them() {
     // Scale the whole S3 gross key by 1.3: correlation stays 1, Sharpe and CAGR move far outside the bands.
     let mut fx = fixtures();
-    for b in fx.s3.bars.iter_mut() {
+    for b in fx.sleeve_mut("S3").unwrap().key.bars.iter_mut() {
         b.ret_gross *= 1.3;
     }
     let r = run(&fx);
@@ -186,10 +198,10 @@ fn tier1_bands_fail_on_a_wrong_key_and_the_verdict_names_them() {
     assert!(!f.contains(&"S3.net.tier1.bands".to_string()), "the net key was not touched");
     // Decorrelate S1 net: the correlation band fails.
     let mut fx = fixtures();
-    let n = fx.s1.bars.len();
-    let rev: Vec<f64> = fx.s1.bars.iter().rev().map(|b| b.ret_net).collect();
+    let n = fx.sleeves["S1"].key.bars.len();
+    let rev: Vec<f64> = fx.sleeves["S1"].key.bars.iter().rev().map(|b| b.ret_net).collect();
     for (i, r) in rev.into_iter().enumerate().take(n) {
-        fx.s1.bars[i].ret_net = r;
+        fx.sleeve_mut("S1").unwrap().key.bars[i].ret_net = r;
     }
     let f = failed(&run(&fx));
     assert!(f.contains(&"S1.net.tier1.bands".to_string()) && !f.contains(&"S1.gross.tier1.bands".to_string()), "{f:?}");
@@ -199,14 +211,14 @@ fn tier1_bands_fail_on_a_wrong_key_and_the_verdict_names_them() {
 fn trades_band_is_five_percent_and_the_exact_counter_is_reported_separately() {
     // key 21 vs run 22: 4.76% is inside the band, but the exact counter differs.
     let mut fx = fixtures();
-    let real = fx.s3.flips;
-    fx.s3.flips = real - 1;
+    let real = fx.sleeves["S3"].key.flips;
+    fx.sleeve_mut("S3").unwrap().key.flips = real - 1;
     let r = run(&fx);
     assert_eq!(failed(&r), vec!["S3.trades.exact".to_string()], "flips {real} -> {}", real - 1);
     assert!(r.sleeves[1].gross.tier1_pass && r.sleeves[1].net.tier1_pass, "4.76% is inside the Tier I trades band");
     // A 20% gap breaks the band on both bases.
     let mut fx = fixtures();
-    fx.s3.flips = real * 12 / 10 + 2;
+    fx.sleeve_mut("S3").unwrap().key.flips = real * 12 / 10 + 2;
     let r = run(&fx);
     let f = failed(&r);
     for name in ["S3.gross.tier1.trades", "S3.net.tier1.trades", "S3.trades.exact"] {
@@ -221,39 +233,39 @@ fn trades_band_is_five_percent_and_the_exact_counter_is_reported_separately() {
 fn the_original_shadow_key_and_the_key_metrics_are_checked() {
     // Shadow saved returns (the ORIGINAL key): 2e-9 fails, 5e-10 is tolerated.
     let mut fx = fixtures();
-    fx.shadow_s3[20].1 += 5e-10;
+    fx.sleeve_mut("S3").unwrap().shadow[20].1 += 5e-10;
     assert!(run(&fx).passed());
     let mut fx = fixtures();
-    fx.shadow_s3[20].1 += 2e-9;
+    fx.sleeve_mut("S3").unwrap().shadow[20].1 += 2e-9;
     assert_eq!(failed(&run(&fx)), vec!["S3.gross.vs_shadow_saved".to_string()]);
     let mut fx = fixtures();
-    fx.shadow_s1[20].1 += 2e-9;
+    fx.sleeve_mut("S1").unwrap().shadow[20].1 += 2e-9;
     assert_eq!(failed(&run(&fx)), vec!["S1.gross.vs_shadow_saved".to_string()]);
     // A shadow file that covers other bars than the key is useless and must fail.
     let mut fx = fixtures();
-    fx.shadow_s3.pop();
+    fx.sleeve_mut("S3").unwrap().shadow.pop();
     assert_eq!(failed(&run(&fx)), vec!["S3.gross.vs_shadow_saved".to_string()]);
     let mut fx = fixtures();
-    fx.shadow_s1.remove(0);
+    fx.sleeve_mut("S1").unwrap().shadow.remove(0);
     assert_eq!(failed(&run(&fx)), vec!["S1.gross.vs_shadow_saved".to_string()]);
     // The key must equal its own recorded metrics.
     let mut fx = fixtures();
-    fx.recorded_s3[1].sharpe += 1e-6;
+    fx.sleeve_mut("S3").unwrap().recorded[1].sharpe += 1e-6;
     assert_eq!(failed(&run(&fx)), vec!["S3.key_self_consistency".to_string()]);
     let mut fx = fixtures();
-    fx.recorded_s1[0].max_drawdown += 1e-6;
+    fx.sleeve_mut("S1").unwrap().recorded[0].max_drawdown += 1e-6;
     assert_eq!(failed(&run(&fx)), vec!["S1.key_self_consistency".to_string()]);
     let mut fx = fixtures();
-    fx.recorded_s1[0].obs += 1.0;
+    fx.sleeve_mut("S1").unwrap().recorded[0].obs += 1.0;
     assert_eq!(failed(&run(&fx)), vec!["S1.key_self_consistency".to_string()]);
 }
 
 #[test]
 fn a_key_longer_than_the_simulated_window_fails_the_window_check() {
     let mut fx = fixtures();
-    let mut extra = fx.s3.bars.last().unwrap().clone();
+    let mut extra = fx.sleeves["S3"].key.bars.last().unwrap().clone();
     extra.date = extra.date.add_days(30);
-    fx.s3.bars.push(extra);
+    fx.sleeve_mut("S3").unwrap().key.bars.push(extra);
     let f = failed(&run(&fx));
     assert!(f.contains(&"S3.gross.window".to_string()) && f.contains(&"S3.net.window".to_string()), "{f:?}");
 }
@@ -319,9 +331,9 @@ fn an_uncaught_mutant_fails_certification() {
     // exactly the situation Tier IV exists to flag (a certification that cannot tell the mutant from the truth).
     let fx0 = fixtures();
     let mrun = weightsim_rules::ladder::mutants::run_mutant(&fx0, Mutant::S1WrongRebalanceMode).unwrap();
-    assert_eq!(mrun.rows.dates.len(), fx0.s1.bars.len());
+    assert_eq!(mrun.rows.dates.len(), fx0.sleeves["S1"].key.bars.len());
     let mut fx = fx0.clone();
-    for (i, b) in fx.s1.bars.iter_mut().enumerate() {
+    for (i, b) in fx.sleeve_mut("S1").unwrap().key.bars.iter_mut().enumerate() {
         assert_eq!(b.date, mrun.rows.dates[i]);
         b.ret_gross = mrun.rows.ret[i];
         b.w_target = mrun.rows.w_target.as_ref().unwrap()[i].clone();
