@@ -284,8 +284,8 @@ mod tests {
         let mut efa = vec![57.5; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED];
         efa[0] = 50.0;
         *efa.last_mut().unwrap() = 65.0;
-        let spy_ret = spy.last().unwrap() / spy[0] - 1.0;
-        let efa_ret = efa.last().unwrap() / efa[0] - 1.0;
+        let spy_ret: f64 = spy.last().unwrap() / spy[0] - 1.0;
+        let efa_ret: f64 = efa.last().unwrap() / efa[0] - 1.0;
         assert_eq!(
             spy_ret.to_bits(),
             efa_ret.to_bits(),
