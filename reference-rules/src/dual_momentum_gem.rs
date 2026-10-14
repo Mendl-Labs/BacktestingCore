@@ -151,7 +151,10 @@ impl WeightRule for DualMomentumGemRule {
     }
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
         BTreeMap::from([
-            ("trailing_months", DUAL_MOMENTUM_GEM_TRAILING_MONTHS.to_string()),
+            (
+                "trailing_months",
+                DUAL_MOMENTUM_GEM_TRAILING_MONTHS.to_string(),
+            ),
             (
                 "month_ends_needed",
                 DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED.to_string(),
