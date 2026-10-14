@@ -65,7 +65,11 @@ pub const DUAL_MOMENTUM_GEM_TRAILING_MONTHS: usize = 12;
 pub const DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED: usize = DUAL_MOMENTUM_GEM_TRAILING_MONTHS + 1;
 
 /// Version string recorded in every run (it is part of the series digest).
-pub const DUAL_MOMENTUM_GEM_VERSION: &str = concat!("reference-rules ", env!("CARGO_PKG_VERSION"), " dual_momentum_gem");
+pub const DUAL_MOMENTUM_GEM_VERSION: &str = concat!(
+    "reference-rules ",
+    env!("CARGO_PKG_VERSION"),
+    " dual_momentum_gem"
+);
 
 /// Indices of month-end bars within `dates` (interpretation choice 2): `t` is a month-end if it is the last index,
 /// or the next bar falls in a different calendar month. Ascending order, same length convention as
@@ -88,7 +92,11 @@ fn month_end_indices(dates: &[Date]) -> Vec<usize> {
 /// order -- exactly one entry `1.0`, the rest `0.0` -- or a typed refusal.
 ///
 /// AGG's own closes are never read (interpretation choice 4): the caller does not even need to pass them.
-pub(crate) fn decide_gem(spy_closes: &[f64], efa_closes: &[f64], dates: &[Date]) -> Result<[f64; 3], RuleRefusal> {
+pub(crate) fn decide_gem(
+    spy_closes: &[f64],
+    efa_closes: &[f64],
+    dates: &[Date],
+) -> Result<[f64; 3], RuleRefusal> {
     let month_ends = month_end_indices(dates);
     if month_ends.len() < DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED {
         return Err(RuleRefusal::warmup(format!(
@@ -144,7 +152,10 @@ impl WeightRule for DualMomentumGemRule {
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
         BTreeMap::from([
             ("trailing_months", DUAL_MOMENTUM_GEM_TRAILING_MONTHS.to_string()),
-            ("month_ends_needed", DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED.to_string()),
+            (
+                "month_ends_needed",
+                DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED.to_string(),
+            ),
             ("schedule", "\"last_bar_of_month\"".to_string()),
             ("rebalance_policy", "\"on_decision\"".to_string()),
         ])
@@ -202,7 +213,11 @@ mod tests {
         *spy.last_mut().unwrap() = 90.0;
         let efa = vec![50.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED];
         let w = decide_gem(&spy, &efa, &dates).expect("enough history");
-        assert_eq!(w, [0.0, 0.0, 1.0], "negative SPY trailing momentum must hold AGG: {w:?}");
+        assert_eq!(
+            w,
+            [0.0, 0.0, 1.0],
+            "negative SPY trailing momentum must hold AGG: {w:?}"
+        );
     }
 
     #[test]
@@ -212,7 +227,11 @@ mod tests {
         let spy = vec![100.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED];
         let efa = vec![50.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED];
         let w = decide_gem(&spy, &efa, &dates).expect("enough history");
-        assert_eq!(w, [0.0, 0.0, 1.0], "exactly zero SPY trailing momentum must hold AGG (non-positive): {w:?}");
+        assert_eq!(
+            w,
+            [0.0, 0.0, 1.0],
+            "exactly zero SPY trailing momentum must hold AGG (non-positive): {w:?}"
+        );
     }
 
     #[test]
@@ -226,7 +245,11 @@ mod tests {
         efa[0] = 50.0;
         *efa.last_mut().unwrap() = 55.0;
         let w = decide_gem(&spy, &efa, &dates).expect("enough history");
-        assert_eq!(w, [1.0, 0.0, 0.0], "SPY (+30%) must beat EFA (+10%) and be held: {w:?}");
+        assert_eq!(
+            w,
+            [1.0, 0.0, 0.0],
+            "SPY (+30%) must beat EFA (+10%) and be held: {w:?}"
+        );
     }
 
     #[test]
@@ -240,7 +263,11 @@ mod tests {
         efa[0] = 50.0;
         *efa.last_mut().unwrap() = 65.0;
         let w = decide_gem(&spy, &efa, &dates).expect("enough history");
-        assert_eq!(w, [0.0, 1.0, 0.0], "EFA (+30%) must beat SPY (+10%) and be held: {w:?}");
+        assert_eq!(
+            w,
+            [0.0, 1.0, 0.0],
+            "EFA (+30%) must beat SPY (+10%) and be held: {w:?}"
+        );
     }
 
     #[test]
@@ -256,9 +283,17 @@ mod tests {
         *efa.last_mut().unwrap() = 65.0;
         let spy_ret = spy.last().unwrap() / spy[0] - 1.0;
         let efa_ret = efa.last().unwrap() / efa[0] - 1.0;
-        assert_eq!(spy_ret.to_bits(), efa_ret.to_bits(), "fixture must be an EXACT tie by construction");
+        assert_eq!(
+            spy_ret.to_bits(),
+            efa_ret.to_bits(),
+            "fixture must be an EXACT tie by construction"
+        );
         let w = decide_gem(&spy, &efa, &dates).expect("enough history");
-        assert_eq!(w, [0.0, 1.0, 0.0], "an exact tie must break to EFA (alphabetically earlier), not SPY: {w:?}");
+        assert_eq!(
+            w,
+            [0.0, 1.0, 0.0],
+            "an exact tie must break to EFA (alphabetically earlier), not SPY: {w:?}"
+        );
     }
 
     #[test]
@@ -267,7 +302,8 @@ mod tests {
         let dates = monthly_dates(DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED - 1, 2020);
         let spy = vec![100.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED - 1];
         let efa = vec![50.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED - 1];
-        let err = decide_gem(&spy, &efa, &dates).expect_err("one short of 13 month-ends must refuse");
+        let err =
+            decide_gem(&spy, &efa, &dates).expect_err("one short of 13 month-ends must refuse");
         assert_eq!(err.kind, weightsim::RefusalKind::Warmup);
         assert_eq!(err.code, "insufficient_history");
     }
@@ -315,11 +351,18 @@ mod tests {
         *efa.last_mut().unwrap() = 55.0;
         let agg = vec![20.0; DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED];
 
-        let symbols: Vec<String> = DUAL_MOMENTUM_GEM_SYMBOLS.iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = DUAL_MOMENTUM_GEM_SYMBOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let panel = Panel::new(symbols, dates, vec![spy, efa, agg]).unwrap();
         let r = simulate(&panel, &DualMomentumGemRule, &SimConfig::default()).unwrap();
         let w = r.row(&r.target_weights, panel.n_bars() - 1).to_vec();
-        assert_eq!(w, vec![1.0, 0.0, 0.0], "SPY must be held on the final decision bar: {w:?}");
+        assert_eq!(
+            w,
+            vec![1.0, 0.0, 0.0],
+            "SPY must be held on the final decision bar: {w:?}"
+        );
     }
 
     #[test]
@@ -332,10 +375,19 @@ mod tests {
         let spy = vec![100.0; n];
         let efa = vec![50.0; n];
         let agg = vec![20.0; n];
-        let symbols: Vec<String> = DUAL_MOMENTUM_GEM_SYMBOLS.iter().map(|s| s.to_string()).collect();
+        let symbols: Vec<String> = DUAL_MOMENTUM_GEM_SYMBOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let panel = Panel::new(symbols, dates, vec![spy, efa, agg]).unwrap();
         let r = simulate(&panel, &DualMomentumGemRule, &SimConfig::default()).unwrap();
-        assert!(r.decision.iter().all(|&dec| !dec), "no bar ever has the required 13 month-ends");
-        assert!(r.refused.iter().any(|&ref_| ref_), "each monthly bar must be attempted and tolerated as Warmup");
+        assert!(
+            r.decision.iter().all(|&dec| !dec),
+            "no bar ever has the required 13 month-ends"
+        );
+        assert!(
+            r.refused.iter().any(|&ref_| ref_),
+            "each monthly bar must be attempted and tolerated as Warmup"
+        );
     }
 }
