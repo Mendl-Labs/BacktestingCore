@@ -150,6 +150,10 @@ MUTANTS = [
      "src/cointegration_spread_threshold.rs",
      "fn refresh_point(s: usize) -> usize {\n        let l = COINT_LOOKBACK_DAYS;\n        l * (s / l)\n    }",
      "fn refresh_point(s: usize) -> usize {\n        s\n    }"),
+    ("M39", "dual_momentum_gem: absolute momentum gate boundary weakened from non-positive to strictly negative (a flat/zero trailing SPY return wrongly clears the gate instead of holding AGG)",
+     "src/dual_momentum_gem.rs",
+     "    if spy_return <= 0.0 {",
+     "    if spy_return < 0.0 {"),
 ]
 
 

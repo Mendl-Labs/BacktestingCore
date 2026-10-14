@@ -80,6 +80,7 @@ mod crypto;
 mod day_of_week;
 mod donchian_breakout;
 mod dual_ma_crossover;
+mod dual_momentum_gem;
 mod etf;
 mod exact;
 mod five_day_reversal_zscore;
@@ -119,6 +120,10 @@ pub use donchian_breakout::{
 };
 pub use dual_ma_crossover::{
     DualMaCrossover, DUAL_MA_DEFAULT_N1, DUAL_MA_DEFAULT_N2, DUAL_MA_UNIVERSE, DUAL_MA_VERSION,
+};
+pub use dual_momentum_gem::{
+    DualMomentumGemRule, DUAL_MOMENTUM_GEM_MONTH_ENDS_NEEDED, DUAL_MOMENTUM_GEM_SYMBOLS,
+    DUAL_MOMENTUM_GEM_TRAILING_MONTHS, DUAL_MOMENTUM_GEM_VERSION,
 };
 pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANCE_SYMBOLS};
 pub use error::RuleError;
