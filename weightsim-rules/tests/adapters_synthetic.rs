@@ -287,7 +287,7 @@ fn non_default_points_run_over_their_own_instruments_and_lookback() {
     assert_eq!(published.decision.iter().filter(|d| **d).count(), 21, "the key's 21 month-ends");
     assert_eq!(decisions, 23, "an 8-month-end lookback decides at two more month-ends than a 10-month-end one");
     assert!(sim.target_weights.iter().all(|w| *w == 0.0 || *w == 0.2));
-    assert!(sim.target_weights.iter().any(|w| *w == 0.2));
+    assert!(sim.target_weights.contains(&0.2));
     // The lag is the configured delay, here too.
     let cfg = SimConfig { execution_delay_bars: 2, ..SimConfig::default() };
     let via_cfg = simulate(&panel, &EtfTrendRule::new(three.to_vec(), 8, 0), &cfg).unwrap();
@@ -304,5 +304,5 @@ fn non_default_points_run_over_their_own_instruments_and_lookback() {
     assert!(!sim.decision[48], "49 bars are not enough for a 50-day average");
     assert!(sim.decision[49], "the first decision comes with the 50th bar");
     assert!(sim.target_weights.iter().all(|w| *w == 0.0 || *w == 0.5));
-    assert!(sim.target_weights.iter().any(|w| *w == 0.5));
+    assert!(sim.target_weights.contains(&0.5));
 }
