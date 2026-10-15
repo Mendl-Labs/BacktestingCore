@@ -273,6 +273,11 @@ pub(crate) fn exposure_stats(x: &[f64]) -> ExposureStats {
 }
 
 /// Run `rule` over `panel` under `cfg`.
+///
+/// Effective bar of a decision: a decision taken at the close of bar `t` enters the pending queue for bar
+/// `t + cfg.execution_delay_bars + rule.execution_lag_bars()` and becomes the standing target (`newly_effective`) when
+/// that bar is reached. With the default rule lag of 0 this is exactly `t + cfg.execution_delay_bars`, the certified
+/// path (design S-6, C11); a decision whose effective bar is past the end of the panel is never effective.
 pub fn simulate<R: WeightRule + ?Sized>(panel: &Panel, rule: &R, cfg: &SimConfig) -> Result<SimResult, SimError> {
     cfg.validate()?;
     let k = panel.n_assets();
@@ -287,6 +292,8 @@ pub fn simulate<R: WeightRule + ?Sized>(panel: &Panel, rule: &R, cfg: &SimConfig
     let schedule = rule.decision_schedule();
     let policy = rule.rebalance_policy();
     let min_hist = rule.min_history_bars();
+    // The rule's own execution lag (0 for every certified rule) adds to the configured delay: `t + d + 0` is `t + d`.
+    let lag = rule.execution_lag_bars();
     let dates = panel.dates();
     let rate = cfg.cost.rate();
 
@@ -392,7 +399,7 @@ pub fn simulate<R: WeightRule + ?Sized>(panel: &Panel, rule: &R, cfg: &SimConfig
                     decision_ok = true;
                     decision_bars.push(t);
                     decision_signs.push(scaled.iter().map(|v| sign(*v)).collect());
-                    pending.push_back((t + cfg.execution_delay_bars, scaled));
+                    pending.push_back((t + cfg.execution_delay_bars + lag, scaled));
                 }
                 Err(refusal) => {
                     let tolerated_warmup = refusal.kind == RefusalKind::Warmup && !decided_any;

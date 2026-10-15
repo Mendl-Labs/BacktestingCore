@@ -172,12 +172,13 @@ pub struct SleeveFixture<'a> {
     pub shadow: &'a [(Date, f64)],
 }
 
+/// The certified instance is the PUBLISHED point (`Default`); a non-default point is never registered here.
 fn make_etf() -> Box<dyn WeightRule> {
-    Box::new(EtfTrendRule)
+    Box::new(EtfTrendRule::default())
 }
 
 fn make_crypto() -> Box<dyn WeightRule> {
-    Box::new(CryptoTrendRule)
+    Box::new(CryptoTrendRule::default())
 }
 
 /// The reviewed table. Order matters: it is the order sleeves are run and reported in, which the ladder digest covers.

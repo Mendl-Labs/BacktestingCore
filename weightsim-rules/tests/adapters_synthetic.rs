@@ -16,7 +16,7 @@ fn s3_config() -> SimConfig {
 #[test]
 fn etf_adapter_reproduces_the_python_key_per_bar() {
     let panel = s1_panel();
-    let sim = simulate(&panel, &EtfTrendRule, &SimConfig::default()).unwrap();
+    let sim = simulate(&panel, &EtfTrendRule::default(), &SimConfig::default()).unwrap();
     let (kd, kr) = parse_returns(PY_KEY_S1_RETURNS);
     assert_eq!(sim.window_dates(), kd.as_slice(), "counted bars must be exactly the key's bars");
     let diff = max_abs_diff(sim.window_returns(), &kr);
@@ -34,7 +34,7 @@ fn etf_adapter_reproduces_the_python_key_per_bar() {
 #[test]
 fn crypto_adapter_reproduces_the_python_key_per_bar() {
     let panel = s3_panel();
-    let sim = simulate(&panel, &CryptoTrendRule, &s3_config()).unwrap();
+    let sim = simulate(&panel, &CryptoTrendRule::default(), &s3_config()).unwrap();
     let (kd, kr) = parse_returns(PY_KEY_S3_RETURNS);
     assert_eq!(sim.window_dates(), kd.as_slice(), "counted bars must be exactly the key's bars");
     let diff = max_abs_diff(sim.window_returns(), &kr);
@@ -54,7 +54,7 @@ fn crypto_adapter_reproduces_the_python_key_per_bar() {
 fn adapters_match_the_python_key_signals_on_every_decision_date() {
     // ETF: month-end decision dates and weights (0.2 x signal).
     let panel = s1_panel();
-    let sim = simulate(&panel, &EtfTrendRule, &SimConfig::default()).unwrap();
+    let sim = simulate(&panel, &EtfTrendRule::default(), &SimConfig::default()).unwrap();
     let (sd, rows) = parse_signals(PY_KEY_S1_SIGNALS);
     let dec: Vec<Date> = (0..sim.n_bars()).filter(|&t| sim.decision[t]).map(|t| sim.dates[t]).collect();
     assert_eq!(dec, sd, "decision dates must equal the key's month-end signal dates");
@@ -69,7 +69,7 @@ fn adapters_match_the_python_key_signals_on_every_decision_date() {
     assert!(cells > 100);
     // Crypto: every listed day.
     let panel = s3_panel();
-    let sim = simulate(&panel, &CryptoTrendRule, &s3_config()).unwrap();
+    let sim = simulate(&panel, &CryptoTrendRule::default(), &s3_config()).unwrap();
     let (sd, rows) = parse_signals(PY_KEY_S3_SIGNALS);
     let mut cells = 0;
     for (date, row) in sd.iter().zip(&rows) {
@@ -86,10 +86,10 @@ fn adapters_match_the_python_key_signals_on_every_decision_date() {
 #[test]
 fn adapter_series_digests_are_stable_across_runs() {
     let panel = s3_panel();
-    let a = simulate(&panel, &CryptoTrendRule, &s3_config()).unwrap();
-    let b = simulate(&panel, &CryptoTrendRule, &s3_config()).unwrap();
+    let a = simulate(&panel, &CryptoTrendRule::default(), &s3_config()).unwrap();
+    let b = simulate(&panel, &CryptoTrendRule::default(), &s3_config()).unwrap();
     assert_eq!(a.series_sha256, b.series_sha256);
-    let e = simulate(&s1_panel(), &EtfTrendRule, &SimConfig::default()).unwrap();
+    let e = simulate(&s1_panel(), &EtfTrendRule::default(), &SimConfig::default()).unwrap();
     assert_ne!(e.series_sha256, a.series_sha256);
 }
 
@@ -98,16 +98,16 @@ fn etf_warmup_is_a_warmup_refusal_and_abort_tolerates_it_until_the_first_decisio
     // Under HoldPrevious the early month-ends are recorded as Warmup refusals with the rule's own code.
     let panel = s1_panel();
     let cfg = SimConfig { on_refusal: OnRefusal::HoldPrevious, ..SimConfig::default() };
-    let sim = simulate(&panel, &EtfTrendRule, &cfg).unwrap();
+    let sim = simulate(&panel, &EtfTrendRule::default(), &cfg).unwrap();
     assert!(!sim.refusals.is_empty());
     assert!(sim.refusals.iter().all(|r| r.kind == RefusalKind::Warmup && r.code == "insufficient_history"));
     // The first decision comes at the 10th month-end and no refusal follows it.
     let first_dec = (0..sim.n_bars()).find(|&t| sim.decision[t]).unwrap();
     assert!(sim.refusals.iter().all(|r| r.bar < first_dec));
     // Under Abort the very same run succeeds (warm-up is tolerated before the first success)...
-    assert!(simulate(&panel, &EtfTrendRule, &SimConfig::default()).is_ok());
+    assert!(simulate(&panel, &EtfTrendRule::default(), &SimConfig::default()).is_ok());
     // ...and the two runs make the same decisions.
-    let abort = simulate(&panel, &EtfTrendRule, &SimConfig::default()).unwrap();
+    let abort = simulate(&panel, &EtfTrendRule::default(), &SimConfig::default()).unwrap();
     assert_eq!(abort.decision, sim.decision);
 }
 
@@ -150,23 +150,23 @@ fn a_data_gap_is_a_data_refusal_with_its_own_code() {
     // A ten-weekday hole inside the ten-month-end window: the rule's strict replay gap policy refuses (`DataGap`).
     let panel = synthetic_etf_panel_with_hole(Some((200, 210)));
     let cfg = SimConfig { on_refusal: OnRefusal::HoldPrevious, ..SimConfig::default() };
-    let sim = simulate(&panel, &EtfTrendRule, &cfg).unwrap();
+    let sim = simulate(&panel, &EtfTrendRule::default(), &cfg).unwrap();
     let data: Vec<_> = sim.refusals.iter().filter(|r| r.kind == RefusalKind::Data).collect();
     assert!(!data.is_empty(), "expected data-gap refusals, got {:?}", sim.refusals);
     assert!(data.iter().all(|r| r.code == "data_gap"));
     // Under Abort a Data refusal after the first success is fatal, not tolerated.
-    let err = simulate(&panel, &EtfTrendRule, &SimConfig::default()).unwrap_err();
+    let err = simulate(&panel, &EtfTrendRule::default(), &SimConfig::default()).unwrap_err();
     assert!(matches!(err, SimError::RuleRefused { ref refusal, .. } if refusal.kind == RefusalKind::Data), "{err}");
     // Without the hole there is no Data refusal at all.
     let clean = synthetic_etf_panel_with_hole(None);
-    let sim = simulate(&clean, &EtfTrendRule, &cfg).unwrap();
+    let sim = simulate(&clean, &EtfTrendRule::default(), &cfg).unwrap();
     assert!(sim.refusals.iter().all(|r| r.kind == RefusalKind::Warmup));
 }
 
 #[test]
 fn the_crypto_adapter_ignores_calendar_gaps_by_design() {
     // GapPolicy::Unchecked: the synthetic ETH series has holes and the adapter still decides on them.
-    let sim = simulate(&s3_panel(), &CryptoTrendRule, &s3_config()).unwrap();
+    let sim = simulate(&s3_panel(), &CryptoTrendRule::default(), &s3_config()).unwrap();
     assert!(sim.refusals.is_empty());
     let days: Vec<i64> = sim.dates.windows(2).map(|w| w[0].days_until(w[1])).collect();
     assert!(days.iter().any(|&x| x > 1), "the fixture is expected to contain calendar holes");
@@ -176,11 +176,11 @@ fn the_crypto_adapter_ignores_calendar_gaps_by_design() {
 fn simulator_poisoning_is_clean_for_the_adapters_and_catches_a_peeking_rule() {
     let cfg = SimConfig::default();
     let etf = s1_panel();
-    let r = weightsim::harness::check_poisoning(&|_p: &Panel| EtfTrendRule, &etf, &cfg, 300, 7).unwrap();
+    let r = weightsim::harness::check_poisoning(&|_p: &Panel| EtfTrendRule::default(), &etf, &cfg, 300, 7).unwrap();
     assert!(r.is_clean(), "{:?}", r.mismatches);
     let cry = s3_panel();
     let cfg3 = s3_config();
-    let r = weightsim::harness::check_poisoning(&|_p: &Panel| CryptoTrendRule, &cry, &cfg3, 200, 7).unwrap();
+    let r = weightsim::harness::check_poisoning(&|_p: &Panel| CryptoTrendRule::default(), &cry, &cfg3, 200, 7).unwrap();
     assert!(r.is_clean(), "{:?}", r.mismatches);
     // The same-day-peek mutant reads the future through its own copy of the panel: the harness must flag it. Only
     // the decision made on the last kept bar can differ, and a signal rarely flips on one bar, so try many cuts.
@@ -195,7 +195,8 @@ fn simulator_poisoning_is_clean_for_the_adapters_and_catches_a_peeking_rule() {
     assert!(flagged >= 3, "the poisoning harness caught the peeking rule at only {flagged} cuts");
     // ...while the honest adapter is clean at every one of those cuts.
     for cut in (150..420usize).step_by(7) {
-        let r = weightsim::harness::check_poisoning(&|_p: &Panel| CryptoTrendRule, &cry, &cfg3, cut, 7).unwrap();
+        let r =
+            weightsim::harness::check_poisoning(&|_p: &Panel| CryptoTrendRule::default(), &cry, &cfg3, cut, 7).unwrap();
         assert!(r.is_clean(), "cut {cut}: {:?}", r.mismatches);
     }
 }
@@ -204,10 +205,12 @@ fn simulator_poisoning_is_clean_for_the_adapters_and_catches_a_peeking_rule() {
 fn rule_truncation_is_clean_for_the_adapters() {
     let etf = s1_panel();
     let samples: Vec<usize> = (150..600).step_by(23).collect();
-    assert!(weightsim::harness::check_rule_truncation(&|_p: &Panel| EtfTrendRule, &etf, &samples).is_empty());
+    assert!(weightsim::harness::check_rule_truncation(&|_p: &Panel| EtfTrendRule::default(), &etf, &samples).is_empty());
     let cry = s3_panel();
     let samples: Vec<usize> = (120..420).step_by(17).collect();
-    assert!(weightsim::harness::check_rule_truncation(&|_p: &Panel| CryptoTrendRule, &cry, &samples).is_empty());
+    assert!(
+        weightsim::harness::check_rule_truncation(&|_p: &Panel| CryptoTrendRule::default(), &cry, &samples).is_empty()
+    );
     // ... and it flags the peeking rule.
     assert!(!weightsim::harness::check_rule_truncation(&|p: &Panel| PeekCrypto::new(p), &cry, &samples).is_empty());
 }
@@ -225,7 +228,81 @@ fn adapters_match_a_direct_call_of_the_rule_crate() {
     let direct = decide_crypto_trend(&panel, *dates.last().unwrap(), &opts).unwrap();
     let want: Vec<f64> = direct.instruments.iter().map(|i| i.weight).collect();
     // Run the adapter through the simulator with a probe that records what the rule returned at bar t.
-    let sim = simulate(&cry, &CryptoTrendRule, &SimConfig::default()).unwrap();
+    let sim = simulate(&cry, &CryptoTrendRule::default(), &SimConfig::default()).unwrap();
     assert_eq!(sim.row(&sim.target_weights, t), want.as_slice());
     assert!(sim.decision[t]);
+}
+
+// ------------------------------------------------------------------- parametric adapters (certified-envelope Phase 2)
+
+/// The parametric adapters at their default are the certified rules bit for bit (same digest as the published point
+/// spelled out explicitly), a rule-level lag of `k` is `SimConfig::execution_delay_bars = k` bit for bit, and a lag
+/// moves the first fill by exactly `k` bars.
+#[test]
+fn parametric_default_is_bit_identical_and_rule_lag_equals_the_configured_delay() {
+    use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS};
+    let first_fill = |s: &SimResult| (0..s.n_bars()).find(|&t| s.row(&s.units, t).iter().any(|u| *u != 0.0)).unwrap();
+
+    let etf = s1_panel();
+    let base = simulate(&etf, &EtfTrendRule::default(), &SimConfig::default()).unwrap();
+    let explicit = EtfTrendRule::new(ETF_SYMBOLS.to_vec(), ETF_SMA_MONTH_ENDS, 0);
+    assert_eq!(simulate(&etf, &explicit, &SimConfig::default()).unwrap().series_sha256, base.series_sha256);
+    assert_eq!(explicit.declared_parameters(), EtfTrendRule::default().declared_parameters());
+    for k in 1..=3 {
+        let lagged = EtfTrendRule::new(ETF_SYMBOLS.to_vec(), ETF_SMA_MONTH_ENDS, k);
+        let via_rule = simulate(&etf, &lagged, &SimConfig::default()).unwrap();
+        let cfg = SimConfig { execution_delay_bars: k, ..SimConfig::default() };
+        let via_cfg = simulate(&etf, &EtfTrendRule::default(), &cfg).unwrap();
+        assert_eq!(via_rule.series_sha256, via_cfg.series_sha256, "ETF lag {k}");
+        assert_ne!(via_rule.series_sha256, base.series_sha256, "ETF lag {k} must move the fills");
+        assert_eq!(first_fill(&via_rule), first_fill(&base) + k, "ETF lag {k}");
+        assert_eq!(via_rule.decision, base.decision, "the decision bars do not move, only the fills");
+    }
+
+    let cry = s3_panel();
+    let base = simulate(&cry, &CryptoTrendRule::default(), &s3_config()).unwrap();
+    let explicit = CryptoTrendRule::new(CRYPTO_SYMBOLS.to_vec(), CRYPTO_SMA_DAYS, 0);
+    assert_eq!(simulate(&cry, &explicit, &s3_config()).unwrap().series_sha256, base.series_sha256);
+    let lagged = CryptoTrendRule::new(CRYPTO_SYMBOLS.to_vec(), CRYPTO_SMA_DAYS, 1);
+    let via_rule = simulate(&cry, &lagged, &s3_config()).unwrap();
+    let via_cfg =
+        simulate(&cry, &CryptoTrendRule::default(), &SimConfig { execution_delay_bars: 1, ..s3_config() }).unwrap();
+    assert_eq!(via_rule.series_sha256, via_cfg.series_sha256);
+    assert_ne!(via_rule.series_sha256, base.series_sha256);
+    assert_eq!(first_fill(&via_rule), first_fill(&base) + 1);
+}
+
+/// Non-default points run: three ETFs with an eight-month-end lookback (two decisions earlier than the published
+/// ten), executed two bars late, and a one-coin sleeve with a 50-day lookback.
+#[test]
+fn non_default_points_run_over_their_own_instruments_and_lookback() {
+    let three = ["SPY", "IEF", "VNQ"];
+    let panel = Panel::from_long_csv(SYNTH_CSV, &three).unwrap();
+    let rule = EtfTrendRule::new(three.to_vec(), 8, 2);
+    let sim = simulate(&panel, &rule, &SimConfig::default()).unwrap();
+    assert_eq!(sim.symbols, three.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(sim.rule_id, "etf_trend_faber");
+    let decisions = sim.decision.iter().filter(|d| **d).count();
+    let published = simulate(&s1_panel(), &EtfTrendRule::default(), &SimConfig::default()).unwrap();
+    assert_eq!(published.decision.iter().filter(|d| **d).count(), 21, "the key's 21 month-ends");
+    assert_eq!(decisions, 23, "an 8-month-end lookback decides at two more month-ends than a 10-month-end one");
+    assert!(sim.target_weights.iter().all(|w| *w == 0.0 || *w == 0.2));
+    assert!(sim.target_weights.contains(&0.2));
+    // The lag is the configured delay, here too.
+    let cfg = SimConfig { execution_delay_bars: 2, ..SimConfig::default() };
+    let via_cfg = simulate(&panel, &EtfTrendRule::new(three.to_vec(), 8, 0), &cfg).unwrap();
+    assert_eq!(sim.series_sha256, via_cfg.series_sha256);
+    let p = rule.declared_parameters();
+    assert_eq!(p["sma_month_ends"], "8");
+    assert_eq!(p["execution_lag_bars"], "2");
+    assert_eq!(p["instruments"], "[\"SPY\",\"IEF\",\"VNQ\"]");
+
+    let btc = Panel::from_long_csv(SYNTH_CSV, &["BTC"]).unwrap();
+    let rule = CryptoTrendRule::new(vec!["BTC"], 50, 0);
+    let sim = simulate(&btc, &rule, &s3_config()).unwrap();
+    assert_eq!(sim.n_assets(), 1);
+    assert!(!sim.decision[48], "49 bars are not enough for a 50-day average");
+    assert!(sim.decision[49], "the first decision comes with the 50th bar");
+    assert!(sim.target_weights.iter().all(|w| *w == 0.0 || *w == 0.5));
+    assert!(sim.target_weights.contains(&0.5));
 }

@@ -102,6 +102,17 @@ pub trait WeightRule: Send + Sync {
     }
     fn decision_schedule(&self) -> DecisionSchedule;
     fn rebalance_policy(&self) -> RebalancePolicy;
+    /// Execution lag of the RULE, in bars: a decision taken at the close of bar `t` becomes effective (the standing
+    /// target, traded under the rebalance policy) at the close of bar `t + lag`, on top of the configuration's
+    /// `SimConfig::execution_delay_bars` (the two add). The default, 0, is the published implementation point: every
+    /// rule that does not override this behaves, bit for bit, as before the method existed. A non-zero lag is an
+    /// implementation-point parameter (a tenant's tranche), never part of the certified run, so a rule that returns one
+    /// must also declare it in `declared_parameters` (`execution_lag_bars`). Decisions whose effective bar is past the
+    /// end of the panel are never effective. Honoured by [`crate::simulate`]; the book simulator keys execution on its
+    /// per-sleeve `SleeveSpec::execution_delay` instead and does not read this method.
+    fn execution_lag_bars(&self) -> usize {
+        0
+    }
     /// The simulator does not call the rule before this many bars are visible (silent skip, not a refusal).
     fn min_history_bars(&self) -> usize;
     /// Target weights (signed fractions of sleeve equity, universe order) for a decision at the close of the last
@@ -130,6 +141,9 @@ impl<R: WeightRule + ?Sized> WeightRule for Box<R> {
     }
     fn rebalance_policy(&self) -> RebalancePolicy {
         (**self).rebalance_policy()
+    }
+    fn execution_lag_bars(&self) -> usize {
+        (**self).execution_lag_bars()
     }
     fn min_history_bars(&self) -> usize {
         (**self).min_history_bars()

@@ -17,7 +17,7 @@ use weightsim::{
     DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
 };
 
-use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS};
+use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS};
 
 use super::checks::SeriesRows;
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
@@ -134,6 +134,9 @@ impl<R: WeightRule> WeightRule for Wrapped<R> {
     fn rebalance_policy(&self) -> RebalancePolicy {
         self.policy.unwrap_or_else(|| self.inner.rebalance_policy())
     }
+    fn execution_lag_bars(&self) -> usize {
+        self.inner.execution_lag_bars()
+    }
     fn min_history_bars(&self) -> usize {
         self.inner.min_history_bars()
     }
@@ -172,12 +175,12 @@ impl WeightRule for PeekCrypto {
         RebalancePolicy::EveryBar
     }
     fn min_history_bars(&self) -> usize {
-        CryptoTrendRule.min_history_bars()
+        CryptoTrendRule::default().min_history_bars()
     }
     fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
         let end = (h.len() + 1).min(self.full.n_bars());
         let cols: Vec<&[f64]> = (0..self.full.n_assets()).map(|i| &self.full.closes(i)[..end]).collect();
-        crypto_weights(&self.full.dates()[..end], &cols)
+        crypto_weights(&CRYPTO_SYMBOLS, CRYPTO_SMA_DAYS, &self.full.dates()[..end], &cols)
     }
 }
 
@@ -333,24 +336,25 @@ pub fn run_mutant(fx: &Fixtures, m: Mutant) -> Result<MutantRun, LadderError> {
     let (panel, key) = (sf.panel, sf.key);
     match m {
         Mutant::S3SameDayPeek => from_sim(&run_gross(panel, &PeekCrypto::new(panel), key, 0)?, key),
-        Mutant::S3ExtraDelay => from_sim(&run_gross(panel, &CryptoTrendRule, key, 1)?, key),
+        Mutant::S3ExtraDelay => from_sim(&run_gross(panel, &CryptoTrendRule::default(), key, 1)?, key),
         Mutant::S3SmaExcludesToday => from_sim(&run_gross(panel, &CryptoSmaExcludesToday, key, 0)?, key),
         Mutant::S3HalfSizing => {
-            let rule = Wrapped { inner: CryptoTrendRule, name: "mutant_s3_half_sizing", scale: 0.5, policy: None };
+            let rule =
+                Wrapped { inner: CryptoTrendRule::default(), name: "mutant_s3_half_sizing", scale: 0.5, policy: None };
             from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
         Mutant::S3DriftingSubaccounts => Ok(MutantRun {
             // The sub-accounts are fed by the unmutated rule's own signals over the WHOLE history (they hold
             // positions, and so drift, from the rule's first signal in 2015, not from the entry bar).
-            rows: drifting_subaccounts(panel, &run_gross(panel, &CryptoTrendRule, key, 0)?, key)?,
+            rows: drifting_subaccounts(panel, &run_gross(panel, &CryptoTrendRule::default(), key, 0)?, key)?,
             flips: None,
             series_sha256: None,
         }),
         Mutant::S1SmaExcludesCurrent => from_sim(&run_gross(panel, &EtfSmaExcludesCurrent, key, 0)?, key),
-        Mutant::S1OneBarLate => from_sim(&run_gross(panel, &EtfTrendRule, key, 1)?, key),
+        Mutant::S1OneBarLate => from_sim(&run_gross(panel, &EtfTrendRule::default(), key, 1)?, key),
         Mutant::S1WrongRebalanceMode => {
             let rule = Wrapped {
-                inner: EtfTrendRule,
+                inner: EtfTrendRule::default(),
                 name: "mutant_s1_daily_rebalanced_20",
                 scale: 1.0,
                 policy: Some(RebalancePolicy::EveryBar),

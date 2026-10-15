@@ -22,26 +22,56 @@ pub const CRYPTO_WEIGHT_PER_INSTRUMENT: f64 = 0.50;
 /// Only bars dated on or before `decision_date` enter the computation. Each coin is validated on its own series:
 /// the decision date must be one of its bars, it must have 100 bars up to and including that date, and by the
 /// default gap policy no calendar day may be missing inside those 100 bars.
+///
+/// This is the PUBLISHED rule: [`decide_crypto_trend_with`] called with `CRYPTO_SYMBOLS` and `CRYPTO_SMA_DAYS`.
 pub fn decide_crypto_trend(
     panel: &Panel,
     decision_date: NaiveDate,
     opts: &Options,
 ) -> Result<CryptoDecision, RuleError> {
-    let mut instruments = Vec::with_capacity(CRYPTO_SYMBOLS.len());
-    let mut window_start = Vec::with_capacity(CRYPTO_SYMBOLS.len());
-    for symbol in CRYPTO_SYMBOLS {
+    decide_crypto_trend_with(panel, decision_date, opts, &CRYPTO_SYMBOLS, CRYPTO_SMA_DAYS)
+}
+
+/// The same rule over an explicit coin list and daily lookback: hold `CRYPTO_WEIGHT_PER_INSTRUMENT` of the sleeve
+/// in each of `symbols` whose close is strictly above the simple average of its last `sma_days` daily closes (the
+/// decision day included). `instruments` follow `symbols` order.
+///
+/// `decide_crypto_trend` is this function at the published point (`CRYPTO_SYMBOLS`, `CRYPTO_SMA_DAYS`); any other
+/// point is an implementation point inside a pre-registered envelope, never the certified rule.
+///
+/// # Panics
+/// If `symbols` is empty or `sma_days` is 0: both are usage errors (an envelope is validated before any of its
+/// points reaches a rule), not data conditions.
+pub fn decide_crypto_trend_with(
+    panel: &Panel,
+    decision_date: NaiveDate,
+    opts: &Options,
+    symbols: &[&str],
+    sma_days: usize,
+) -> Result<CryptoDecision, RuleError> {
+    assert!(
+        !symbols.is_empty(),
+        "decide_crypto_trend_with: empty instrument list"
+    );
+    assert!(
+        sma_days >= 1,
+        "decide_crypto_trend_with: the lookback needs at least one day"
+    );
+    let mut instruments = Vec::with_capacity(symbols.len());
+    let mut window_start = Vec::with_capacity(symbols.len());
+    for &symbol in symbols {
         let s = panel.get(symbol)?;
         check_as_of(s, opts)?;
         let pos = locate(s, decision_date)?;
         check_panel_end(s, pos, opts)?;
-        if pos + 1 < CRYPTO_SMA_DAYS {
+        if pos + 1 < sma_days {
             return Err(RuleError::InsufficientHistory {
                 symbol: symbol.to_string(),
-                needed: CRYPTO_SMA_DAYS,
+                needed: sma_days,
                 have: pos + 1,
             });
         }
-        let lo = pos + 1 - CRYPTO_SMA_DAYS;
+        let lo = pos + 1 - sma_days;
         check_gaps(symbol, &s.dates()[lo..=pos], opts.gap_policy)?;
         let window = &s.closes()[lo..=pos];
         let close = s.closes()[pos];

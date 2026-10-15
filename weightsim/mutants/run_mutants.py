@@ -22,8 +22,8 @@ ROOT = os.path.dirname(CRATE)
 # (id, description, file relative to the crate, old text (exactly once), new text)
 MUTANTS = [
     ("M01", "one-bar-late decision (fill one bar after the decision)", "src/sim.rs",
-     "pending.push_back((t + cfg.execution_delay_bars, scaled));",
-     "pending.push_back((t + cfg.execution_delay_bars + 1, scaled));"),
+     "pending.push_back((t + cfg.execution_delay_bars + lag, scaled));",
+     "pending.push_back((t + cfg.execution_delay_bars + lag + 1, scaled));"),
     ("M02", "wrong rebalance mode (OnDecision behaves like EveryBar)", "src/sim.rs",
      "RebalancePolicy::OnDecision => newly_effective,",
      "RebalancePolicy::OnDecision => true,"),
@@ -41,7 +41,7 @@ MUTANTS = [
      "let scaled: Vec<f64> = w.iter().map(|v| -v * cfg.risk_scale).collect();"),
     ("M07", "drop the refusal hold (a refusal flattens the book)", "src/sim.rs",
      "                    refused = true;\n                    res.refusals.push(Refusal {",
-     "                    refused = true;\n                    pending.push_back((t + cfg.execution_delay_bars, vec![0.0; k]));\n                    res.refusals.push(Refusal {"),
+     "                    refused = true;\n                    pending.push_back((t + cfg.execution_delay_bars + lag, vec![0.0; k]));\n                    res.refusals.push(Refusal {"),
     ("M08", "fill at the wrong bar (previous close)", "src/sim.rs",
      "                let p = panel.closes(i)[t];\n                let nu = w[i] * equity_pre / p;",
      "                let p = panel.closes(i)[t.saturating_sub(1)];\n                let nu = w[i] * equity_pre / p;"),

@@ -156,7 +156,7 @@ fn the_honest_rule_passes_every_sleeve_check() {
     let fx = fixtures();
     let e = entry(&fx);
     let (rep, checks) =
-        certify_sleeve(&fx, MutantSleeve::S3, &|_p: &Panel| FlatUntil::new(CryptoTrendRule, e)).unwrap();
+        certify_sleeve(&fx, MutantSleeve::S3, &|_p: &Panel| FlatUntil::new(CryptoTrendRule::default(), e)).unwrap();
     assert!(failed(&checks).is_empty(), "{:?}", failed(&checks));
     assert!(checks.len() >= 15);
     assert_eq!(rep.code, "S3");

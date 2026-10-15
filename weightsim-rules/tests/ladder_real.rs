@@ -135,7 +135,7 @@ fn without_the_flat_start_the_net_series_cannot_reproduce_the_key() {
     let (_, checks) = weightsim_rules::ladder::certify_sleeve(
         &fx,
         weightsim_rules::ladder::mutants::MutantSleeve::S3,
-        &|_p: &weightsim::Panel| weightsim_rules::CryptoTrendRule,
+        &|_p: &weightsim::Panel| weightsim_rules::CryptoTrendRule::default(),
     )
     .unwrap();
     let failed: Vec<&str> = checks.iter().filter(|c| !c.passed).map(|c| c.name.as_str()).collect();
@@ -148,7 +148,7 @@ fn without_the_flat_start_the_net_series_cannot_reproduce_the_key() {
     let (_, ok) = weightsim_rules::ladder::certify_sleeve(
         &fx,
         weightsim_rules::ladder::mutants::MutantSleeve::S3,
-        &|_p: &weightsim::Panel| weightsim_rules::FlatUntil::new(weightsim_rules::CryptoTrendRule, entry),
+        &|_p: &weightsim::Panel| weightsim_rules::FlatUntil::new(weightsim_rules::CryptoTrendRule::default(), entry),
     )
     .unwrap();
     assert!(ok.iter().all(|c| c.passed));
