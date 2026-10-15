@@ -244,3 +244,111 @@ fn synthetic_crypto_every_day_reference_semantics() {
     assert_eq!((hit, tot), (2 * rows.len(), 2 * rows.len()));
     assert_eq!(rows.len(), 273);
 }
+
+/// `decide_etf_trend` is `decide_etf_trend_with` at the published point: the same `Ok` or the same `Err` on every
+/// month-end of the synthetic ladder, warm-up included. A reordered instrument list reorders the decision.
+#[test]
+fn synthetic_etf_with_published_arguments_is_the_published_rule() {
+    let panel = etf_panel();
+    let opts = Options::etf_replay(MonthEndMode::Explicit);
+    let all = month_end_dates(panel.get("SPY").unwrap());
+    assert_eq!(all.len(), 30);
+    let (mut ok, mut err) = (0, 0);
+    for date in &all {
+        let published = decide_etf_trend(&panel, *date, &opts);
+        let with = decide_etf_trend_with(&panel, *date, &opts, &ETF_SYMBOLS, ETF_SMA_MONTH_ENDS);
+        assert_eq!(with, published, "{date}");
+        match published {
+            Ok(_) => ok += 1,
+            Err(_) => err += 1,
+        }
+    }
+    assert_eq!((ok, err), (21, 9));
+    let date = all[29];
+    let published = decide_etf_trend(&panel, date, &opts).unwrap();
+    let reordered =
+        decide_etf_trend_with(&panel, date, &opts, &["VNQ", "SPY"], ETF_SMA_MONTH_ENDS).unwrap();
+    let syms: Vec<&str> = reordered
+        .instruments
+        .iter()
+        .map(|i| i.symbol.as_str())
+        .collect();
+    assert_eq!(syms, ["VNQ", "SPY"]);
+    assert_eq!(reordered.instruments[0], *published.get("VNQ").unwrap());
+    assert_eq!(reordered.instruments[1], *published.get("SPY").unwrap());
+    assert_eq!(reordered.month_end_dates, published.month_end_dates);
+}
+
+/// A non-published point runs: three ETFs over eight month-ends decide at the eighth month-end, where the published
+/// rule still refuses for insufficient history, with eight averaged dates and weights of exactly 0 or 0.2.
+#[test]
+fn synthetic_etf_with_three_instruments_and_eight_month_ends_runs() {
+    let three = ["SPY", "IEF", "VNQ"];
+    let panel = panel_of(&load_synthetic_ladder(), &three);
+    let opts = Options::etf_replay(MonthEndMode::Explicit);
+    let all = month_end_dates(panel.get("SPY").unwrap());
+    let eighth = all[7];
+    assert!(matches!(
+        decide_etf_trend_with(&panel, eighth, &opts, &three, ETF_SMA_MONTH_ENDS),
+        Err(RuleError::InsufficientHistory {
+            needed: 10,
+            have: 8,
+            ..
+        })
+    ));
+    let dec = decide_etf_trend_with(&panel, eighth, &opts, &three, 8).unwrap();
+    assert_eq!(dec.decision_date, eighth);
+    assert_eq!(dec.month_end_dates.len(), 8);
+    assert_eq!(dec.month_end_dates, all[..8].to_vec());
+    let syms: Vec<&str> = dec.instruments.iter().map(|i| i.symbol.as_str()).collect();
+    assert_eq!(syms, three);
+    for i in &dec.instruments {
+        assert!(i.weight == 0.0 || i.weight == 0.2, "{i:?}");
+        assert_eq!(i.weight == 0.2, i.signal == Signal::Long);
+    }
+    // Every later month-end decides too (the last decided month-end of the key included).
+    for date in &all[8..] {
+        decide_etf_trend_with(&panel, *date, &opts, &three, 8)
+            .unwrap_or_else(|e| panic!("{date}: {e}"));
+    }
+}
+
+/// `decide_crypto_trend` is `decide_crypto_trend_with` at the published point on every key day (the strict gap policy
+/// refusals included), and a one-coin point with a 50-day lookback decides on a day the published rule refuses.
+#[test]
+fn synthetic_crypto_with_published_arguments_is_the_published_rule_and_a_short_point_runs() {
+    let panel = crypto_panel();
+    let (_, rows) = load_key("key_S3_signals.csv");
+    let opts = Options::crypto_replay();
+    let (mut ok, mut err) = (0, 0);
+    for (date, _) in &rows {
+        let published = decide_crypto_trend(&panel, *date, &opts);
+        let with = decide_crypto_trend_with(&panel, *date, &opts, &CRYPTO_SYMBOLS, CRYPTO_SMA_DAYS);
+        assert_eq!(with, published, "{date}");
+        match published {
+            Ok(_) => ok += 1,
+            Err(_) => err += 1,
+        }
+    }
+    assert!(
+        ok > 0 && err > 0,
+        "the key must exercise both outcomes ({ok} ok, {err} refused)"
+    );
+
+    let btc = panel.get("BTC").unwrap();
+    let day60 = btc.dates()[59];
+    let opts = Options {
+        gap_policy: GapPolicy::Unchecked,
+        ..Options::crypto_replay()
+    };
+    assert!(matches!(
+        decide_crypto_trend(&panel, day60, &opts),
+        Err(RuleError::InsufficientHistory { needed: 100, .. })
+    ));
+    let dec = decide_crypto_trend_with(&panel, day60, &opts, &["BTC"], 50).unwrap();
+    assert_eq!(dec.decision_date, day60);
+    assert_eq!(dec.instruments.len(), 1);
+    assert_eq!(dec.instruments[0].symbol, "BTC");
+    assert_eq!(dec.window_start, vec![btc.dates()[10]]);
+    assert!(dec.instruments[0].weight == 0.0 || dec.instruments[0].weight == 0.5);
+}

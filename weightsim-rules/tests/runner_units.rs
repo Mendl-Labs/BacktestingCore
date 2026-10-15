@@ -206,16 +206,16 @@ fn key_rows_offer_the_columns_the_key_defines_for_each_basis() {
 fn flat_until_holds_cash_before_the_entry_bar_and_delegates_after() {
     let cry = s3_panel();
     let entry = cry.dates()[250];
-    let gated = FlatUntil::new(CryptoTrendRule, entry);
+    let gated = FlatUntil::new(CryptoTrendRule::default(), entry);
     assert_eq!(gated.first_trade(), entry);
     assert_eq!(gated.id(), "crypto_trend_100d");
-    assert_eq!(gated.universe(), CryptoTrendRule.universe());
-    assert_eq!(gated.decision_schedule(), CryptoTrendRule.decision_schedule());
-    assert_eq!(gated.rebalance_policy(), CryptoTrendRule.rebalance_policy());
-    assert_eq!(gated.min_history_bars(), CryptoTrendRule.min_history_bars());
-    assert_eq!(gated.declared_parameters(), CryptoTrendRule.declared_parameters());
+    assert_eq!(gated.universe(), CryptoTrendRule::default().universe());
+    assert_eq!(gated.decision_schedule(), CryptoTrendRule::default().decision_schedule());
+    assert_eq!(gated.rebalance_policy(), CryptoTrendRule::default().rebalance_policy());
+    assert_eq!(gated.min_history_bars(), CryptoTrendRule::default().min_history_bars());
+    assert_eq!(gated.declared_parameters(), CryptoTrendRule::default().declared_parameters());
     assert!(gated.impl_version().contains(&entry.to_string()));
-    let plain = simulate(&cry, &CryptoTrendRule, &SimConfig::default()).unwrap();
+    let plain = simulate(&cry, &CryptoTrendRule::default(), &SimConfig::default()).unwrap();
     let flat = simulate(&cry, &gated, &SimConfig::default()).unwrap();
     // before the entry: all-zero targets, no positions, no cost; equity stays 1
     let k = 2;
@@ -242,7 +242,7 @@ fn flat_until_holds_cash_before_the_entry_bar_and_delegates_after() {
     assert!((net.equity[250] - (1.0 - 0.001 * invested)).abs() <= 1e-15);
     // The gated rule is causal (the entry date is a date, not a price).
     let r = weightsim::harness::check_poisoning(
-        &|_p: &Panel| FlatUntil::new(CryptoTrendRule, entry),
+        &|_p: &Panel| FlatUntil::new(CryptoTrendRule::default(), entry),
         &cry,
         &SimConfig::default(),
         300,

@@ -1,7 +1,8 @@
 # reference-rules
 
 The pure decision rules of the documented sleeves: ETF trend (`decide_etf_trend`), crypto trend
-(`decide_crypto_trend`) and FX time-series momentum (`decide_fx_tsmom`). No I/O, no network, no clock (the run
+(`decide_crypto_trend`) and FX time-series momentum (`decide_fx_tsmom`). The ETF and crypto rules are the published
+points of `decide_etf_trend_with` / `decide_crypto_trend_with` (explicit instrument list and lookback). No I/O, no network, no clock (the run
 date is an argument). The interpretation choices are written at the top of `src/lib.rs`.
 
 This crate is the ONE implementation of those rules. Both the backtester (through the weight-target simulator

@@ -106,7 +106,8 @@ pub use cointegration_spread_threshold::{
     COINT_LOOKBACK_DAYS, COINT_SYMBOLS,
 };
 pub use crypto::{
-    decide_crypto_trend, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
+    decide_crypto_trend, decide_crypto_trend_with, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS,
+    CRYPTO_WEIGHT_PER_INSTRUMENT,
 };
 pub use day_of_week::{
     decide_day_of_week, decide_day_of_week_default, decide_day_of_week_on,
@@ -127,7 +128,10 @@ pub use dual_momentum_gem::{
 };
 pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANCE_SYMBOLS};
 pub use error::RuleError;
-pub use etf::{decide_etf_trend, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT};
+pub use etf::{
+    decide_etf_trend, decide_etf_trend_with, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
+    ETF_WEIGHT_PER_INSTRUMENT,
+};
 pub use fingerprint::data_fingerprint;
 pub use five_day_reversal_zscore::{
     FiveDayReversalZscore, FIVE_DAY_REVERSAL_LOOKBACK, FIVE_DAY_REVERSAL_MIN_HISTORY_BARS,

@@ -18,8 +18,8 @@ pub const ETF_SMA_MONTH_ENDS: usize = 10;
 /// Target weight, as a fraction of the sleeve, of each ETF whose signal is `Long`.
 pub const ETF_WEIGHT_PER_INSTRUMENT: f64 = 0.20;
 
-struct Gathered {
-    symbol: &'static str,
+struct Gathered<'a> {
+    symbol: &'a str,
     month_end_dates: Vec<NaiveDate>,
     month_end_closes: Vec<f64>,
 }
@@ -29,26 +29,56 @@ struct Gathered {
 /// Only bars dated on or before `decision_date` enter the computation. Each instrument is validated on its own
 /// series (no silent joint-dropna as in the reference tool); the ten month-end dates must then agree across
 /// the five ETFs, since they trade the same sessions.
+///
+/// This is the PUBLISHED rule: [`decide_etf_trend_with`] called with `ETF_SYMBOLS` and `ETF_SMA_MONTH_ENDS`.
 pub fn decide_etf_trend(
     panel: &Panel,
     decision_date: NaiveDate,
     opts: &Options,
 ) -> Result<EtfDecision, RuleError> {
-    let mut gathered: Vec<Gathered> = Vec::with_capacity(ETF_SYMBOLS.len());
-    for symbol in ETF_SYMBOLS {
+    decide_etf_trend_with(panel, decision_date, opts, &ETF_SYMBOLS, ETF_SMA_MONTH_ENDS)
+}
+
+/// The same rule over an explicit instrument list and month-end lookback: hold `ETF_WEIGHT_PER_INSTRUMENT` of the
+/// sleeve in each of `symbols` whose month-end close is strictly above the simple average of its last
+/// `sma_month_ends` month-end closes (the current one included). `instruments` follow `symbols` order.
+///
+/// `decide_etf_trend` is this function at the published point (`ETF_SYMBOLS`, `ETF_SMA_MONTH_ENDS`); any other
+/// point is an implementation point inside a pre-registered envelope, never the certified rule.
+///
+/// # Panics
+/// If `symbols` is empty or `sma_month_ends` is 0: both are usage errors (an envelope is validated before any of
+/// its points reaches a rule), not data conditions.
+pub fn decide_etf_trend_with(
+    panel: &Panel,
+    decision_date: NaiveDate,
+    opts: &Options,
+    symbols: &[&str],
+    sma_month_ends: usize,
+) -> Result<EtfDecision, RuleError> {
+    assert!(
+        !symbols.is_empty(),
+        "decide_etf_trend_with: empty instrument list"
+    );
+    assert!(
+        sma_month_ends >= 1,
+        "decide_etf_trend_with: the lookback needs at least one month-end"
+    );
+    let mut gathered: Vec<Gathered<'_>> = Vec::with_capacity(symbols.len());
+    for &symbol in symbols {
         let s = panel.get(symbol)?;
         check_as_of(s, opts)?;
         let pos = locate(s, decision_date)?;
         check_month_end(s, pos, opts)?;
         let idx = month_end_indices(&s.dates()[..=pos]);
-        if idx.len() < ETF_SMA_MONTH_ENDS {
+        if idx.len() < sma_month_ends {
             return Err(RuleError::InsufficientHistory {
                 symbol: symbol.to_string(),
-                needed: ETF_SMA_MONTH_ENDS,
+                needed: sma_month_ends,
                 have: idx.len(),
             });
         }
-        let idx = &idx[idx.len() - ETF_SMA_MONTH_ENDS..];
+        let idx = &idx[idx.len() - sma_month_ends..];
         check_gaps(symbol, &s.dates()[idx[0]..=pos], opts.gap_policy)?;
         gathered.push(Gathered {
             symbol,
@@ -70,7 +100,7 @@ pub fn decide_etf_trend(
     }
     let mut instruments = Vec::with_capacity(gathered.len());
     for g in &gathered {
-        let close = g.month_end_closes[ETF_SMA_MONTH_ENDS - 1];
+        let close = g.month_end_closes[sma_month_ends - 1];
         let cmp = compare_to_mean(close, &g.month_end_closes[..]).ok_or_else(|| {
             RuleError::PriceScaleTooWide {
                 symbol: g.symbol.to_string(),

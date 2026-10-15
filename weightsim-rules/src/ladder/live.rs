@@ -30,9 +30,9 @@ pub const LIVE_REALISTIC_LAYER: &str = "live_realistic";
 /// The pre-registered sleeve class of a library rule, or `None` for an id this crate does not implement.
 pub fn sleeve_class_of(rule_id: &str) -> Option<SleeveClass> {
     use weightsim::WeightRule;
-    if rule_id == EtfTrendRule.id() {
+    if rule_id == EtfTrendRule::default().id() {
         Some(SleeveClass::EtfTrend)
-    } else if rule_id == CryptoTrendRule.id() {
+    } else if rule_id == CryptoTrendRule::default().id() {
         Some(SleeveClass::CryptoTrend)
     } else {
         None

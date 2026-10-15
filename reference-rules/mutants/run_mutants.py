@@ -81,8 +81,8 @@ MUTANTS = [
      "((b - a).num_days() - 1).max(0) as u32",
      "(b - a).num_days().max(0) as u32"),
     ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
-     "if pos + 1 < CRYPTO_SMA_DAYS {",
-     "if pos + 1 <= CRYPTO_SMA_DAYS {"),
+     "if pos + 1 < sma_days {",
+     "if pos + 1 <= sma_days {"),
 
     # --- W3.6 new primitives (SENIOR_RESEARCHER_GAP_CLOSURE_PLAN.md, W3.6 / 9.9 point 2) ---
     ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",

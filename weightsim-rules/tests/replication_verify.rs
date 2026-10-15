@@ -327,9 +327,9 @@ fn metrics_recomputed_from_the_columns_equal_the_runs_own_metrics_bit_for_bit() 
         // The run's own SimResults, produced independently of `replicate`.
         let entry = entry_date(panel, key).unwrap();
         let sims = if is_etf {
-            run_gross_and_net(panel, &FlatUntil::new(EtfTrendRule, entry), key).unwrap()
+            run_gross_and_net(panel, &FlatUntil::new(EtfTrendRule::default(), entry), key).unwrap()
         } else {
-            run_gross_and_net(panel, &FlatUntil::new(CryptoTrendRule, entry), key).unwrap()
+            run_gross_and_net(panel, &FlatUntil::new(CryptoTrendRule::default(), entry), key).unwrap()
         };
         let v = verify(&w.fx, rule, &run.gross, &run.net).unwrap();
         let (first, last) = (key.bars[0].date, key.bars[key.bars.len() - 1].date);

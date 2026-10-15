@@ -51,11 +51,13 @@ fn certification_execution_model_reproduces_the_pinned_digests_bit_for_bit() {
     let mut got = Vec::new();
     for cost in [CostModel::ZERO, CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE] {
         let cfg = cert.apply_to(&sleeve_config(&fx.sleeves["S1"].key, cost)).unwrap();
-        got.push(simulate(&fx.etf_panel, &FlatUntil::new(EtfTrendRule, e1), &cfg).unwrap().series_sha256);
+        got.push(simulate(&fx.etf_panel, &FlatUntil::new(EtfTrendRule::default(), e1), &cfg).unwrap().series_sha256);
     }
     for cost in [CostModel::ZERO, CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE] {
         let cfg = cert.apply_to(&sleeve_config(&fx.sleeves["S3"].key, cost)).unwrap();
-        got.push(simulate(&fx.crypto_panel, &FlatUntil::new(CryptoTrendRule, e3), &cfg).unwrap().series_sha256);
+        got.push(
+            simulate(&fx.crypto_panel, &FlatUntil::new(CryptoTrendRule::default(), e3), &cfg).unwrap().series_sha256,
+        );
     }
     for (name, (want, g)) in ["S1 gross", "S1 net", "S3 gross", "S3 net"].iter().zip(PINNED.iter().zip(&got)) {
         println!("CERTIFICATION-MODEL DIGEST {name}: {g}");

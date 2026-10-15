@@ -5,8 +5,11 @@ against the pinned answer key. Stage T3 (milestone A: ETF and crypto certified i
 `product-mandate/BACKTESTER_TRUTH_DESIGN.md`.
 
 * `adapters`: `EtfTrendRule` and `CryptoTrendRule` implement `weightsim::WeightRule` around
-  `reference_rules::{decide_etf_trend, decide_crypto_trend}` (replay options, date conversion, `RuleError` to
+  `reference_rules::{decide_etf_trend_with, decide_crypto_trend_with}` (replay options, date conversion, `RuleError` to
   `RuleRefusal` mapping: `InsufficientHistory` is `Warmup`, gaps and stale data are `Data`, the rest is `Other`).
+  Both are parametric (instruments, lookback, rule-level execution lag); `::default()` is the PUBLISHED point (the rule
+  crate's constants, no lag), the only instance the ladder certifies, and declares exactly the parameters the library
+  entry pins. A non-default point keeps the id and additionally declares `execution_lag_bars` and `instruments`.
   `FlatUntil` starts a sleeve flat at the bar before its window, as the key's ledger does. The FX adapter is Stage T5.
 * `ladder`: pure functions. `Fixtures::from_dir` verifies the pinned `MANIFEST.json` and every file it lists (sha256 and
   size) and parses the answer key; `run_ladder` runs both rules gross and net (`certification_flat_10bps_per_side`)
