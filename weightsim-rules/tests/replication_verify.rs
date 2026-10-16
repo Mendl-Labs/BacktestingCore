@@ -179,7 +179,7 @@ fn round_trip_replicate_columns_verify_is_ok_with_identical_digests() {
 fn the_impl_version_string_carries_the_crate_version_and_is_a_digest_input() {
     let w = world();
     assert_eq!(ADAPTER_VERSION, "weightsim-rules 0.1.0 over reference-rules");
-    let entry = entry_date(&w.fx.etf_panel, &w.fx.sleeves["S1"].key).unwrap();
+    let entry = entry_date(w.fx.etf_panel(), &w.fx.sleeves["S1"].key).unwrap();
     assert_eq!(w.s1.rule_impl_version, format!("{ADAPTER_VERSION}, flat until {entry}"));
     assert_eq!(w.s1.gross.rule_impl_version, w.s1.rule_impl_version);
     // Changing only that string changes the digest.
@@ -320,8 +320,8 @@ fn oracle(dates: &[Date], r: &[f64]) -> Oracle {
 fn metrics_recomputed_from_the_columns_equal_the_runs_own_metrics_bit_for_bit() {
     let w = world();
     let cases: [(&str, &ReplicationRun, &Panel, &weightsim_rules::ladder::fixtures::SleeveKey, bool); 2] = [
-        (S1, &w.s1, &w.fx.etf_panel, &w.fx.sleeves["S1"].key, true),
-        (S3, &w.s3, &w.fx.crypto_panel, &w.fx.sleeves["S3"].key, false),
+        (S1, &w.s1, w.fx.etf_panel(), &w.fx.sleeves["S1"].key, true),
+        (S3, &w.s3, w.fx.crypto_panel(), &w.fx.sleeves["S3"].key, false),
     ];
     for (rule, run, panel, key, is_etf) in cases {
         // The run's own SimResults, produced independently of `replicate`.

@@ -144,7 +144,7 @@ fn without_the_flat_start_the_net_series_cannot_reproduce_the_key() {
     // the returns themselves are the same rule's returns: the bands still pass
     assert!(!failed.contains(&"S3.gross.tier1.bands"), "{failed:?}");
     // and the certified (flat-started) configuration passes the same checks
-    let entry = weightsim_rules::ladder::runner::entry_date(&fx.crypto_panel, &fx.sleeves["S3"].key).unwrap();
+    let entry = weightsim_rules::ladder::runner::entry_date(fx.crypto_panel(), &fx.sleeves["S3"].key).unwrap();
     let (_, ok) = weightsim_rules::ladder::certify_sleeve(
         &fx,
         weightsim_rules::ladder::mutants::MutantSleeve::S3,

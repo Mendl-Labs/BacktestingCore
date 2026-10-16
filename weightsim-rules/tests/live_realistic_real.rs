@@ -46,17 +46,17 @@ fn certification_execution_model_reproduces_the_pinned_digests_bit_for_bit() {
     assert_eq!((s1.layer(), s3.layer()), (Layer::Certified, Layer::Certified));
     // And the same runs driven through `ExecutionModel::certification().apply_to` are byte-identical.
     let cert = ExecutionModel::certification();
-    let e1 = entry_date(&fx.etf_panel, &fx.sleeves["S1"].key).unwrap();
-    let e3 = entry_date(&fx.crypto_panel, &fx.sleeves["S3"].key).unwrap();
+    let e1 = entry_date(fx.etf_panel(), &fx.sleeves["S1"].key).unwrap();
+    let e3 = entry_date(fx.crypto_panel(), &fx.sleeves["S3"].key).unwrap();
     let mut got = Vec::new();
     for cost in [CostModel::ZERO, CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE] {
         let cfg = cert.apply_to(&sleeve_config(&fx.sleeves["S1"].key, cost)).unwrap();
-        got.push(simulate(&fx.etf_panel, &FlatUntil::new(EtfTrendRule::default(), e1), &cfg).unwrap().series_sha256);
+        got.push(simulate(fx.etf_panel(), &FlatUntil::new(EtfTrendRule::default(), e1), &cfg).unwrap().series_sha256);
     }
     for cost in [CostModel::ZERO, CostModel::CERTIFICATION_FLAT_10BPS_PER_SIDE] {
         let cfg = cert.apply_to(&sleeve_config(&fx.sleeves["S3"].key, cost)).unwrap();
         got.push(
-            simulate(&fx.crypto_panel, &FlatUntil::new(CryptoTrendRule::default(), e3), &cfg).unwrap().series_sha256,
+            simulate(fx.crypto_panel(), &FlatUntil::new(CryptoTrendRule::default(), e3), &cfg).unwrap().series_sha256,
         );
     }
     for (name, (want, g)) in ["S1 gross", "S1 net", "S3 gross", "S3 net"].iter().zip(PINNED.iter().zip(&got)) {

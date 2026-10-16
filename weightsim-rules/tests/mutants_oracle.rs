@@ -67,8 +67,8 @@ fn check_s3(m: Mutant, shift: usize, size: f64, include_today: bool) {
     let rows: &SeriesRows = &run.rows;
     assert!(rows.dates.len() > 150, "{}: only {} bars", m.name(), rows.dates.len());
     for (i, &d) in rows.dates.iter().enumerate() {
-        let t = index_of(&fx.crypto_panel, d);
-        let (r, w) = s3_closed_form(&fx.crypto_panel, t, shift, size, include_today);
+        let t = index_of(fx.crypto_panel(), d);
+        let (r, w) = s3_closed_form(fx.crypto_panel(), t, shift, size, include_today);
         assert!((rows.ret[i] - r).abs() <= TOL, "{} {d}: ret {} vs closed form {r}", m.name(), rows.ret[i]);
         let wt = &rows.w_target.as_ref().unwrap()[i];
         let wh = &rows.w_held.as_ref().unwrap()[i];
@@ -107,8 +107,8 @@ fn s3_base_replay_shift_one_is_the_certified_rule() {
     let fx = fixtures();
     let (kd, kr) = parse_returns(PY_KEY_S3_RETURNS);
     for (d, r) in kd.iter().zip(&kr) {
-        let t = index_of(&fx.crypto_panel, *d);
-        let (got, _) = s3_closed_form(&fx.crypto_panel, t, 1, 0.5, true);
+        let t = index_of(fx.crypto_panel(), *d);
+        let (got, _) = s3_closed_form(fx.crypto_panel(), t, 1, 0.5, true);
         assert!((got - r).abs() <= 1e-12, "{d}: {got} vs Python key {r}");
     }
 }
@@ -117,7 +117,7 @@ fn s3_base_replay_shift_one_is_the_certified_rule() {
 fn s3_drifting_subaccounts_never_rebalance_back_to_fifty_fifty() {
     let fx = fixtures();
     let run = run_mutant(&fx, Mutant::S3DriftingSubaccounts).unwrap();
-    let p = &fx.crypto_panel;
+    let p = fx.crypto_panel();
     // two accounts of 0.5; a coin's whole account is invested when its shift-1 signal is on
     let mut e = [0.5f64, 0.5];
     let mut tot = vec![e[0] + e[1]; p.n_bars()];
@@ -244,7 +244,7 @@ fn s1_decisions(p: &Panel, include_current: bool) -> std::collections::BTreeMap<
 
 fn check_s1(m: Mutant, decisions: std::collections::BTreeMap<usize, Vec<f64>>, every_bar: bool) {
     let fx = fixtures();
-    let p = &fx.etf_panel;
+    let p = fx.etf_panel();
     let start_i = *decisions.keys().next().unwrap();
     let rows = ledger(p, &decisions, every_bar, start_i);
     let run = run_mutant(&fx, m).unwrap();
@@ -290,11 +290,11 @@ fn the_plain_ledger_reproduces_the_certified_rule() {
 #[test]
 fn s1_one_bar_late_executes_each_month_end_decision_on_the_next_bar() {
     let fx = fixtures();
-    let dec = s1_decisions(&fx.etf_panel, true);
+    let dec = s1_decisions(fx.etf_panel(), true);
     // ledger start = the first (undelayed) decision bar; every decision moves one bar later
     let start_i = *dec.keys().next().unwrap();
     let late: std::collections::BTreeMap<usize, Vec<f64>> = dec.iter().map(|(i, w)| (i + 1, w.clone())).collect();
-    let rows = ledger(&fx.etf_panel, &late, false, start_i);
+    let rows = ledger(fx.etf_panel(), &late, false, start_i);
     let run = run_mutant(&fx, Mutant::S1OneBarLate).unwrap();
     assert_eq!(run.rows.dates.len(), rows.len());
     let (wt, wh) = (run.rows.w_target.as_ref().unwrap(), run.rows.w_held.as_ref().unwrap());
@@ -302,7 +302,7 @@ fn s1_one_bar_late_executes_each_month_end_decision_on_the_next_bar() {
     assert_eq!(run.rows.ret[0], 0.0);
     assert!(wt[0].iter().all(|&x| x == 0.0) && wh[0].iter().all(|&x| x == 0.0));
     for (i, lr) in rows.iter().enumerate() {
-        assert_eq!(run.rows.dates[i], fx.etf_panel.dates()[lr.bar]);
+        assert_eq!(run.rows.dates[i], fx.etf_panel().dates()[lr.bar]);
         assert!((run.rows.ret[i] - lr.ret).abs() <= TOL, "row {i}");
         for a in 0..5 {
             assert!(
@@ -316,13 +316,13 @@ fn s1_one_bar_late_executes_each_month_end_decision_on_the_next_bar() {
 #[test]
 fn s1_daily_rebalanced_restores_twenty_percent_every_bar() {
     let fx = fixtures();
-    let dec = s1_decisions(&fx.etf_panel, true);
+    let dec = s1_decisions(fx.etf_panel(), true);
     check_s1(Mutant::S1WrongRebalanceMode, dec, true);
 }
 
 #[test]
 fn s1_sma_excludes_current_averages_the_ten_month_ends_before_it() {
     let fx = fixtures();
-    let dec = s1_decisions(&fx.etf_panel, false);
+    let dec = s1_decisions(fx.etf_panel(), false);
     check_s1(Mutant::S1SmaExcludesCurrent, dec, false);
 }
