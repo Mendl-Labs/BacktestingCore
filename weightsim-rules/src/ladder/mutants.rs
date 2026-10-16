@@ -23,18 +23,34 @@
 //! | `momentum_lookback_off_by_one` | the real rule with `L = 125` (`close_(t-125)` instead of `close_(t-126)`) |
 //! | `momentum_half_sizing` | wrapper rule: the rank weights times 0.5 (50% cash) |
 //! | `momentum_equal_weight_not_rank_weight` | the real ranking's eligibility with `1/K` for every eligible instrument instead of `(K+1-r)/(K(K+1)/2)` |
+//!
+//! The mutants of the low-volatility evidence set (Amendment 15 section 6, T4; sleeve `S5`, rule
+//! `low_vol_quintile_tilt_20d`) are listed in [`Mutant::LOWVOL`] (four) and [`Mutant::LOWVOL_EQUIVALENT`] (one):
+//!
+//! | mutant | how it is built here |
+//! |---|---|
+//! | `lowvol_lookahead_peek` | wrapper rule that ranks on volatility computed through the NEXT bar (its own copy of the panel) |
+//! | `lowvol_extra_1day_delay` | configuration: `execution_delay_bars = 1` |
+//! | `lowvol_lookback_off_by_one` | independent rule with a 19-day trailing window instead of 20 |
+//! | `lowvol_top_quintile_not_bottom` | independent rule that holds the HIGHEST-volatility quintile (descending sort) |
+//! | `lowvol_ddof1_not_ddof0` | independent rule with the SAMPLE stdev (ddof = 1). EQUIVALENT to the rule: sample stdev is the population stdev times the constant `sqrt(L / (L - 1))`, identical for every instrument, so the ranking and every weight are the same and NO tier can fail it. It is kept as a replayable mutant (a test proves the equivalence) but is not in the registered list, because a mutant no tier can catch would make the ladder fail by construction. Amendment 15 T4 says such a mutant blocks certification; resolving that is an owner/amendment decision (Amendment 16), never a loosened tier. |
 
 use weightsim::{
     DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
 };
 
-use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK};
+use reference_rules::{
+    low_vol_quintile_tilt::quintile_count, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS,
+    LOW_VOL_QUINTILE_LOOKBACK_DAYS, LOW_VOL_QUINTILE_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+};
 
 use super::checks::SeriesRows;
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
 use super::registry::FixtureSetId;
 use super::runner::{rows_from_sim, run_gross};
-use crate::adapters::{crypto_weights, CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{
+    crypto_weights, CryptoTrendRule, EtfTrendRule, LowVolQuintileTiltAdapter, MomentumRankWeightedRule,
+};
 
 /// The eight mutants, in the order of the amendment's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +69,12 @@ pub enum Mutant {
     S4LookbackOffByOne,
     S4HalfSizing,
     S4EqualWeight,
+    // The low-volatility evidence set (Amendment 15 section 6, T4), in the amendment's order.
+    S5LookaheadPeek,
+    S5ExtraDelay,
+    S5LookbackOffByOne,
+    S5TopQuintileNotBottom,
+    S5Ddof1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +83,8 @@ pub enum MutantSleeve {
     S3,
     /// `momentum_rank_weighted` in the `MomentumEvidence` fixture set.
     S4,
+    /// `low_vol_quintile_tilt_20d` in the `LowVolEvidence` fixture set.
+    S5,
 }
 
 impl MutantSleeve {
@@ -70,6 +94,7 @@ impl MutantSleeve {
             MutantSleeve::S1 => "S1",
             MutantSleeve::S3 => "S3",
             MutantSleeve::S4 => "S4",
+            MutantSleeve::S5 => "S5",
         }
     }
 
@@ -78,6 +103,7 @@ impl MutantSleeve {
             "S1" => Some(MutantSleeve::S1),
             "S3" => Some(MutantSleeve::S3),
             "S4" => Some(MutantSleeve::S4),
+            "S5" => Some(MutantSleeve::S5),
             _ => None,
         }
     }
@@ -104,12 +130,22 @@ impl Mutant {
         Mutant::S4EqualWeight,
     ];
 
+    /// The four low-volatility mutants some tier can fail (sleeve `S5`), in the order of Amendment 15 section 6 (T4)
+    /// with the equivalent fifth removed ([`Mutant::LOWVOL_EQUIVALENT`]).
+    pub const LOWVOL: [Mutant; 4] =
+        [Mutant::S5LookaheadPeek, Mutant::S5ExtraDelay, Mutant::S5LookbackOffByOne, Mutant::S5TopQuintileNotBottom];
+
+    /// The pre-registered low-volatility mutant that is observationally equivalent to the rule (see the module doc):
+    /// it replays, but it is in no set's ladder.
+    pub const LOWVOL_EQUIVALENT: [Mutant; 1] = [Mutant::S5Ddof1];
+
     /// The mutants of one fixture set, in table order: what its ladder runs in Tier IV. [`Mutant::ALL`] is the
     /// legacy set's eight, unchanged.
     pub fn of_set(set: FixtureSetId) -> &'static [Mutant] {
         match set {
             FixtureSetId::Legacy => &Mutant::ALL,
             FixtureSetId::MomentumEvidence => &Mutant::MOMENTUM,
+            FixtureSetId::LowVolEvidence => &Mutant::LOWVOL,
         }
     }
 
@@ -129,6 +165,11 @@ impl Mutant {
             Mutant::S4LookbackOffByOne => "momentum_lookback_off_by_one",
             Mutant::S4HalfSizing => "momentum_half_sizing",
             Mutant::S4EqualWeight => "momentum_equal_weight_not_rank_weight",
+            Mutant::S5LookaheadPeek => "lowvol_lookahead_peek",
+            Mutant::S5ExtraDelay => "lowvol_extra_1day_delay",
+            Mutant::S5LookbackOffByOne => "lowvol_lookback_off_by_one",
+            Mutant::S5TopQuintileNotBottom => "lowvol_top_quintile_not_bottom",
+            Mutant::S5Ddof1 => "lowvol_ddof1_not_ddof0",
         }
     }
 
@@ -140,6 +181,11 @@ impl Mutant {
             | Mutant::S4LookbackOffByOne
             | Mutant::S4HalfSizing
             | Mutant::S4EqualWeight => MutantSleeve::S4,
+            Mutant::S5LookaheadPeek
+            | Mutant::S5ExtraDelay
+            | Mutant::S5LookbackOffByOne
+            | Mutant::S5TopQuintileNotBottom
+            | Mutant::S5Ddof1 => MutantSleeve::S5,
             _ => MutantSleeve::S3,
         }
     }
@@ -161,6 +207,11 @@ impl Mutant {
             Mutant::S4LookbackOffByOne => "trailing return over 125 bars instead of 126",
             Mutant::S4HalfSizing => "rank weights halved, 50% cash",
             Mutant::S4EqualWeight => "1/K for every ranked instrument instead of the linear rank weights",
+            Mutant::S5LookaheadPeek => "ranks on volatility through the next bar's close",
+            Mutant::S5ExtraDelay => "one extra day between decision and fill",
+            Mutant::S5LookbackOffByOne => "19-day trailing volatility window instead of 20",
+            Mutant::S5TopQuintileNotBottom => "holds the highest-volatility quintile instead of the lowest",
+            Mutant::S5Ddof1 => "sample stdev (ddof = 1) instead of population stdev (equivalent: same ranking)",
         }
     }
 }
@@ -416,6 +467,113 @@ impl WeightRule for EqualWeightMomentum {
     }
 }
 
+/// Low-volatility weights from raw close slices (each ending at the decision bar): every instrument with
+/// `lookback + 1` closes is ranked by the standard deviation of its trailing `lookback` simple returns (`ddof` 0 =
+/// population, 1 = sample), ascending, or descending when `descending` is set; ties by ascending ticker; the first
+/// `quintile_count(K)` get `1 / count`. A deliberately independent re-statement of the reference rule, used by the
+/// mutants that need the ranking on data the rule is not given or with one thing changed.
+fn lowvol_weights(
+    universe: &[&'static str],
+    closes: &[&[f64]],
+    lookback: usize,
+    ddof: usize,
+    descending: bool,
+) -> Vec<f64> {
+    let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(universe.len());
+    for (i, c) in closes.iter().enumerate() {
+        if c.len() > lookback {
+            let w = &c[c.len() - 1 - lookback..];
+            let r: Vec<f64> = (1..w.len()).map(|k| w[k] / w[k - 1] - 1.0).collect();
+            let mean = r.iter().sum::<f64>() / r.len() as f64;
+            let ss: f64 = r.iter().map(|x| (x - mean) * (x - mean)).sum();
+            ranked.push((i, (ss / (r.len() - ddof) as f64).sqrt()));
+        }
+    }
+    ranked.sort_by(|a, b| {
+        let by_vol = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+        let by_vol = if descending { by_vol.reverse() } else { by_vol };
+        by_vol.then(universe[a.0].cmp(universe[b.0]))
+    });
+    let held = quintile_count(ranked.len());
+    let mut w = vec![0.0; universe.len()];
+    for (i, _) in ranked.iter().take(held) {
+        w[*i] = 1.0 / held as f64;
+    }
+    w
+}
+
+/// Low-volatility rule with one thing changed: its trailing window (`lookback`), the stdev's `ddof`, or the direction
+/// of the ranking. Everything else (universe, daily schedule, every-bar rebalance) is the real rule's.
+struct LowVolVariant {
+    name: &'static str,
+    lookback: usize,
+    ddof: usize,
+    descending: bool,
+}
+
+impl WeightRule for LowVolVariant {
+    fn id(&self) -> &'static str {
+        self.name
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        &LOW_VOL_QUINTILE_SYMBOLS
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        DecisionSchedule::Daily
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::EveryBar
+    }
+    fn min_history_bars(&self) -> usize {
+        self.lookback + 1
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        let cols: Vec<&[f64]> = (0..h.n_assets()).map(|a| h.closes(a)).collect();
+        Ok(lowvol_weights(&LOW_VOL_QUINTILE_SYMBOLS, &cols, self.lookback, self.ddof, self.descending))
+    }
+}
+
+/// Low-volatility rule that peeks: at the close of bar `t` it ranks on volatility computed through the close of
+/// `t+1`. It holds its own copy of the panel, which is exactly what a leaky rule looks like.
+pub struct PeekLowVol {
+    full: Panel,
+}
+
+impl PeekLowVol {
+    pub fn new(panel: &Panel) -> PeekLowVol {
+        PeekLowVol { full: panel.clone() }
+    }
+}
+
+impl WeightRule for PeekLowVol {
+    fn id(&self) -> &'static str {
+        "mutant_lowvol_lookahead_peek"
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        &LOW_VOL_QUINTILE_SYMBOLS
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        DecisionSchedule::Daily
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::EveryBar
+    }
+    fn min_history_bars(&self) -> usize {
+        LOW_VOL_QUINTILE_LOOKBACK_DAYS + 1
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        let end = self.full.n_bars().min(h.len() + 1);
+        let cols: Vec<&[f64]> = (0..self.full.n_assets()).map(|i| &self.full.closes(i)[..end]).collect();
+        Ok(lowvol_weights(&LOW_VOL_QUINTILE_SYMBOLS, &cols, LOW_VOL_QUINTILE_LOOKBACK_DAYS, 0, false))
+    }
+}
+
 /// Two independent sub-accounts of 0.5 each, invested in a coin (whole account) when its base-run target is on and
 /// never rebalanced back to 50/50. Returns are those of the summed equity, over the sleeve's counted window.
 fn drifting_subaccounts(panel: &Panel, base: &SimResult, key: &SleeveKey) -> Result<SeriesRows, LadderError> {
@@ -531,6 +689,35 @@ pub fn run_mutant_on(panel: &Panel, key: &SleeveKey, m: Mutant) -> Result<Mutant
         }
         Mutant::S4EqualWeight => {
             let rule = EqualWeightMomentum { inner: MomentumRankWeightedRule::default() };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S5LookaheadPeek => from_sim(&run_gross(panel, &PeekLowVol::new(panel), key, 0)?, key),
+        Mutant::S5ExtraDelay => from_sim(&run_gross(panel, &LowVolQuintileTiltAdapter::default(), key, 1)?, key),
+        Mutant::S5LookbackOffByOne => {
+            let rule = LowVolVariant {
+                name: "mutant_lowvol_lookback_off_by_one",
+                lookback: LOW_VOL_QUINTILE_LOOKBACK_DAYS - 1,
+                ddof: 0,
+                descending: false,
+            };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S5TopQuintileNotBottom => {
+            let rule = LowVolVariant {
+                name: "mutant_lowvol_top_quintile_not_bottom",
+                lookback: LOW_VOL_QUINTILE_LOOKBACK_DAYS,
+                ddof: 0,
+                descending: true,
+            };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S5Ddof1 => {
+            let rule = LowVolVariant {
+                name: "mutant_lowvol_ddof1_not_ddof0",
+                lookback: LOW_VOL_QUINTILE_LOOKBACK_DAYS,
+                ddof: 1,
+                descending: false,
+            };
             from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
     }

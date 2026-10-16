@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
-use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS};
+use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS, LOW_VOL_QUINTILE_SYMBOLS};
 use weightsim::{sha256_hex, Date, Panel, PriceSource};
 
 use super::json::{self, Json};
@@ -172,6 +172,7 @@ pub struct Fixtures {
     /// A panel is loaded only when a rule registered in this set runs on it ([`Fixtures::try_panel`]).
     etf_panel: Option<Panel>,
     crypto_panel: Option<Panel>,
+    lowvol_panel: Option<Panel>,
     /// Every answer-key sleeve this set carries, by sleeve code (`S1`, `S3`, ...). Which sleeves exist here is
     /// driven entirely by [`LIBRARY_RULES`] (`load`): adding a registered rule with a new `KeyRef` is enough to add
     /// a new entry, no further edit of this module needed.
@@ -195,6 +196,7 @@ impl Fixtures {
         match spec {
             PanelSpec::Etf => self.etf_panel.as_ref(),
             PanelSpec::Crypto => self.crypto_panel.as_ref(),
+            PanelSpec::LowVol => self.lowvol_panel.as_ref(),
         }
     }
 
@@ -366,6 +368,11 @@ impl Fixtures {
         } else {
             None
         };
+        let lowvol_panel = if runs_on(PanelSpec::LowVol) {
+            Some(source.load(&LOW_VOL_QUINTILE_SYMBOLS).map_err(|e| parse_err("low-vol panel", e))?)
+        } else {
+            None
+        };
 
         let metrics_json =
             json::parse(&text(&contents[F_KEY_METRICS], F_KEY_METRICS)?).map_err(|e| parse_err(F_KEY_METRICS, e))?;
@@ -408,6 +415,7 @@ impl Fixtures {
             verified_files: verified.into_iter().collect(),
             etf_panel,
             crypto_panel,
+            lowvol_panel,
             sleeves,
             expected_mutants,
         })
