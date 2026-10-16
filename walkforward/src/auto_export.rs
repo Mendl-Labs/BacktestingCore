@@ -293,7 +293,7 @@ fn percentiles(values: &[f64]) -> (f64, f64, f64) {
     }
     
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     
     let len = sorted.len();
     let p5_idx = (len as f64 * 0.05) as usize;

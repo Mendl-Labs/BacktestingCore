@@ -51,7 +51,7 @@ pub fn omega_ratio_suite(returns: &[f64], risk_free_rate: f64) -> OmegaRatioSuit
         0.0
     } else {
         let mut sorted = returns.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| a.total_cmp(b));
         sorted[sorted.len() / 2]
     };
     
@@ -95,7 +95,7 @@ pub fn tail_ratio(returns: &[f64], tail_percentile: f64) -> Option<f64> {
     }
     
     let mut sorted = returns.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     
     let lower_idx = ((tail_percentile / 100.0) * sorted.len() as f64).floor() as usize;
     let upper_idx = (((100.0 - tail_percentile) / 100.0) * sorted.len() as f64).floor() as usize;
@@ -136,7 +136,7 @@ pub fn tail_analysis(returns: &[f64]) -> TailAnalysis {
     }
     
     let mut sorted = returns.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     
     let n = sorted.len();
     let idx_1 = (0.01 * n as f64).floor() as usize;

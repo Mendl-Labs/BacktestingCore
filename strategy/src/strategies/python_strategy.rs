@@ -1430,14 +1430,26 @@ result = scan(_source_code)
     /// (the documented/native case), then f64 (the common case in
     /// practice), rounding rather than truncating so floating-point noise
     /// (e.g. `0.9999999999`) doesn't silently drop to 0.
-    fn extract_signal_i8(item: &pyo3::Bound<'_, pyo3::PyAny>) -> i8 {
+    ///
+    /// 2026-09-15: the float64 fix above left one gap -- anything that's
+    /// NEITHER an int NOR a float (a Python string, e.g. a strategy that
+    /// returns `"HOLD"`/`"BUY"`/`"SELL"` instead of numeric codes) still
+    /// silently fell through to `0`. Confirmed live: an AI-generated
+    /// `stat_arb_pairs` strategy returning string signals produced a
+    /// "completed" backtest with 0 trades and no visible error anywhere --
+    /// indistinguishable from a legitimately flat strategy. Unlike the
+    /// float64 case, there is no correct numeric value to coerce a string
+    /// to, so this returns `None` (mirroring `extract_size_f64`'s already-
+    /// correct pattern just below) and the caller surfaces a real error
+    /// instead of a second silent default.
+    fn extract_signal_i8(item: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<i8> {
         if let Ok(v) = item.extract::<i64>() {
-            return v.clamp(-128, 127) as i8;
+            return Some(v.clamp(-128, 127) as i8);
         }
         if let Ok(v) = item.extract::<f64>() {
-            return v.round().clamp(-128.0, 127.0) as i8;
+            return Some(v.round().clamp(-128.0, 127.0) as i8);
         }
-        0
+        None
     }
 
     /// Convert one `compute_position_sizes()` output element to `f64`.
@@ -1472,6 +1484,54 @@ result = scan(_source_code)
             }
         }
         Ok(dict)
+    }
+
+    /// Give a strategy that has no usable SDK `initialize(parameters)` the
+    /// same parameter semantics `BaseStrategy.initialize` provides: keep an
+    /// existing `self.params` dict, seed `parameter_space()` defaults that
+    /// aren't already set, then apply the engine-supplied values on top.
+    /// Best effort -- a class that forbids attribute assignment keeps its
+    /// old (parameterless) behavior, with a warning instead of a failure.
+    fn apply_params_without_sdk_initialize(
+        py: Python<'_>,
+        strategy: &Bound<'_, PyAny>,
+        params: &Bound<'_, PyDict>,
+    ) {
+        const APPLY_PARAMS: &str = r#"
+def _tp_apply_params(obj, parameters):
+    params = getattr(obj, "params", None)
+    if not isinstance(params, dict):
+        params = {}
+    space_fn = getattr(obj, "parameter_space", None)
+    if callable(space_fn):
+        try:
+            space = space_fn()
+        except Exception:
+            space = None
+        if isinstance(space, dict):
+            for key, spec in space.items():
+                if key not in params and isinstance(spec, dict) and "default" in spec:
+                    params[key] = spec["default"]
+    if parameters:
+        params.update(parameters)
+    obj.params = params
+"#;
+        let globals = PyDict::new_bound(py);
+        let result = py
+            .run_bound(APPLY_PARAMS, Some(&globals), None)
+            .and_then(|_| {
+                globals
+                    .get_item("_tp_apply_params")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("_tp_apply_params missing"))
+            })
+            .and_then(|f| f.call1((strategy, params)).map(|_| ()));
+        if let Err(e) = result {
+            log_warn!(
+                STRATEGY_LOGGER,
+                "Strategy has no SDK initialize(parameters); could not apply parameters to self.params: {}",
+                e
+            );
+        }
     }
 
     // ── Derivatives helpers ──────────────────────────────────────────
@@ -1787,17 +1847,30 @@ impl Strategy for PythonStrategy {
         Python::with_gil(|py| {
             let strategy = py_obj.bind(py);
 
-            if !strategy.hasattr("initialize").unwrap_or(false) {
-                return Ok::<(), StrategyError>(());
-            }
-
             let params_dict = Self::params_to_py(py, &parameters).map_err(|e| {
                 StrategyError::ConfigurationError(format!("Parameter conversion error: {}", e))
             })?;
 
-            if let Err(e) = strategy.call_method1("initialize", (params_dict,)) {
+            // 2026-09-16: both malformed shapes used to DROP every
+            // parameter silently -- self.params stayed whatever __init__
+            // left it ({} for the common `__init__(self, params=None)`), so
+            // tuned parameter_space() values never reached compute_signals
+            // and pooled pairs/baskets could never read their per-member
+            // symbol_a/exchange_a identity. Confirmed in production: every
+            // pair_spec() identity rejection in eval-harness baseline
+            // a9772a86 was a plain `class Strategy:` that already read
+            // self.params.get("symbol_a", ...) exactly as instructed, and
+            // switching to self.params["symbol_a"] raised KeyError. Apply
+            // BaseStrategy.initialize()'s own semantics instead.
+            if !strategy.hasattr("initialize").unwrap_or(false) {
+                Self::apply_params_without_sdk_initialize(py, strategy, &params_dict);
+                return Ok::<(), StrategyError>(());
+            }
+
+            if let Err(e) = strategy.call_method1("initialize", (params_dict.clone(),)) {
                 let arity_mismatch = e.to_string().contains("positional argument");
                 if arity_mismatch && strategy.call_method0("initialize").is_ok() {
+                    Self::apply_params_without_sdk_initialize(py, strategy, &params_dict);
                     return Ok(());
                 }
                 return Err(StrategyError::ConfigurationError(format!(
@@ -2376,8 +2449,17 @@ _thread.start_new_thread(_persistent_watchdog, ())
                 };
 
             let mut sigs = Vec::with_capacity(items.len());
-            for item in &items {
-                sigs.push(Self::extract_signal_i8(item));
+            for (i, item) in items.iter().enumerate() {
+                match Self::extract_signal_i8(item) {
+                    Some(v) => sigs.push(v),
+                    None => {
+                        return Err(StrategyError::CalculationError(format!(
+                            "compute_signals() returned a non-numeric value at index {}: {:?} -- \
+                            expected int8 (-1=SELL, 0=HOLD, 1=BUY, 2=CLOSE)",
+                            i, item
+                        )));
+                    }
+                }
             }
 
             log_debug!(
@@ -2755,8 +2837,17 @@ _thread.start_new_thread(_persistent_watchdog, ())
                 };
 
             let mut sigs = Vec::with_capacity(items.len());
-            for item in &items {
-                sigs.push(Self::extract_signal_i8(item));
+            for (i, item) in items.iter().enumerate() {
+                match Self::extract_signal_i8(item) {
+                    Some(v) => sigs.push(v),
+                    None => {
+                        return Err(StrategyError::CalculationError(format!(
+                            "compute_signals_multi_venue() returned a non-numeric value at index {}: {:?} -- \
+                            expected int8 (-1=SELL, 0=HOLD, 1=BUY, 2=CLOSE)",
+                            i, item
+                        )));
+                    }
+                }
             }
 
             log_debug!(
@@ -3541,6 +3632,49 @@ class Strategy(BaseStrategy):
         );
     }
 
+    /// Production eval-harness baseline a9772a86: a plain `class Strategy:`
+    /// (no BaseStrategy, so no `initialize`) with the common
+    /// `__init__(self, params=None)` shape silently lost every engine-
+    /// supplied parameter -- pooled pairs couldn't read their per-member
+    /// identity and `self.params["symbol_a"]` raised KeyError.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn initialize_applies_parameters_to_a_class_without_sdk_initialize() {
+        use crate::Strategy;
+
+        const PLAIN_CLASS_READING_PARAMS: &str = r#"
+import numpy as np
+
+class Strategy:
+    def __init__(self, params=None):
+        self.params = params or {}
+
+    def name(self):
+        return "PlainClassPairs"
+
+    def parameter_space(self):
+        return {"lookback_bars": {"type": "int", "default": 60, "min": 20, "max": 120}}
+
+    def compute_signals(self, prices, volumes, timestamps):
+        # Direct indexing: both the engine-supplied identity and the
+        # declared default must be present.
+        assert self.params["symbol_a"] == "CAD-SGD", self.params
+        assert self.params["lookback_bars"] == 60, self.params
+        return np.zeros(len(prices), dtype=np.int8)
+"#;
+
+        let mut parameters = std::collections::HashMap::new();
+        parameters.insert("symbol_a".to_string(), ParameterValue::String("CAD-SGD".to_string()));
+        let mut strategy = PythonStrategy::new(PLAIN_CLASS_READING_PARAMS.to_string());
+        let init = strategy.initialize(parameters).await;
+        assert!(init.is_ok(), "initialize() failed: {:?}", init.err());
+
+        let signals = strategy
+            .compute_all_signals(&[1.0, 2.0, 3.0], &[1.0; 3], &[0i64; 3], &[], &[], &[])
+            .await;
+        assert!(signals.is_ok(), "parameters were not applied to self.params: {:?}", signals.err());
+    }
+
     /// Regression test for production jobs `9e1ce0e1`/`5db4828c` (2026-07-24):
     /// a strategy whose `compute_signals()` returns a **float64** numpy array
     /// (the default dtype for `np.zeros(n)` when `dtype=np.int8` isn't
@@ -3669,6 +3803,56 @@ class Strategy(BaseStrategy):
             "should deterministically coerce to the alphabetically-first leg \
              (kraken:BTC-USD, sorting before kraken:WBTC-USD) rather than fail outright \
              or pick a leg non-deterministically based on HashMap iteration order",
+        );
+    }
+
+    /// Regression test (2026-09-15): the float64 fix above left one gap --
+    /// a strategy whose `compute_signals()` returns STRINGS instead of
+    /// numeric codes (confirmed live in an AI-generated `stat_arb_pairs`
+    /// strategy: `["HOLD"] * n`, `"BUY"`/`"SELL"`/`"CLOSE"` elsewhere) used
+    /// to fall through `extract_signal_i8`'s old unconditional `0` default,
+    /// producing a "completed" backtest with 0 trades and no error --
+    /// indistinguishable from a legitimately flat strategy. Must now fail
+    /// loudly instead.
+    #[cfg(feature = "python")]
+    #[tokio::test]
+    async fn compute_all_signals_rejects_non_numeric_signal_values() {
+        use crate::Strategy;
+
+        const STRING_SIGNAL_STRATEGY: &str = r#"
+from trading_platform import BaseStrategy
+
+class Strategy(BaseStrategy):
+    def name(self) -> str:
+        return "StringSignalBug"
+
+    def compute_signals(self, prices, volumes, timestamps):
+        # The exact live bug shape -- strings instead of int8 codes.
+        return ["HOLD"] * len(prices)
+"#;
+
+        let mut strategy = PythonStrategy::new(STRING_SIGNAL_STRATEGY.to_string());
+        strategy.initialize(std::collections::HashMap::new()).await.unwrap();
+
+        let signals = strategy
+            .compute_all_signals(
+                &[1.0; 10],
+                &[1.0; 10],
+                &[0i64; 10],
+                &[],
+                &[],
+                &[],
+            )
+            .await;
+
+        assert!(
+            signals.is_err(),
+            "a strategy returning string signals must fail loudly, not silently complete with 0 trades"
+        );
+        let msg = format!("{}", signals.err().unwrap());
+        assert!(
+            msg.contains("non-numeric"),
+            "error message should name the actual problem, got: {msg}"
         );
     }
 

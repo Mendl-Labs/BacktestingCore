@@ -1,0 +1,2 @@
+# Fixtures are pinned by sha256 (MANIFEST.sha256): never let git rewrite line endings.
+* -text

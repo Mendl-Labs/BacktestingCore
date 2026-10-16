@@ -1,0 +1,398 @@
+# Minimal CI for the PURE crates of BacktestingCore (BACKTESTER_TRUTH_DESIGN.md, Stage T1).
+#
+# Core had no CI, so Core PRs were unreviewed by machine. This workflow gates only the pure crates (no pyo3, no
+# database, no network calls in the tests). The Engine's ladder_certification test remains the authoritative
+# certification.
+#
+# weightsim, reference-rules (Stage T2: the decision rules the rebalancer and the backtester both consume),
+# weightsim-rules (Stage T3: the adapters of those rules to the simulator, and the replication-ladder certification) and
+# portfolio-construct (PF2: the shared portfolio-construction specification, zero dependencies) are
+# portfolio-eval (PF5: purged folds, stationary bootstrap, paired marginal test, HAC spanning alpha, DSR, trial ledger,
+# PBO and the committed power table; zero dependencies) are
+# STANDALONE crates (each has its own [workspace] and Cargo.lock, and all are excluded from Core's workspace) because
+# Core's workspace depends on private sibling repos (LoggingEngine) that a hosted runner cannot fetch without a token.
+# reference-rules' real-history goldens are vendor-derived and are not in this public repository: they are env-gated
+# (REFRULES_LADDER_DIR) and print SKIPPED here; the always-on golden tests run on the synthetic fixtures.
+name: core-pure-crates
+
+on:
+  push:
+    branches: [local-dev, master]
+    paths:
+      - "weightsim/**"
+      - "reference-rules/**"
+      - "weightsim-rules/**"
+      - "portfolio-construct/**"
+      - "portfolio-eval/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/core-ci.yml"
+  pull_request:
+    paths:
+      - "weightsim/**"
+      - "reference-rules/**"
+      - "weightsim-rules/**"
+      - "portfolio-construct/**"
+      - "portfolio-eval/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/core-ci.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_TOOLCHAIN: "1.90.0"
+
+concurrency:
+  group: core-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weightsim:
+    name: weightsim (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: weightsim
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, integration, doc)
+        run: cargo test --locked --no-fail-fast
+
+      - name: print the pinned series digests (compare with the aarch64 goldens in tests/determinism.rs)
+        run: cargo test --locked --test determinism series_digests_match_the_pinned_goldens -- --nocapture
+
+      # PF1 (weightsim 0.2, the book simulator): the always-on tests above already ran the synthetic book fixtures, the
+      # one-sleeve identity, the properties and the causality harnesses. The digests of the book runs must equal the
+      # aarch64 goldens (IEEE-exact arithmetic only), and the real-data comparisons against the PF0 book key are env-gated
+      # (WEIGHTSIM_LADDER_DIR, WEIGHTSIM_BOOK_KEY_DIR; vendor-derived files live only in the private Engine repository):
+      # they must print SKIPPED here, never silently pass as if they had run.
+      - name: print the pinned BOOK series digests (compare with the aarch64 goldens in tests/book_causality.rs)
+        run: cargo test --locked --test book_causality series_digests_match_the_pinned_goldens -- --nocapture
+
+      - name: the real-data book tests are skipped here (the owner runs them against the private Engine fixtures)
+        run: |
+          cargo test --locked --test book_key_real --test book_identity -- --nocapture 2>&1 | tee book_real.log
+          grep -q "SKIPPED real_book_matches_the_five_per_bar_key_files_gross_and_net" book_real.log
+          grep -q "SKIPPED real_netting_fixture_matches_the_key_file" book_real.log
+          grep -q "SKIPPED real_one_sleeve_books_reproduce_the_t0_per_bar_files" book_real.log
+          grep -q "SKIPPED real_cadence_modes_reproduce_the_amendment_12_f1_numbers" book_real.log
+          grep -q "SKIPPED real_pinned_ladder_one_sleeve_books_are_bit_identical_to_simulate" book_real.log
+
+      - name: the committed synthetic book fixtures are exactly what gen_book_key.py generates
+        run: |
+          mkdir -p "$RUNNER_TEMP/book_regen"
+          python3 tests/book_fixtures/gen_book_key.py --out "$RUNNER_TEMP/book_regen"
+          for f in tests/book_fixtures/*.csv; do cmp "$f" "$RUNNER_TEMP/book_regen/$(basename "$f")"; done
+
+  weightsim-mutants:
+    name: weightsim mutation power (every mutant must be killed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: weightsim
+    env:
+      WEIGHTSIM_TEST_CMD: cargo test --manifest-path weightsim/Cargo.toml --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+      - name: run every hand-written mutant against the suite
+        run: python3 weightsim/mutants/run_mutants.py
+
+  weightsim-book-mutants:
+    name: weightsim BOOK mutation power (every book mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    needs: weightsim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim
+      - name: every `old` text of the mutant list still matches exactly once
+        run: python3 weightsim/mutants/run_book_mutants.py --check
+      - name: run every hand-written book mutant against the always-on book tests
+        run: python3 weightsim/mutants/run_book_mutants.py
+
+  reference-rules:
+    name: reference-rules (fmt, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: reference-rules
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference-rules
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      # No `clippy -D warnings` gate yet: the crate was moved verbatim from SignalEngine and current clippy flags two
+      # pre-existing lints in src/fx.rs (repeat_vec_with_capacity, manual_is_multiple_of). Fixing them is a source
+      # change, deliberately kept out of the move.
+
+      - name: tests (unit + integration; real-data goldens print SKIPPED, the synthetic goldens run)
+        run: cargo test --locked --no-fail-fast -- --nocapture
+
+      - name: the real-data goldens really are skipped here, and the synthetic ones ran
+        run: |
+          cargo test --locked --test golden --test golden_fx --test golden_synthetic -- --nocapture 2>&1 | tee golden.log
+          grep -q "SKIPPED golden_etf_every_month_end_explicit_mode" golden.log
+          grep -q "synthetic S1 ETF trend (explicit mode): 105/105" golden.log
+
+  reference-rules-mutants:
+    name: reference-rules mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: reference-rules
+    env:
+      REFRULES_TEST_CMD: cargo test --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference-rules
+      - name: run every hand-written mutant against the suite
+        run: python3 reference-rules/mutants/run_mutants.py
+
+  weightsim-rules:
+    name: weightsim-rules (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: weightsim-rules
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim-rules
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, adapters vs the Python key of the synthetic fixture, ladder logic on a synthetic answer key, mutant oracles, negative controls)
+        run: cargo test --locked --no-fail-fast -- --nocapture
+
+      # The real-data ladder needs vendor-derived fixtures that live only in the private Engine repository. They are
+      # env-gated (WEIGHTSIM_RULES_LADDER_DIR) and must print SKIPPED here, never silently pass as if they had run.
+      - name: the real-data ladder is skipped here (the Engine's CI runs it on the committed fixtures)
+        run: |
+          cargo test --locked --test ladder_real -- --nocapture 2>&1 | tee real.log
+          grep -q "SKIPPED real ladder" real.log
+          grep -q "SKIPPED flat-start negative control" real.log
+
+  weightsim-rules-mutants:
+    name: weightsim-rules mutation power (shard ${{ matrix.shard }}/4; every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: weightsim-rules
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      WEIGHTSIM_RULES_TEST_CMD: cargo test --locked --no-fail-fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weightsim-rules
+      # Fails in seconds if any edit anchor is stale, instead of after a full mutation run.
+      - name: check every mutant anchor matches the source
+        run: python3 weightsim-rules/mutants/run_mutants.py --check
+      - name: run this shard of hand-written mutants against the suite
+        run: python3 weightsim-rules/mutants/run_mutants.py --shard ${{ matrix.shard }}/4
+
+  portfolio-construct:
+    name: portfolio-construct (fmt, clippy, tests, zero dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: portfolio-construct
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-construct
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Forbidden edge (design 5.1): a pure crate may depend on nothing but std. `cargo tree` must list only the crate itself.
+      - name: zero dependencies (normal, dev and build)
+        run: |
+          cargo tree --locked -e normal,dev,build --prefix none | tee tree.log
+          test "$(grep -vc '^portfolio-construct ' tree.log)" = "0"
+
+      - name: tests (golden vectors from the planner, hand-computed, properties, ladder oracle, determinism)
+        run: cargo test --locked --no-fail-fast
+
+      - name: print the pinned digests (compare with the aarch64 goldens in tests/determinism.rs)
+        run: cargo test --locked --test determinism digests_match_the_pinned_goldens -- --nocapture
+
+  portfolio-construct-mutants:
+    name: portfolio-construct mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: portfolio-construct
+    env:
+      PORTFOLIO_CONSTRUCT_TEST_CMD: cargo test --manifest-path portfolio-construct/Cargo.toml --locked --no-fail-fast -- --skip digests_match_the_pinned_goldens
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-construct
+      - name: every mutant edit applies exactly once
+        run: python3 portfolio-construct/mutants/run_mutants.py --validate
+      - name: run every hand-written mutant against the suite
+        run: python3 portfolio-construct/mutants/run_mutants.py
+
+  portfolio-eval:
+    name: portfolio-eval (fmt, clippy, tests, power table)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: portfolio-eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-eval
+
+      - name: fmt
+        run: cargo fmt -- --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests (unit, integration, hand-computed references, property tests, determinism, pinned reduced Monte Carlo)
+        run: cargo test --locked --no-fail-fast
+
+      # The committed POWER_TABLE.md must be exactly what the code generates, on this platform too (the crate uses no
+      # libm, so x86_64 and aarch64 give the same bits). About 40 s in release on two cores.
+      - name: the committed power table regenerates byte for byte
+        run: cargo test --release --locked --test power_table -- --ignored --nocapture
+
+  portfolio-eval-mutants:
+    name: portfolio-eval mutation power (every mutant must be killed by the always-on tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: portfolio-eval
+    env:
+      PORTFOLIO_EVAL_TEST_CMD: cargo test --manifest-path portfolio-eval/Cargo.toml --locked
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: portfolio-eval
+      - name: run every hand-written mutant against the suite
+        run: python3 portfolio-eval/mutants/run_mutants.py
+
+  dependency-audit:
+    # Runs `cargo audit` against each standalone pure crate's own Cargo.lock (they are excluded
+    # from the root [workspace] in Cargo.toml and vendor their own lockfiles, so they must each be
+    # audited individually; the root workspace's Cargo.lock is covered by Dependabot directly).
+    name: dependency audit (cargo-audit, one standalone crate's lockfile at a time)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - weightsim
+          - reference-rules
+          - weightsim-rules
+          - portfolio-construct
+          - portfolio-eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit (${{ matrix.crate }})
+        working-directory: ${{ matrix.crate }}
+        run: cargo audit --file Cargo.lock

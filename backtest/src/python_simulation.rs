@@ -25,7 +25,8 @@ use strategy::traits::{
 use strategy::Strategy; // trait import — required for .initialize() / .generate_signals()
 use strategy::executor::{self, StrategyExecutor, ExecutionTier};
 
-use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel};
+use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel, PerBarWeights};
+use crate::per_bar_weights::PerBarWeightTracker;
 use crate::python_validation::OptionSpreadLeg;
 use crate::rolling_window::RollingWindow;
 use genetic::adaptive_sampling::StableRegionDetector;
@@ -270,6 +271,21 @@ fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &D
 /// account-level `risk_manager` drawdown gate is the applicable backstop
 /// instead). `false` for futures/perps (2026-09-02 fix): unlike options,
 /// they use the exact leveraged-margin accounting `is_liquidated` models.
+/// Where a liquidation fills once a position's isolated-margin level has
+/// been breached intrabar: the level itself, clamped to the bar's traded
+/// range. A bar that gapped entirely past the level fills at the nearest
+/// price that bar actually traded (its high for a long, its low for a
+/// short). Filling at the bar's CLOSE instead -- the previous behavior --
+/// let a daily bar sit far past the level and book a loss several times
+/// the posted margin, which is precisely what a liquidation exists to
+/// prevent. `fallback` is used when the bar has no OHLC (tick data).
+fn liquidation_fill_price(liq_level: f64, high_low: Option<(f64, f64)>, fallback: f64) -> f64 {
+    match high_low {
+        Some((high, low)) if low <= high => liq_level.max(low).min(high),
+        _ => fallback,
+    }
+}
+
 fn is_exempt_from_leverage_liquidation_check(position: &portfoliomanager::Position) -> bool {
     position.close_time.is_some()
         || position.instrument.as_ref().map(|i| i.instrument_kind.is_option()).unwrap_or(false)
@@ -297,6 +313,46 @@ pub async fn run_sim_ticks(
     config: PythonSimConfig,
 ) -> Result<PythonSimResult> {
     run_with_input(MarketDataInput::SimTicks { ticks, symbol, exchange }, config).await
+}
+
+/// Compute a strategy's `compute_features()` output over `data` with NO
+/// trading simulation -- no signals, no fills, no portfolio, no walk-forward.
+/// The rule-first discovery flow's signal-test stage uses this to check
+/// whether a strategy's underlying feature predicts forward returns at all
+/// before spending a single real backtest on it: build the executor exactly
+/// as `run_with_input` does, extract the same price/volume/timestamp arrays
+/// `compute_all_features` expects, and return whatever the strategy computes
+/// alongside the aligned prices/timestamps a caller needs to build forward
+/// returns from. `Ok((None, ..))` when the strategy has no `compute_features()`
+/// override (not an error -- see `compute_all_features`'s own contract) or
+/// when the hook is disabled via `ENABLE_COMPUTE_FEATURES=0`.
+pub async fn compute_strategy_features(
+    python_source: &str,
+    parameters: HashMap<String, ParameterValue>,
+    data: &[MarketData],
+) -> Result<(Option<HashMap<String, Vec<f64>>>, Vec<f64>, Vec<i64>)> {
+    if data.is_empty() {
+        anyhow::bail!("No market data provided for feature computation");
+    }
+    let (mut executor, _tier_analysis) = executor::build_executor(python_source, parameters)
+        .await
+        .context("Failed to build strategy executor")?;
+
+    let mut prices = Vec::with_capacity(data.len());
+    let mut volumes = Vec::with_capacity(data.len());
+    let mut timestamps = Vec::with_capacity(data.len());
+    for md in data {
+        let (p, v, ts) = extract_price_volume_ts(md);
+        prices.push(p);
+        volumes.push(v);
+        timestamps.push(ts.timestamp_millis());
+    }
+
+    let (features, error) = executor.compute_all_features(&prices, &volumes, &timestamps).await;
+    if let Some(e) = error {
+        log_warn!(BACKTEST_LOGGER, "compute_features() failed in compute_strategy_features: {}", e);
+    }
+    Ok((features, prices, timestamps))
 }
 
 async fn run_with_input(
@@ -382,9 +438,16 @@ async fn run_with_input(
     let adverse_selection = config.backtest_config.trading.adverse_selection;
     let fill_volume_fraction = config.backtest_config.trading.fill_volume_fraction;
     let synthetic_book_cfg = if config.backtest_config.trading.use_synthetic_book {
+        // Bar length from the candles' own timestamps, not a config field:
+        // the book's volatility-widening term is scaled by it (see
+        // `SyntheticBookConfig::bar_minutes`), and a mislabelled interval
+        // would silently mis-price every fill.
+        let bar_minutes = median_candle_spacing_minutes(&input).unwrap_or(crate::synthetic_book::REFERENCE_BAR_MINUTES);
+        log_info!(BACKTEST_LOGGER, "Synthetic book: {:.0}-minute bars (median candle spacing)", bar_minutes);
         Some(SyntheticBookConfig {
             spread_bps: config.backtest_config.trading.synthetic_spread_bps,
             depth_levels: config.backtest_config.trading.synthetic_depth_levels,
+            bar_minutes,
             ..Default::default()
         })
     } else {
@@ -398,6 +461,14 @@ async fn run_with_input(
         1
     };
     let equity_capacity = (input.len() / equity_sample_interval) + 100;
+
+    // W3.5: opt-in per-bar held weights, sampled at exactly the equity curve's sample points
+    // (see `crate::per_bar_weights`). `None` (the default) leaves the result untouched.
+    let mut per_bar_weights: Option<PerBarWeightTracker> = if config.backtest_config.analysis.export_per_bar_weights {
+        Some(PerBarWeightTracker::new(input_symbol(&input), equity_capacity))
+    } else {
+        None
+    };
 
     // Tracking state
     let mut equity_curve: Vec<f64> = Vec::with_capacity(equity_capacity);
@@ -675,6 +746,11 @@ async fn run_with_input(
     // into a `SignalCounts` after the dispatch loop completes (see below).
     let mut signal_counts = signal_counts;
     let risk_free_rate = config.backtest_config.trading.risk_free_rate;
+    // See `BacktestConfig::warmup_bars`: the strategy's vectorized signals
+    // were computed over the WHOLE slice above (so lookback indicators are
+    // warm by the time trading starts), but nothing is traded or recorded
+    // before this index.
+    let warmup_bars = config.backtest_config.warmup_bars.min(total_ticks);
 
     for (tick_idx, data_cow) in input.iter().enumerate() {
         let data = &*data_cow;
@@ -683,11 +759,14 @@ async fn run_with_input(
         if current_price <= 0.0 {
             continue;
         }
+        last_price = current_price;
+        price_series.push(current_price);
+        if tick_idx < warmup_bars {
+            continue;
+        }
         if first_price.is_none() {
             first_price = Some(current_price);
         }
-        last_price = current_price;
-        price_series.push(current_price);
 
         // Update MAE/MFE for all open positions, reading side/entry price
         // from the portfolio's own real ledger (correct for shorts) rather
@@ -940,59 +1019,104 @@ async fn run_with_input(
         // leveraged-margin accounting `is_liquidated` models (real
         // `margin_posted`, same `entry_price`/`leverage` semantics as a
         // plain leveraged spot position), so they're no longer exempt.
-        if leverage > 1.0 {
+        // Also runs at 1x whenever a SHORT is open: a 1x short's posted
+        // margin is exhausted once price doubles against it, and
+        // `margin::liquidation_price` now yields that level (previously
+        // INFINITY, letting unleveraged shorts lose several hundred percent
+        // of capital). 1x longs still never trigger (level 0.0).
+        let has_open_short = portfolio.positions.iter()
+            .any(|p| p.close_time.is_none() && p.side == PositionSide::Short);
+        if leverage > 1.0 || has_open_short {
             let ohlc = extract_candle_ohlcv(data);
-            let triggered = portfolio.positions.iter().any(|p| {
-                if is_exempt_from_leverage_liquidation_check(p) {
-                    return false;
-                }
-                let intrabar_extreme = match (p.side, ohlc) {
-                    (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
-                    (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
-                    (_, None) => current_price,
-                };
-                portfoliomanager::margin::is_liquidated(
-                    intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
-                )
-            });
-            if triggered {
-                let equity = portfolio.equity_at(current_price);
-                let margin_used = portfolio.margin_used();
-                let maintenance_margin = portfoliomanager::margin::maintenance_margin(
-                    portfolio.net_position.abs() * current_price,
-                    maintenance_margin_ratio,
-                );
-                if matches!(
-                    riskmanager::check_margin(equity, margin_used, maintenance_margin),
-                    riskmanager::RiskAction::CloseAllPositions(_)
-                ) {
-                    let liquidation_side = if portfolio.net_position > 0.0 {
-                        portfoliomanager::PositionSide::Long
-                    } else {
-                        portfoliomanager::PositionSide::Short
+            // Two independent triggers, either of which liquidates:
+            //  1. Per-position isolated-margin level breached intrabar
+            //     (`is_liquidated`). `breached_level` is the FIRST level
+            //     price would have hit this bar -- the highest for longs,
+            //     the lowest for shorts -- and is where the fill books.
+            //  2. Account-level margin call (`check_margin`: equity at or
+            //     below maintenance margin).
+            // These were previously ANDed. At high leverage that made (1)
+            // unreachable in practice -- the level breach fired but the
+            // account check (maintenance margin is 0.5% of notional) only
+            // confirmed once equity was already near zero, so a 100x
+            // position rode a daily bar straight through zero and booked a
+            // loss several times its posted margin. A liquidation exists
+            // precisely to cap the loss at the margin; see
+            // `liquidation_fill_price` for the fill.
+            let breached_level: Option<(f64, portfoliomanager::PositionSide)> = portfolio.positions.iter()
+                .filter(|p| !is_exempt_from_leverage_liquidation_check(p))
+                .filter_map(|p| {
+                    let intrabar_extreme = match (p.side, ohlc) {
+                        (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
+                        (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
+                        (_, None) => current_price,
                     };
-                    let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
-                        current_price, liquidation_side, liquidation_penalty_bps,
-                    );
-                    log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, liq_exit_price);
-                    close_all_positions(
-                        &mut portfolio,
-                        liq_exit_price,
-                        &mut total_commission,
-                        taker_fee,
-                        &mut num_trades,
-                        &mut trade_returns,
-                        &mut trade_maes,
-                        &mut trade_log,
-                        &mut open_lot_meta,
-                        max_trade_log_size,
-                        timestamp,
-                        slippage_bps,
-                        ohlc,
-                        synthetic_book_cfg.as_ref(),
-                        "margin_call_liquidation",
-                    );
-                }
+                    portfoliomanager::margin::is_liquidated(
+                        intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
+                    ).then(|| (
+                        portfoliomanager::margin::liquidation_price(p.entry_price, p.side, leverage, maintenance_margin_ratio),
+                        p.side,
+                    ))
+                })
+                .fold(None, |best, (level, side)| match best {
+                    None => Some((level, side)),
+                    Some((best_level, best_side)) => {
+                        let first_hit = match side {
+                            portfoliomanager::PositionSide::Long => level > best_level,
+                            portfoliomanager::PositionSide::Short => level < best_level,
+                        };
+                        Some(if first_hit { (level, side) } else { (best_level, best_side) })
+                    }
+                });
+            let equity = portfolio.equity_at(current_price);
+            let margin_used = portfolio.margin_used();
+            let maintenance_margin = portfoliomanager::margin::maintenance_margin(
+                portfolio.net_position.abs() * current_price,
+                maintenance_margin_ratio,
+            );
+            let account_margin_call = matches!(
+                riskmanager::check_margin(equity, margin_used, maintenance_margin),
+                riskmanager::RiskAction::CloseAllPositions(_)
+            );
+            if breached_level.is_some() || account_margin_call {
+                let liquidation_side = if portfolio.net_position > 0.0 {
+                    portfoliomanager::PositionSide::Long
+                } else {
+                    portfoliomanager::PositionSide::Short
+                };
+                let fill_basis = match breached_level {
+                    Some((level, _)) => liquidation_fill_price(level, ohlc.map(|(_, high, low, _)| (high, low)), current_price),
+                    None => current_price,
+                };
+                let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
+                    fill_basis, liquidation_side, liquidation_penalty_bps,
+                );
+                log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} level_breached={:?} account_call={} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, breached_level.map(|(l, _)| l), account_margin_call, liq_exit_price);
+                close_all_positions(
+                    &mut portfolio,
+                    liq_exit_price,
+                    &mut total_commission,
+                    taker_fee,
+                    &mut num_trades,
+                    &mut trade_returns,
+                    &mut trade_maes,
+                    &mut trade_log,
+                    &mut open_lot_meta,
+                    max_trade_log_size,
+                    timestamp,
+                    slippage_bps,
+                    // NOT `ohlc`: with a bar and a synthetic-book config,
+                    // `execute_taker_fill` rebuilds the fill from a book
+                    // anchored at the bar's CLOSE and ignores the price it
+                    // was given. A liquidation is an intrabar event at a
+                    // known level -- on a bar that breached the level and
+                    // then rallied, the close-anchored fill booked the
+                    // "liquidation" as a PROFIT (confirmed live). Passing
+                    // no bar makes the fill honor `liq_exit_price`.
+                    None,
+                    synthetic_book_cfg.as_ref(),
+                    "margin_call_liquidation",
+                );
             }
         }
 
@@ -1002,6 +1126,9 @@ async fn run_with_input(
                 let eq = portfolio.equity_at(current_price);
                 equity_curve.push(eq);
                 equity_curve_timestamps.push(timestamp.timestamp_millis());
+                if let Some(t) = per_bar_weights.as_mut() {
+                    t.sample(&portfolio, current_price, eq, timestamp.timestamp_millis());
+                }
             }
             continue;
         }
@@ -1473,6 +1600,9 @@ async fn run_with_input(
         if tick_idx % equity_sample_interval == 0 || tick_idx == total_ticks - 1 {
             equity_curve.push(total_value);
             equity_curve_timestamps.push(timestamp.timestamp_millis());
+            if let Some(t) = per_bar_weights.as_mut() {
+                t.sample(&portfolio, current_price, total_value, timestamp.timestamp_millis());
+            }
         }
 
         // -- Progress callback --
@@ -1553,6 +1683,7 @@ async fn run_with_input(
             volume_constrained_fills,
             config.option_instrument.as_ref(),
             config.option_spread.as_deref(),
+            per_bar_weights.map(PerBarWeightTracker::finish),
         ),
         total_commission,
         pending_limits_at_end: pending_limits.len(),
@@ -1663,7 +1794,7 @@ fn extract_price_volume_ts(data: &MarketData) -> (f64, f64, DateTime<Utc>) {
 /// real candle (trades / generic ticks without OHLC columns) the bar
 /// degenerates to the tick price — open=high=low=close=price — so close-bar
 /// behavior is preserved while candle datasets surface true OHLC.
-fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
+pub(crate) fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
     match data {
         MarketData::Trade(t) => (
             t.price, t.price, t.price, t.price,
@@ -1846,6 +1977,35 @@ fn i8_to_signals(
         2  => vec![Signal::close("bulk", SignalStrength::Medium, reason).with_price(price)],
         _  => Vec::new(), // HOLD or any unknown code
     }
+}
+
+/// Median spacing between consecutive candles, in minutes. Median rather than
+/// mean so weekend/holiday gaps (FX, equities) don't stretch a daily series'
+/// estimate. `None` when the input has fewer than two candles (tick data
+/// never builds a synthetic book, see `extract_candle_ohlcv`). Samples at
+/// most the first 1,000 gaps -- the spacing is uniform by construction, and
+/// this runs once per simulation.
+fn median_candle_spacing_minutes(input: &MarketDataInput<'_>) -> Option<f64> {
+    let mut prev: Option<DateTime<Utc>> = None;
+    let mut gaps: Vec<f64> = Vec::new();
+    for data in input.iter() {
+        let MarketData::Candle(c) = &*data else { continue };
+        if let Some(p) = prev {
+            let minutes = (c.timestamp - p).num_seconds() as f64 / 60.0;
+            if minutes > 0.0 {
+                gaps.push(minutes);
+            }
+        }
+        prev = Some(c.timestamp);
+        if gaps.len() >= 1_000 {
+            break;
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    Some(gaps[gaps.len() / 2])
 }
 
 /// Extract candle OHLCV as (close, high, low, volume) if the data is a candle.
@@ -2584,6 +2744,7 @@ fn build_backtest_result(
     volume_constrained_fills: usize,
     option_instrument: Option<&DerivativeMetadata>,
     option_spread: Option<&[OptionSpreadLeg]>,
+    per_bar_weights: Option<PerBarWeights>,
 ) -> BacktestResult {
     // Use actual round-trip percentage returns from trade_log instead of per-fill
     // pseudo-returns in trade_returns (which are just cash flow proportions, not real P&L).
@@ -2726,7 +2887,10 @@ fn build_backtest_result(
 
     let median_trade_return = if !actual_returns.is_empty() {
         let mut sorted = actual_returns.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup (BacktestingEngine's
+        // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+        sorted.sort_by(f64::total_cmp);
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 0 {
             Some((sorted[mid - 1] + sorted[mid]) / 2.0)
@@ -2900,7 +3064,21 @@ fn build_backtest_result(
             None
         },
         option_summary: build_option_summary(option_instrument, option_spread, portfolio),
+        per_bar_weights,
         ..Default::default()
+    }
+}
+
+/// The run's data symbol (column 0 of the per-bar weight export): the sim-ticks symbol, or the first candle's or
+/// trade's symbol of a slice. `None` when the slice carries no symbol at all.
+fn input_symbol(input: &MarketDataInput<'_>) -> Option<String> {
+    match input {
+        MarketDataInput::SimTicks { symbol, .. } => Some(symbol.to_string()),
+        MarketDataInput::Slice(s) => s.iter().find_map(|d| match d {
+            MarketData::Candle(c) => Some(c.symbol.to_string()),
+            MarketData::Trade(t) => Some(t.symbol.to_string()),
+            _ => None,
+        }),
     }
 }
 
@@ -2960,6 +3138,39 @@ fn compute_max_drawdown(equity: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn weekday_daily_candles(n_days: i64) -> Vec<MarketData> {
+        use chrono::{Datelike, TimeZone};
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(); // a Monday
+        (0..n_days)
+            .map(|d| start + Duration::days(d))
+            .filter(|t| t.weekday().num_days_from_monday() < 5)
+            .map(|t| MarketData::Candle(dataloader::Candle {
+                timestamp: t,
+                symbol: "EUR-CHF".into(),
+                exchange: "oanda".into(),
+                open: 0.95, high: 0.952, low: 0.948, close: 0.95,
+                volume: 150_000.0,
+                trade_count: 0,
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn candle_spacing_is_one_day_for_a_weekday_only_daily_series() {
+        // Weekend gaps (3 days, every 5th gap) must not stretch the estimate:
+        // the synthetic book scales its spread by this, see
+        // SyntheticBookConfig::bar_minutes.
+        let candles = weekday_daily_candles(60);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&candles)), Some(1440.0));
+    }
+
+    #[test]
+    fn candle_spacing_is_none_without_two_candles() {
+        let one = weekday_daily_candles(1);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&one)), None);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&[])), None);
+    }
 
     fn mk_trade(pnl: Option<f64>, exit_time: Option<DateTime<Utc>>) -> TradeRecord {
         TradeRecord {
@@ -3580,6 +3791,35 @@ mod tests {
             greeks: None,
             margin_posted: 0.0,
         }
+    }
+
+    // -- liquidation fill price (liquidation_fill_price) --
+
+    #[test]
+    fn liquidation_fill_price_fills_at_the_level_when_the_bar_traded_through_it() {
+        // Long at 100 @ 100x: level 99.5; bar low 98, high 101 -> fill at 99.5,
+        // not at wherever the bar closed.
+        assert_eq!(liquidation_fill_price(99.5, Some((101.0, 98.0)), 98.2), 99.5);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_high_when_the_bar_gapped_below_a_long_level() {
+        // The whole bar traded below the level: best available fill is the
+        // bar's high, never a price above what actually traded.
+        assert_eq!(liquidation_fill_price(99.5, Some((97.0, 95.0)), 96.0), 97.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_low_when_the_bar_gapped_above_a_short_level() {
+        // Short level 100.5; whole bar traded above it -> fill at the bar low.
+        assert_eq!(liquidation_fill_price(100.5, Some((104.0, 102.0)), 103.0), 102.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_falls_back_to_the_current_price_without_ohlc() {
+        assert_eq!(liquidation_fill_price(99.5, None, 98.2), 98.2);
+        // Malformed bar (low > high) is treated like no OHLC rather than panicking.
+        assert_eq!(liquidation_fill_price(99.5, Some((95.0, 97.0)), 98.2), 98.2);
     }
 
     // -- leverage liquidation exemption (is_exempt_from_leverage_liquidation_check) --

@@ -111,6 +111,76 @@ pub struct AnalysisMetadata {
     pub recommendations: Vec<String>,
 }
 
+/// The median (not mean, not first-two-bars) inter-bar timestamp delta, in
+/// seconds, across `market_data`. Extracted from `run_walk_forward_analysis`
+/// (shared verification infra, slice A3,
+/// `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) byte-for-byte
+/// -- same filter (`d > 0`, so a duplicate/out-of-order timestamp never drags
+/// the median down or negative), same sort-and-take-middle, same `0` fallback
+/// for fewer than 2 bars or an all-non-positive series -- purely so this
+/// arithmetic is directly, synchronously testable without a full async
+/// GA/simulation harness. This is the fix for the historical "first two bars"
+/// embargo bug the plan doc names: using only `market_data[0]`/`market_data[1]`
+/// let a single atypical opening gap (a weekend, a listing gap, a data
+/// vendor's first stale tick) silently set the whole run's embargo length.
+pub fn median_inter_bar_delta_secs(market_data: &[MarketData]) -> i64 {
+    if market_data.len() < 2 {
+        return 0;
+    }
+    let extract_ts = |md: &MarketData| match md {
+        MarketData::Candle(c) => c.timestamp,
+        MarketData::Trade(t) => t.timestamp,
+        MarketData::PoolSwap(s) => s.timestamp,
+        MarketData::Generic(g) => chrono::DateTime::from_timestamp_millis(g.timestamp_ms)
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        MarketData::OptionCandle(c) => c.timestamp,
+    };
+    let mut deltas: Vec<i64> = market_data
+        .windows(2)
+        .map(|w| (extract_ts(&w[1]) - extract_ts(&w[0])).num_seconds())
+        .filter(|&d| d > 0)
+        .collect();
+    deltas.sort_unstable();
+    if deltas.is_empty() {
+        0
+    } else {
+        deltas[deltas.len() / 2]
+    }
+}
+
+/// Embargo length, in CALENDAR DAYS, derived from `delta_secs` (the median
+/// inter-bar spacing -- see `median_inter_bar_delta_secs`) and a fixed
+/// 200-bar strategy lookback assumption (`directional_momentum`'s own
+/// longest lookback). Extracted from `run_walk_forward_analysis` (shared
+/// verification infra, slice A3) byte-for-byte, purely for testability --
+/// same formula, same `1..=14`-day clamp, same `delta_secs <= 0` fallback to
+/// `1`.
+///
+/// **This did NOT migrate to `portfolio_eval::folds::purge_embargo_bars`,
+/// and could not, without changing behavior:** the two formulas are
+/// unrelated in both units and design. This one converts a FIXED, hardcoded
+/// bar-count lookback (200) into CALENDAR DAYS via the data's own bar
+/// spacing, capped to an absolute `1..=14`-day band; `purge_embargo_bars`
+/// instead takes `rebalance_interval_bars`/`mean_holding_bars` -- neither of
+/// which this call site has computed or has any real value to supply for --
+/// and returns a BAR count capped at `test_len / 2`, with no absolute-days
+/// ceiling at all. There is no substitution here that both (a) uses the
+/// shared crate's formula and (b) reproduces this function's current
+/// output; inventing one would be new formula logic, not a call-site swap
+/// -- see `run_walk_forward_analysis`'s own doc comment for the fuller
+/// explanation (also, separately, the actual window generation this feeds
+/// into is calendar-date-based, delegated entirely to the `walkforward`
+/// crate, which this slice's scope explicitly forbids touching).
+pub fn resolve_engine_embargo_days(delta_secs: i64) -> i64 {
+    if delta_secs > 0 {
+        let bars_per_day = (86_400_i64 / delta_secs).max(1);
+        let raw = (200_i64 + bars_per_day - 1) / bars_per_day; // ceil(200 / bars_per_day)
+        raw.max(1).min(14)
+    } else {
+        1
+    }
+}
+
 impl BacktestEngine {
     /// Create a new backtesting engine with configuration and a GA fitness
     /// function (used only by the built-in SMA-crossover demo optimizer).
@@ -823,6 +893,26 @@ impl BacktestEngine {
     
     /// Run walk-forward analysis.
     ///
+    /// **Shared verification infra, slice A3
+    /// (`product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) --
+    /// no call-site migration to `portfolio_eval::folds` was made here, and
+    /// none is safe to make under this slice's scope.** The actual fold
+    /// boundary construction below is calendar-date-based, computed entirely
+    /// by `walkforward::WalkForwardAnalyzer::generate_windows()` (this slice's
+    /// scope explicitly forbids touching the `walkforward` crate) -- this
+    /// method itself only computes the CONFIG fed into that call
+    /// (`data_duration_days`/`optimization_days`/`test_days`/`step_size`/
+    /// `embargo_days`), not bar-index fold arithmetic of the kind
+    /// `portfolio_eval::folds` operates on. This method also has no regime
+    /// classification of its own (confirmed: no reference to
+    /// `quant_diagnostics`/`VolatilityRegime` anywhere in this file), matching
+    /// the plan doc's own section 4 risk item 2 anticipation for this exact
+    /// function. The one piece that WAS extracted and tested (not migrated,
+    /// since no compatible target formula exists) is `embargo_days`'s
+    /// derivation -- see `median_inter_bar_delta_secs`/`resolve_engine_embargo_days`'s
+    /// own doc comments just above `impl BacktestEngine` for why even that
+    /// narrower piece has no safe `portfolio_eval::folds` substitute.
+    ///
     /// Each window re-optimizes on its own in-sample (optimization) slice and
     /// is then evaluated on its out-of-sample (test) slice — parameters found
     /// on the FULL dataset are never tested against slices of that same data
@@ -905,31 +995,13 @@ impl BacktestEngine {
         // Capped at 14 days so short WFO windows remain usable.
         // Uses median inter-bar delta (not just first two bars) to avoid atypical opening gaps.
         // delta_secs is hoisted here so it can also drive per-bar risk-free rate in the IR computation below.
-        let delta_secs: i64 = if market_data.len() >= 2 {
-            let extract_ts = |md: &MarketData| match md {
-                MarketData::Candle(c) => c.timestamp,
-                MarketData::Trade(t) => t.timestamp,
-                MarketData::PoolSwap(s) => s.timestamp,
-                MarketData::Generic(g) => chrono::DateTime::from_timestamp_millis(g.timestamp_ms)
-                    .unwrap_or(chrono::DateTime::UNIX_EPOCH),
-                MarketData::OptionCandle(c) => c.timestamp,
-            };
-            let mut deltas: Vec<i64> = market_data.windows(2)
-                .map(|w| (extract_ts(&w[1]) - extract_ts(&w[0])).num_seconds())
-                .filter(|&d| d > 0)
-                .collect();
-            deltas.sort_unstable();
-            if deltas.is_empty() { 0 } else { deltas[deltas.len() / 2] }
-        } else {
-            0
-        };
-        let embargo_days: i64 = if delta_secs > 0 {
-            let bars_per_day = (86_400_i64 / delta_secs).max(1);
-            let raw = (200_i64 + bars_per_day - 1) / bars_per_day; // ceil(200 / bars_per_day)
-            raw.max(1).min(14)
-        } else {
-            1
-        };
+        // Extracted into `median_inter_bar_delta_secs`/`resolve_engine_embargo_days` (shared
+        // verification infra, slice A3) purely so this arithmetic is directly, synchronously
+        // testable -- see those functions' own doc comments for why NEITHER of them could be
+        // migrated to call `portfolio_eval::folds` (this is the honest exception the task
+        // explicitly allows for): this is the exact same formula as before, unchanged.
+        let delta_secs: i64 = median_inter_bar_delta_secs(market_data);
+        let embargo_days: i64 = resolve_engine_embargo_days(delta_secs);
 
         let wf_config = WalkForwardConfig {
             start_date,
@@ -1847,6 +1919,105 @@ mod tests {
         let mut config = BacktestConfig::default();
         config.analysis.mode = mode;
         BacktestEngine::new(config, Arc::new(TestFitnessFunction))
+    }
+
+    // ---------------------------------------------------------------------
+    // median_inter_bar_delta_secs / resolve_engine_embargo_days -- golden
+    // vectors + the two historical bug patterns the plan doc names (shared
+    // verification infra, slice A3,
+    // `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`). No
+    // call-site migration to `portfolio_eval::folds` happened for
+    // `run_walk_forward_analysis` -- see its own doc comment and these two
+    // functions' doc comments for why -- so these tests pin TODAY's real
+    // formula, extracted (not migrated) for testability.
+    // ---------------------------------------------------------------------
+
+    fn daily_candles_with_gap_at(n: usize, gap_index: usize, gap_days: i64) -> Vec<MarketData> {
+        use chrono::TimeZone;
+        let start = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut ts = start;
+        (0..n)
+            .map(|i| {
+                let this_ts = ts;
+                ts = if i + 1 == gap_index {
+                    ts + chrono::Duration::days(gap_days)
+                } else {
+                    ts + chrono::Duration::days(1)
+                };
+                MarketData::Candle(dataloader::Candle {
+                    timestamp: this_ts,
+                    symbol: "TEST".into(),
+                    exchange: "test".into(),
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.0,
+                    volume: 1000.0,
+                    trade_count: 10,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn golden_median_inter_bar_delta_400_ordinary_daily_bars() {
+        let data = daily_candles_with_gap_at(400, usize::MAX, 1);
+        assert_eq!(median_inter_bar_delta_secs(&data), 86_400);
+    }
+
+    #[test]
+    fn golden_resolve_engine_embargo_days_ordinary_daily_bars() {
+        // bars_per_day = 1 -> ceil(200 / 1) = 200, clamped to 14.
+        assert_eq!(resolve_engine_embargo_days(86_400), 14);
+    }
+
+    #[test]
+    fn golden_resolve_engine_embargo_days_hourly_bars() {
+        // 3600s bars -> 24 bars/day -> ceil(200/24) = 9, within [1, 14].
+        assert_eq!(resolve_engine_embargo_days(3_600), 9);
+    }
+
+    #[test]
+    fn golden_resolve_engine_embargo_days_non_positive_delta_falls_back_to_one() {
+        assert_eq!(resolve_engine_embargo_days(0), 1);
+        assert_eq!(resolve_engine_embargo_days(-100), 1);
+    }
+
+    #[test]
+    fn golden_median_inter_bar_delta_secs_degenerate_inputs() {
+        assert_eq!(median_inter_bar_delta_secs(&[]), 0);
+        assert_eq!(
+            median_inter_bar_delta_secs(&daily_candles_with_gap_at(1, usize::MAX, 1)),
+            0
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Historical bug regression #2 (named in the plan doc): first-two-bars
+    // vs. median embargo. Using only the first inter-bar delta would let a
+    // single atypical opening gap (a weekend, a listing gap) dictate the
+    // WHOLE run's embargo length; the median over every inter-bar delta must
+    // not be swayed by one outlier gap.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn historical_bug_first_two_bars_vs_median_embargo_regression() {
+        // 400 daily bars, but the very FIRST gap (bar 0 -> bar 1) is a
+        // 30-day outlier (e.g. a listing gap) while every other bar is a
+        // normal 1-day spacing. The first-two-bars bug would derive the
+        // embargo from that single 30-day gap; the median must instead see
+        // through it to the true, typical 1-day spacing.
+        let data = daily_candles_with_gap_at(400, 1, 30);
+        let delta = median_inter_bar_delta_secs(&data);
+        assert_eq!(
+            delta, 86_400,
+            "the median inter-bar delta must reflect the TYPICAL 1-day spacing, not the single 30-day opening gap (bug: first-two-bars embargo), got {delta}s"
+        );
+        assert_eq!(
+            resolve_engine_embargo_days(delta),
+            14,
+            "embargo_days derived from the correct (median) delta should match the ordinary-daily-bars golden vector"
+        );
     }
 
     // WalkForwardSummary

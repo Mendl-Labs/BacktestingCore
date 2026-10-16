@@ -1,0 +1,22 @@
+[package]
+name = "weightsim-rules"
+version = "0.1.0"
+edition = "2021"
+description = "Adapters that run the library decision rules (reference-rules) inside the weight-target simulator (weightsim), plus the replication-ladder certification (BACKTESTER_TRUTH_DESIGN.md stage T3)"
+publish = false
+
+# `weightsim` and `reference-rules` are deliberately independent of each other (neither depends on the other, and
+# neither depends on this crate). This crate is the only place that knows both: it adapts the rules to the simulator's
+# `WeightRule` trait and certifies the pair against the pinned answer key.
+[dependencies]
+weightsim = { path = "../weightsim" }
+reference-rules = { path = "../reference-rules" }
+# The rule crate takes chrono dates; the adapter converts weightsim's dependency-free `Date` to and from them. Same
+# specification as `reference-rules` (no default features: no clock, no time zones), so one copy resolves.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# Standalone on purpose (same pattern as `weightsim` and `reference-rules`): NOT a member of the BacktestingCore
+# workspace (root Cargo.toml `exclude`), path dependencies only, so a hosted runner never has to resolve Core's private
+# git dependencies. Consumers depend on it by git revision, e.g.
+#   weightsim-rules = { git = "https://github.com/Mendl-Labs/BacktestingCore", rev = "<sha>" }
+[workspace]

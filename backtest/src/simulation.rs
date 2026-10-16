@@ -1401,7 +1401,7 @@ impl SimulationLoop {
         
         let median_time_to_fill = if !time_to_fill_samples.is_empty() {
             let mut sorted = time_to_fill_samples.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| a.total_cmp(b));
             let mid = sorted.len() / 2;
             if sorted.len() % 2 == 0 && sorted.len() > 1 {
                 (sorted[mid - 1] + sorted[mid]) / 2.0
