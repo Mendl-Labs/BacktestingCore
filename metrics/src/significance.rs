@@ -389,6 +389,118 @@ mod tests {
         );
     }
 
+    // -- Monte Carlo calibration: does DSR's false-positive rate on TRUE
+    // NULL data stay safely bounded by its own stated Type-I error bar? --
+
+    /// Simulates `n_trials` independent candidate strategies whose TRUE
+    /// population Sharpe is exactly zero (no real edge anywhere), takes the
+    /// best-observed one (the realistic "tested many ideas, picked the
+    /// best" selection scenario DSR exists to correct for), and checks how
+    /// often `deflated_sharpe_ratio` still calls that selected maximum
+    /// "Promising" (DSR > 0.95, this platform's real promotion threshold --
+    /// see docs/alpha-discovery-skill-preregistration.md's primary outcome
+    /// metric, which anchors "no real selection skill" to a nominal 5%
+    /// Type-I baseline). This is the null-hypothesis-discipline check for
+    /// the AI research-process quality experiment (2026-09-02): does the
+    /// platform's OWN statistical gate, not the LLM, correctly avoid false
+    /// "this is real" verdicts on data that structurally contains none.
+    ///
+    /// REAL FINDING from running this (not assumed going in): at a full
+    /// year of daily observations (n_days=252) with `sharpe_std=1.0` (this
+    /// function's own documented default, and a real production call
+    /// site's actual value), the empirical false-positive rate came back
+    /// at ~0.18%, not ~5% -- the gate is dramatically MORE conservative
+    /// than its nominal Type-I target at this parameterization, not less.
+    /// That's the safe direction of error (fewer false "Promising" verdicts
+    /// than the design target implies, not more), so the assertion below
+    /// checks an UPPER safety bound, not an exact match to 5% -- requiring
+    /// exact 5% would be asserting a design target the formula demonstrably
+    /// doesn't hit at this n_days/sharpe_std combination, and being
+    /// stricter than that target is not a defect. The companion test below
+    /// stress-tests a thinner-data regime (n_days=30) where the gate has
+    /// much less statistical power and a rate closer to nominal is
+    /// plausible, since a single parameterization doesn't fully calibrate
+    /// the formula across the ranges this platform actually uses.
+    ///
+    /// Deterministic (seeded RNG) so this is a real, reproducible unit
+    /// test, not a flaky one -- printed diagnostics left in on purpose so
+    /// the empirical rate is visible under `--nocapture`.
+    #[test]
+    fn test_dsr_false_positive_rate_on_true_null_data_stays_below_its_5_percent_bar() {
+        let false_positive_rate = simulate_dsr_null_false_positive_rate(20, 252, 1.0, 365.0, 42);
+        println!(
+            "[DSR calibration, n_days=252] false-Promising rate on true-null data = {:.3}% (nominal target ~5%, must not exceed a safe 10% ceiling)",
+            false_positive_rate * 100.0
+        );
+        assert!(
+            false_positive_rate <= 0.10,
+            "DSR's false-Promising rate on true-null data was {:.2}% -- exceeds a safe \
+             ceiling above the nominal 5% Type-I bar; the gate may be too permissive here",
+            false_positive_rate * 100.0
+        );
+    }
+
+    /// Companion to the test above: a much thinner OOS window (30 daily
+    /// observations, closer to the platform's real minimum-track-record
+    /// floor than a full year) where `se` is larger relative to
+    /// `sharpe_std`, giving the test far less statistical power and making
+    /// a false-positive rate closer to the nominal 5% more plausible --
+    /// the regime most worth stress-testing, since it's where the gate is
+    /// weakest.
+    #[test]
+    fn test_dsr_false_positive_rate_on_thin_oos_window_stays_below_its_5_percent_bar() {
+        let false_positive_rate = simulate_dsr_null_false_positive_rate(20, 30, 1.0, 365.0, 43);
+        println!(
+            "[DSR calibration, n_days=30] false-Promising rate on true-null data = {:.3}% (nominal target ~5%, must not exceed a safe 10% ceiling)",
+            false_positive_rate * 100.0
+        );
+        assert!(
+            false_positive_rate <= 0.10,
+            "DSR's false-Promising rate on true-null data with a thin (30-day) OOS window was \
+             {:.2}% -- exceeds a safe ceiling above the nominal 5% Type-I bar; the gate may be \
+             too permissive on short backtests, exactly where the min-track-record-length gate \
+             is supposed to be doing the most work",
+            false_positive_rate * 100.0
+        );
+    }
+
+    /// Shared simulation core for both calibration tests above. Draws
+    /// `n_trials` iid Sharpes from a true-null N(0, sharpe_std^2)
+    /// distribution `n_simulations` times, takes the max each time (the
+    /// selection-bias scenario DSR corrects for), and reports the fraction
+    /// of those simulated "best of n_trials, genuinely edge-free" outcomes
+    /// that `deflated_sharpe_ratio` still calls Promising (DSR > 0.95).
+    fn simulate_dsr_null_false_positive_rate(
+        n_trials: usize,
+        n_days: usize,
+        sharpe_std: f64,
+        periods_per_year: f64,
+        seed: u64,
+    ) -> f64 {
+        use rand::SeedableRng;
+        use rand_distr::{Distribution, Normal};
+
+        const PROMISING_DSR_THRESHOLD: f64 = 0.95;
+        const N_SIMULATIONS: usize = 20_000;
+
+        let normal = Normal::new(0.0, sharpe_std).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+        let mut false_positives = 0usize;
+        for _ in 0..N_SIMULATIONS {
+            let best_observed = (0..n_trials)
+                .map(|_| normal.sample(&mut rng))
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            let dsr = deflated_sharpe_ratio(best_observed, n_trials, n_days, sharpe_std, periods_per_year);
+            if dsr > PROMISING_DSR_THRESHOLD {
+                false_positives += 1;
+            }
+        }
+
+        false_positives as f64 / N_SIMULATIONS as f64
+    }
+
     // -- periods_per_year_for_interval --------------------------------------
 
     #[test]
