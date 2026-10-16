@@ -668,7 +668,7 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
         ),
     );
     if opts.check_canaries {
-        for canary in registry.iter().flat_map(|e| e.canaries.iter()) {
+        for canary in registry.iter_set(fx.set).flat_map(|e| e.canaries.iter()) {
             let (check, centre, tol) = (canary.check, canary.sharpe.0, canary.sharpe.1);
             match mutant_reports.iter().find(|m| m.name == canary.mutant.name()) {
                 Some(m) => col.push(
