@@ -55,7 +55,10 @@ fn the_registry_changes_no_digest_over_the_synthetic_fixtures() {
 #[test]
 fn the_library_table_is_the_certified_rules_in_sleeve_order() {
     let reg = Registry::library();
-    assert_eq!(reg.ids(), vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted", "low_vol_quintile_tilt_20d"]);
+    assert_eq!(
+        reg.ids(),
+        vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted", "low_vol_quintile_tilt_20d"]
+    );
     let legacy: Vec<&str> = reg.iter_set(FixtureSetId::Legacy).map(|r| r.id).collect();
     assert_eq!(legacy, LIBRARY_RULE_IDS.to_vec(), "LIBRARY_RULE_IDS is a view of the legacy set of the registry");
     assert_eq!(reg.len(), 4);

@@ -177,7 +177,11 @@ fn the_ddof1_mutant_is_equivalent_to_the_rule_and_no_tier_can_fail_it() {
     assert_eq!(Mutant::S5Ddof1.sleeve(), MutantSleeve::S5);
     assert!(!Mutant::LOWVOL.contains(&Mutant::S5Ddof1));
     let cmp = against_key(&panel, &key, Mutant::S5Ddof1);
-    assert!(cmp.failed_tiers().is_empty(), "if a tier fails it, the equivalence argument is wrong: {:?}", cmp.failed_tiers());
+    assert!(
+        cmp.failed_tiers().is_empty(),
+        "if a tier fails it, the equivalence argument is wrong: {:?}",
+        cmp.failed_tiers()
+    );
     assert_eq!(cmp.max_abs_w_target_diff, Some(0.0), "the weights are bit-identical");
     assert_eq!(cmp.max_abs_ret_diff, 0.0, "so are the returns");
 }
@@ -186,14 +190,9 @@ fn the_ddof1_mutant_is_equivalent_to_the_rule_and_no_tier_can_fail_it() {
 fn the_lookahead_mutant_leaks_and_the_causality_harnesses_see_it() {
     let panel = lowvol_panel();
     let cfg = SimConfig::default();
-    let honest = weightsim::harness::check_poisoning(
-        &|_p: &Panel| LowVolQuintileTiltAdapter::default(),
-        &panel,
-        &cfg,
-        300,
-        7,
-    )
-    .unwrap();
+    let honest =
+        weightsim::harness::check_poisoning(&|_p: &Panel| LowVolQuintileTiltAdapter::default(), &panel, &cfg, 300, 7)
+            .unwrap();
     assert!(honest.is_clean(), "the honest rule reads no future bar");
     let leaky = weightsim::harness::check_poisoning(&|p: &Panel| PeekLowVol::new(p), &panel, &cfg, 300, 7).unwrap();
     assert!(!leaky.is_clean(), "poisoning the future must change the peeking rule's past");

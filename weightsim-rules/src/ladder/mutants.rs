@@ -40,8 +40,8 @@ use weightsim::{
 };
 
 use reference_rules::{
-    low_vol_quintile_tilt::quintile_count, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS, LOW_VOL_QUINTILE_LOOKBACK_DAYS,
-    LOW_VOL_QUINTILE_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+    low_vol_quintile_tilt::quintile_count, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS,
+    LOW_VOL_QUINTILE_LOOKBACK_DAYS, LOW_VOL_QUINTILE_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 
 use super::checks::SeriesRows;
@@ -132,12 +132,8 @@ impl Mutant {
 
     /// The four low-volatility mutants some tier can fail (sleeve `S5`), in the order of Amendment 15 section 6 (T4)
     /// with the equivalent fifth removed ([`Mutant::LOWVOL_EQUIVALENT`]).
-    pub const LOWVOL: [Mutant; 4] = [
-        Mutant::S5LookaheadPeek,
-        Mutant::S5ExtraDelay,
-        Mutant::S5LookbackOffByOne,
-        Mutant::S5TopQuintileNotBottom,
-    ];
+    pub const LOWVOL: [Mutant; 4] =
+        [Mutant::S5LookaheadPeek, Mutant::S5ExtraDelay, Mutant::S5LookbackOffByOne, Mutant::S5TopQuintileNotBottom];
 
     /// The pre-registered low-volatility mutant that is observationally equivalent to the rule (see the module doc):
     /// it replays, but it is in no set's ladder.
