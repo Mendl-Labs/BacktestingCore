@@ -21,14 +21,14 @@ use std::sync::OnceLock;
 
 use reference_rules::{
     CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
-    ETF_WEIGHT_PER_INSTRUMENT,
+    ETF_WEIGHT_PER_INSTRUMENT, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 
 use super::fixtures::{Fixtures, LadderError, RecordedMetrics, SleeveKey};
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
-use crate::adapters::{CryptoTrendRule, EtfTrendRule};
+use crate::adapters::{CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
 
 /// What a rule's signal reads. The sampling of the signal is the rule's decision schedule ([`CadenceSpec::decision`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,6 +36,9 @@ pub enum SignalSpec {
     /// The close is strictly above the simple average of the last `window` closes sampled on the decision bars (the
     /// current one included).
     CloseAboveSma { window: usize },
+    /// Instruments are ranked by their trailing `lookback`-bar return (`close_t / close_(t-lookback) - 1`), descending,
+    /// ties broken by ascending ticker; an instrument with fewer than `lookback + 1` closes is not ranked.
+    TrailingReturnRank { lookback: usize },
 }
 
 /// Which instruments a rule trades.
@@ -50,6 +53,9 @@ pub enum UniverseSpec {
 pub enum WeightingSpec {
     /// Every instrument whose signal is on gets `weight` of the sleeve; the rest is cash.
     FixedPerInstrument { weight: f64 },
+    /// With `K` ranked instruments, the one at rank `r` (1 = best) gets `(K + 1 - r) / (K (K + 1) / 2)` of the sleeve:
+    /// strictly positive, summing to 1, no cutoff. Instruments that are not ranked get 0 and leave `K`.
+    LinearRank,
 }
 
 /// When the rule decides, and how the book is traded between decisions.
@@ -87,8 +93,8 @@ pub enum FixtureSetId {
     /// `Pins::REAL`. Its ladder digest is covered by the Engine's `CERTIFIED_LADDER_DIGESTS`.
     Legacy,
     /// `replication_ladder_momentum_evidence/` (Amendment 14): the evidence window of
-    /// `etf_cross_sectional_momentum`, pinned on its own. Reserved: no rule is registered in it yet, and
-    /// `Fixtures::load_set` refuses a set with no registered rule.
+    /// `etf_cross_sectional_momentum` (rule `momentum_rank_weighted`, sleeve `S4`), pinned on its own. Its pins are the
+    /// caller's (the Engine's `certified.rs`); they are not constants of this crate.
     MomentumEvidence,
 }
 
@@ -220,8 +226,12 @@ fn make_crypto() -> Box<dyn WeightRule> {
     Box::new(CryptoTrendRule::default())
 }
 
+fn make_momentum() -> Box<dyn WeightRule> {
+    Box::new(MomentumRankWeightedRule::default())
+}
+
 /// The reviewed table. Order matters: it is the order sleeves are run and reported in, which the ladder digest covers.
-pub const LIBRARY_RULES: [RegisteredRule; 2] = [
+pub const LIBRARY_RULES: [RegisteredRule; 3] = [
     RegisteredRule {
         id: "etf_trend_faber",
         spec: RuleSpec {
@@ -274,6 +284,35 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
             },
             Canary { check: "canary.s3_extra_delay_sharpe", mutant: Mutant::S3ExtraDelay, sharpe: CANARY_DELAY_SHARPE },
         ],
+    },
+    // Amendment 14: `etf_cross_sectional_momentum`, in its own fixture set (the evidence window), so the legacy set's
+    // manifest, candles pin and ladder digest are untouched. The lookahead mutant's Sharpe ordering is REPORTED
+    // (Amendment 14 T4), not a pinned number, so there are no Layer C canaries.
+    RegisteredRule {
+        id: "momentum_rank_weighted",
+        spec: RuleSpec {
+            signal: SignalSpec::TrailingReturnRank { lookback: MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK },
+            universe: UniverseSpec::Fixed(&ETF_SYMBOLS),
+            weighting: WeightingSpec::LinearRank,
+            cadence: CadenceSpec { decision: DecisionSchedule::Daily, rebalance: RebalancePolicy::OnDecision },
+            overlay: OverlaySpec::None,
+        },
+        factory: make_momentum,
+        set: FixtureSetId::MomentumEvidence,
+        panel: PanelSpec::Etf,
+        key: KeyRef {
+            sleeve_code: "S4",
+            perbar_file: "key/S4_momentum_rank_weighted_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S4_daily_returns.csv",
+        },
+        mutants: &[
+            Mutant::S4LookaheadPeek,
+            Mutant::S4ExtraDelay,
+            Mutant::S4LookbackOffByOne,
+            Mutant::S4HalfSizing,
+            Mutant::S4EqualWeight,
+        ],
+        canaries: &[],
     },
 ];
 

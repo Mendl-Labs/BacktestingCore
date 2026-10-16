@@ -53,11 +53,12 @@ fn the_registry_changes_no_digest_over_the_synthetic_fixtures() {
 }
 
 #[test]
-fn the_library_table_is_the_two_certified_rules_in_sleeve_order() {
+fn the_library_table_is_the_certified_rules_in_sleeve_order() {
     let reg = Registry::library();
-    assert_eq!(reg.ids(), vec!["etf_trend_faber", "crypto_trend_100d"]);
-    assert_eq!(reg.ids(), LIBRARY_RULE_IDS.to_vec(), "LIBRARY_RULE_IDS is a view of the registry");
-    assert_eq!(reg.len(), 2);
+    assert_eq!(reg.ids(), vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted"]);
+    let legacy: Vec<&str> = reg.iter_set(FixtureSetId::Legacy).map(|r| r.id).collect();
+    assert_eq!(legacy, LIBRARY_RULE_IDS.to_vec(), "LIBRARY_RULE_IDS is a view of the legacy set of the registry");
+    assert_eq!(reg.len(), 3);
     assert!(!reg.is_empty());
     let s1 = reg.get("etf_trend_faber").unwrap();
     let s3 = reg.get("crypto_trend_100d").unwrap();
@@ -92,20 +93,24 @@ fn every_entrys_mutants_are_exactly_its_sleeves_mutants_in_table_order() {
     let mut seen = 0usize;
     for e in reg.iter() {
         let sleeve = e.sleeve().unwrap();
-        let want: Vec<Mutant> = Mutant::ALL.iter().copied().filter(|m| m.sleeve() == sleeve).collect();
+        let want: Vec<Mutant> = Mutant::of_set(e.set).iter().copied().filter(|m| m.sleeve() == sleeve).collect();
         assert_eq!(e.mutants.to_vec(), want, "{}", e.id);
         for c in e.canaries {
             assert!(e.mutants.contains(&c.mutant), "a canary names one of its own rule's mutants");
         }
         seen += e.mutants.len();
     }
-    assert_eq!(seen, Mutant::ALL.len(), "every named mutant belongs to exactly one registered rule");
+    assert_eq!(
+        seen,
+        Mutant::ALL.len() + Mutant::MOMENTUM.len(),
+        "every named mutant belongs to exactly one registered rule"
+    );
 }
 
 #[test]
 fn every_entry_binds_to_the_fixture_set_it_claims() {
     let fx = common::fixtures();
-    for e in Registry::library().iter() {
+    for e in Registry::library().iter_set(FixtureSetId::Legacy) {
         let sf = e.fixture(&fx).unwrap();
         assert_eq!(sf.key.rule_id, e.id);
         assert_eq!(sf.key.code, e.key.sleeve_code);
@@ -258,18 +263,29 @@ fn a_rule_of_another_fixture_set_is_refused_by_a_loaded_set() {
 }
 
 #[test]
-fn loading_a_fixture_set_no_rule_is_registered_in_is_refused_before_any_file_is_read() {
-    let reader = |name: &str| -> Result<Vec<u8>, String> { panic!("no file may be read, asked for {name}") };
-    let pins = Pins { manifest_sha256: "0", candles_sha256: "0" };
-    for set in FixtureSetId::ALL {
-        if Registry::library().iter_set(set).next().is_some() {
-            continue;
-        }
-        match Fixtures::load_set(&reader, pins, set) {
-            Err(LadderError::Inconsistent(m)) => assert!(m.contains("no library rule is registered"), "{m}"),
-            other => panic!("expected an Inconsistent error for {set:?}, got {:?}", other.map(|_| ())),
-        }
+fn a_fixture_set_never_loads_another_sets_files() {
+    // The synthetic LEGACY files carry S1/S3 only: loading them as the momentum set must fail on the missing S4
+    // key (the manifest does not list it), never silently pass or fall back to the legacy sleeves.
+    let (files, ms, cs) = common::ready();
+    let reader = |name: &str| -> Result<Vec<u8>, String> {
+        files.files.get(name).cloned().ok_or_else(|| format!("{name}: not in the synthetic table"))
+    };
+    let pins = Pins { manifest_sha256: ms, candles_sha256: cs };
+    assert!(Fixtures::load_set(&reader, pins, FixtureSetId::Legacy).is_ok());
+    match Fixtures::load_set(&reader, pins, FixtureSetId::MomentumEvidence) {
+        Err(LadderError::Pin(m)) => assert!(m.contains("S4_momentum_rank_weighted_perbar.csv"), "{m}"),
+        other => panic!("expected a Pin error for the missing S4 key, got {:?}", other.map(|_| ())),
     }
+    assert_eq!(
+        required_files_for(FixtureSetId::MomentumEvidence),
+        vec![
+            "ladder_candles.csv",
+            "key/key_metrics.json",
+            "key/mutants.json",
+            "key/S4_momentum_rank_weighted_perbar.csv",
+            "shadow_saved/shadow_S4_daily_returns.csv",
+        ]
+    );
 }
 
 #[test]

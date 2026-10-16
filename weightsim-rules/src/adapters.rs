@@ -23,9 +23,10 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
 use reference_rules::{
-    decide_crypto_trend_with, decide_etf_trend_with, GapPolicy, MonthEndMode, Options, Panel as RrPanel, PriceSeries,
-    RuleError, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
-    ETF_WEIGHT_PER_INSTRUMENT,
+    decide_crypto_trend_with, decide_etf_trend_with, GapPolicy, MomentumRankWeighted, MonthEndMode, Options,
+    Panel as RrPanel, PriceSeries, RankWeightedRanking, RuleError, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS,
+    CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
+    MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, HistoryView, RebalancePolicy, RefusalKind, RuleRefusal, WeightRule};
 
@@ -349,6 +350,78 @@ impl WeightRule for CryptoTrendRule {
     }
     fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
         crypto_weights(&self.universe, self.sma_days, h.dates(), &view_columns(h))
+    }
+}
+
+/// `momentum_rank_weighted` (Amendment 14, library entry `etf_cross_sectional_momentum`): the compiled
+/// `reference_rules::MomentumRankWeighted` over the five ETFs, ranked daily by trailing 126-bar return, every ranked
+/// instrument weighted `(K + 1 - r) / (K (K + 1) / 2)`.
+///
+/// Unlike the trend rules, the reference rule already IS a `WeightRule`, so this adapter only fixes the published
+/// point (`Default`: `ETF_SYMBOLS`, `L = 126`, `DecisionSchedule::Daily`, no execution lag) and stamps the adapter
+/// version on the run like every other certified rule. Everything else is the reference rule's, unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MomentumRankWeightedRule {
+    inner: MomentumRankWeighted,
+}
+
+impl Default for MomentumRankWeightedRule {
+    /// The published point: `ETF_SYMBOLS`, `L = 126`, daily.
+    fn default() -> Self {
+        MomentumRankWeightedRule::new(ETF_SYMBOLS.to_vec(), MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK)
+    }
+}
+
+impl MomentumRankWeightedRule {
+    /// An implementation point: `universe` in column order, trailing `lookback`-bar return, daily decisions.
+    ///
+    /// # Panics
+    /// If `universe` is empty or `lookback` is 0 (the reference rule's own usage errors).
+    pub fn new(universe: Vec<&'static str>, lookback: usize) -> Self {
+        MomentumRankWeightedRule { inner: MomentumRankWeighted::new(universe, lookback, DecisionSchedule::Daily) }
+    }
+    pub fn lookback(&self) -> usize {
+        self.inner.lookback()
+    }
+    /// The typed ranking of the reference rule for this bar (the weights, and which slots lacked history).
+    pub fn ranking(&self, h: &HistoryView<'_>) -> RankWeightedRanking {
+        self.inner.rank(h)
+    }
+}
+
+impl WeightRule for MomentumRankWeightedRule {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn impl_version(&self) -> String {
+        ADAPTER_VERSION.to_string()
+    }
+    fn universe(&self) -> &[&'static str] {
+        self.inner.universe()
+    }
+    /// The four parameters the library entry pins (Amendment 14 section 1, verbatim from the entry's template): the
+    /// reference rule's own `L`, plus the schedule, the rebalance policy and the largest weight any one instrument can
+    /// get (rank 1 of `K`: `K / (K (K + 1) / 2)`), so the entry's parameters bind with no drift in either direction.
+    fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
+        let k = self.inner.universe().len() as f64;
+        BTreeMap::from([
+            ("L", self.inner.lookback().to_string()),
+            ("schedule", "\"daily\"".to_string()),
+            ("rebalance_policy", "\"on_decision\"".to_string()),
+            ("max_weight_per_instrument", (k / (k * (k + 1.0) / 2.0)).to_string()),
+        ])
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        self.inner.decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.inner.rebalance_policy()
+    }
+    fn min_history_bars(&self) -> usize {
+        self.inner.min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        self.inner.target_weights(h)
     }
 }
 
