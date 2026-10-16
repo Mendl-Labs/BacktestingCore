@@ -54,7 +54,7 @@ pub fn volatility_tercile_regimes(returns: &[f64], window: usize) -> Vec<Option<
     if valid_vols.len() < 3 {
         return vec![None; n];
     }
-    valid_vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    valid_vols.sort_by(|a, b| a.total_cmp(b));
     let low_cut = valid_vols[valid_vols.len() / 3];
     let high_cut = valid_vols[(2 * valid_vols.len()) / 3];
 

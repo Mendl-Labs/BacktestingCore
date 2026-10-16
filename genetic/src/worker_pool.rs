@@ -440,7 +440,10 @@ impl WorkerPool {
         // vectorization (Phase 2 vs Phase 3 of the perf plan).
         let mut ds = durations.lock().unwrap().clone();
         if !ds.is_empty() {
-            ds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+            // 2026-09-16 production-incident writeup (BacktestingEngine's
+            // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+            ds.sort_by(f64::total_cmp);
             let pct = |p: f64| -> f64 {
                 let idx = ((ds.len() as f64 - 1.0) * p).round() as usize;
                 ds[idx.min(ds.len() - 1)]

@@ -362,7 +362,7 @@ fn test_var_calculation_concept() {
     ];
     
     let mut sorted_returns = returns.clone();
-    sorted_returns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_returns.sort_by(|a, b| a.total_cmp(b));
     
     // 95th percentile VaR (5th percentile of losses)
     let var_index = (0.05 * sorted_returns.len() as f64) as usize;
@@ -380,7 +380,7 @@ fn test_cvar_calculation_concept() {
     ];
     
     let mut sorted_returns = returns.clone();
-    sorted_returns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_returns.sort_by(|a, b| a.total_cmp(b));
     
     let var_index = (0.05 * sorted_returns.len() as f64) as usize;
     

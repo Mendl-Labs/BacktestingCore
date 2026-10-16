@@ -373,3 +373,83 @@ async fn compute_position_sizes_wrong_length_falls_back_without_failing_backtest
         result.backtest_result.num_trades
     );
 }
+
+// ── W3.5: opt-in per-bar held-weight export (`AnalysisConfig::export_per_bar_weights`) ────
+//
+// Long-only, single asset, explicit whole-book quantities on a flat price so the
+// weight is exactly 1.0 while in position and exactly 0.0 while flat (see
+// `backtest::per_bar_weights` for the semantics: held weight at the close of the
+// bar, after that bar's fills, as a fraction of the equity sampled there).
+
+/// BUY 1000 units at bar 0 and 15, SELL (close) them at bar 10 and 25; nothing else.
+/// At price 100 with initial capital 100,000 the position is the whole book.
+const WHOLE_BOOK_LONG_ONLY_STRATEGY: &str = r#"
+class Strategy:
+    def __init__(self, parameters):
+        self.i = -1
+
+    def on_candle(self, candle, position, portfolio):
+        self.i += 1
+        if self.i in (0, 15):
+            return {"action": "buy", "quantity": 1000.0}
+        if self.i in (10, 25):
+            return {"action": "sell", "quantity": 1000.0}
+        return None
+"#;
+
+fn whole_book_config(export_per_bar_weights: bool) -> PythonSimConfig {
+    let mut config = run_sizing_config(WHOLE_BOOK_LONG_ONLY_STRATEGY.to_string());
+    config.backtest_config.analysis.export_per_bar_weights = export_per_bar_weights;
+    config
+}
+
+#[tokio::test]
+async fn per_bar_weights_are_one_in_position_and_zero_flat_for_a_long_only_single_asset() {
+    let market_data = generate_flat_data(30, 100.0);
+    let result = python_simulation::run(&market_data, whole_book_config(true))
+        .await
+        .expect("simulation with per-bar weight export should succeed");
+    let br = &result.backtest_result;
+    assert!(br.num_trades >= 2, "the fixture must trade, got {} trades", br.num_trades);
+    let w = br.per_bar_weights.as_ref().expect("per_bar_weights is exported when the option is on");
+
+    // One row per equity sample, same timestamps.
+    assert_eq!(w.rows.len(), br.equity_curve.len());
+    assert_eq!(w.timestamps, br.equity_curve_timestamps);
+    assert_eq!(w.symbols.len(), 1, "a single-asset run has one column: {:?}", w.symbols);
+
+    // In position on bars 0..=9 and 15..=24, flat on 10..=14 and 25..=29.
+    for (bar, row) in w.rows.iter().enumerate() {
+        let weight = row[0];
+        let in_position = (0..=9).contains(&bar) || (15..=24).contains(&bar);
+        if in_position {
+            assert!(
+                (weight - 1.0).abs() < 2e-2,
+                "bar {bar}: expected the whole book (1.0), got {weight}"
+            );
+        } else {
+            assert_eq!(weight, 0.0, "bar {bar}: expected flat (exactly 0.0), got {weight}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn per_bar_weights_off_changes_nothing_in_the_result() {
+    let market_data = generate_flat_data(30, 100.0);
+    let off = python_simulation::run(&market_data, whole_book_config(false))
+        .await
+        .expect("simulation should succeed")
+        .backtest_result;
+    assert!(off.per_bar_weights.is_none(), "off is the default: nothing is exported");
+    let off_json = serde_json::to_string(&off).unwrap();
+    assert!(!off_json.contains("per_bar_weights"), "the field is absent from the serialised result");
+
+    // The same run with the option on differs ONLY by the exported field.
+    let mut on = python_simulation::run(&market_data, whole_book_config(true))
+        .await
+        .expect("simulation should succeed")
+        .backtest_result;
+    assert!(on.per_bar_weights.is_some());
+    on.per_bar_weights = None;
+    assert_eq!(serde_json::to_string(&on).unwrap(), off_json);
+}

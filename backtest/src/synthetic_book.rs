@@ -40,7 +40,29 @@ pub struct SyntheticBookConfig {
     /// model (`RealismConfig::spread_cap_bps`), which has always capped its
     /// own equivalent range-derived spread term for the same reason.
     pub max_volatility_widening_bps: f64,
+    /// Duration of the candles this book is built from, in minutes
+    /// (default: 1.0). The volatility-widening term reads the candle's
+    /// high-low range, and a range grows with the square root of the time it
+    /// spans while a bid-ask spread does not -- so the range is rescaled to
+    /// its `REFERENCE_BAR_MINUTES` equivalent before it widens the spread.
+    ///
+    /// Without this, a DAILY bar's range (a whole day of price movement,
+    /// ~0.5% on an FX major) was read as if it were the spread at the moment
+    /// of the fill: the widening term sat at or near its 50 bps cap on most
+    /// daily bars, charging ~106 bps per round trip (median) on pairs whose
+    /// real spread is ~1 bp. Confirmed 2026-09-19 by replaying a production
+    /// robustness job's stored strategy independently on the same bars: the
+    /// replay reproduced the platform's per-asset dollar P&L to within cents
+    /// (EUR-CHF -$23.99 vs -$23.90) and its 10.5% win rate (11.0%), against a
+    /// 35.6% win rate before costs. The 50 bps cap above treated the USD-TRY
+    /// symptom of this; the cause was the missing horizon scaling.
+    pub bar_minutes: f64,
 }
+
+/// The bar length the volatility-widening term is calibrated to: a candle's
+/// range is rescaled to what it would be over this many minutes (a fill is
+/// an instantaneous event, so the relevant volatility is short-horizon).
+pub const REFERENCE_BAR_MINUTES: f64 = 1.0;
 
 impl Default for SyntheticBookConfig {
     fn default() -> Self {
@@ -50,6 +72,7 @@ impl Default for SyntheticBookConfig {
             depth_decay: 0.5,
             volatility_multiplier: 2.0,
             max_volatility_widening_bps: 50.0,
+            bar_minutes: REFERENCE_BAR_MINUTES,
         }
     }
 }
@@ -84,9 +107,13 @@ impl SyntheticOrderBook {
         volume: f64,
         config: &SyntheticBookConfig,
     ) -> Self {
-        // Intrabar volatility as ratio of range to close
+        // Intrabar volatility as ratio of range to close, rescaled from the
+        // candle's own duration to REFERENCE_BAR_MINUTES by sqrt(time) -- see
+        // `SyntheticBookConfig::bar_minutes`. Bars at or below the reference
+        // length are left unscaled (never widened).
+        let horizon_scale = (config.bar_minutes / REFERENCE_BAR_MINUTES).max(1.0).sqrt();
         let intrabar_range_ratio = if close > 0.0 {
-            (high - low) / close
+            (high - low) / close / horizon_scale
         } else {
             0.0
         };
@@ -278,6 +305,49 @@ mod tests {
         // 10x order should have ~sqrt(10) ≈ 3.16x impact
         let ratio = impact_large / impact_small;
         assert!(ratio > 2.5 && ratio < 4.0, "sqrt-law check: ratio={:.2}", ratio);
+    }
+
+    /// Round-trip cost of crossing the book, in bps of mid.
+    fn round_trip_bps(book: &SyntheticOrderBook) -> f64 {
+        (book.best_ask - book.best_bid) / book.mid_price * 10_000.0
+    }
+
+    #[test]
+    fn daily_fx_major_bar_round_trip_cost_is_a_few_bps_not_a_percent() {
+        // Regression test for 2026-09-19: an EUR-CHF-like daily bar (0.5%
+        // high-low range) was charged ~105 bps per round trip because the
+        // whole day's range was read as the spread at the fill.
+        let daily = SyntheticBookConfig { bar_minutes: 1440.0, ..SyntheticBookConfig::default() };
+        let book = SyntheticOrderBook::from_candle(0.95, 0.95 * 1.0025, 0.95 * 0.9975, 150_000.0, &daily);
+        let rt = round_trip_bps(&book);
+        assert!(rt < 10.0, "daily FX-major round trip should cost a few bps, got {rt:.2} bps");
+        // Still at least the configured base spread -- the fix narrows the
+        // volatility term, it does not remove costs.
+        assert!(rt >= daily.spread_bps - 1e-9, "round trip {rt:.2} bps fell below the {} bps base spread", daily.spread_bps);
+    }
+
+    #[test]
+    fn same_candle_is_charged_less_the_longer_the_bar_it_spans() {
+        // A fixed range spread over more time is less volatility per unit
+        // time; the widening term must be non-increasing in bar length.
+        let candle = |minutes: f64| {
+            let cfg = SyntheticBookConfig { bar_minutes: minutes, ..SyntheticBookConfig::default() };
+            round_trip_bps(&SyntheticOrderBook::from_candle(100.0, 100.3, 99.7, 1000.0, &cfg))
+        };
+        let (m1, m60, d1) = (candle(1.0), candle(60.0), candle(1440.0));
+        assert!(m1 > m60 && m60 > d1, "expected 1m > 1h > 1d, got {m1:.2} / {m60:.2} / {d1:.2} bps");
+    }
+
+    #[test]
+    fn one_minute_bars_keep_the_unscaled_range_term() {
+        // bar_minutes at (or below) the reference leaves the pre-2026-09-19
+        // behavior exactly: half-spread = base/2 + range (uncapped here).
+        let one_min = SyntheticBookConfig::default();
+        let sub_min = SyntheticBookConfig { bar_minutes: 0.25, ..SyntheticBookConfig::default() };
+        let a = SyntheticOrderBook::from_candle(100.0, 100.1, 99.9, 1000.0, &one_min);
+        let b = SyntheticOrderBook::from_candle(100.0, 100.1, 99.9, 1000.0, &sub_min);
+        assert!((round_trip_bps(&a) - (5.0 + 2.0 * 20.0)).abs() < 1e-6, "got {:.4}", round_trip_bps(&a));
+        assert!((round_trip_bps(&a) - round_trip_bps(&b)).abs() < 1e-9, "sub-reference bars must not be widened");
     }
 
     #[test]

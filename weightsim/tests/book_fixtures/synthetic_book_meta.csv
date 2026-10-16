@@ -1,0 +1,12 @@
+name,value
+start_bar,2019-03-29
+end,2019-06-28
+capital0,100000.0
+min_abs,10.0
+min_pct,0.02
+allocated_capital_currency,98500.0
+risk_scale_scaled,0.8
+max_gross,0.7
+invvol_lookback,15
+etf_first_decision,2019-03-29
+cry_first_decision,2019-01-11

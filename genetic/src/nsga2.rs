@@ -76,6 +76,17 @@ pub struct NsgaIIOptimizer<C: Chromosome> {
     pub fitness_fn: AsyncContextFitnessFn<C>,
     pub sampling_config: AdaptiveSamplingConfig,
     pub force_sequential: bool,
+    /// Real (non-hard-gated) IS Sharpe ratio for every candidate evaluated
+    /// across the whole run -- same purpose and gate as
+    /// `AdaptiveGeneticOptimizer::trial_sharpes` (see that field's doc
+    /// comment): this is the σ_SR source the Deflated Sharpe Ratio's
+    /// expected-max-under-null figure needs to become an actual Sharpe bar
+    /// instead of a dimensionless z-score. NSGA-II is the DEFAULT
+    /// optimization mode for Python custom-strategy validation
+    /// (`python_validation.rs`'s `ga_config.unwrap_or_else` default), so
+    /// without this, most production GA runs would have no σ_SR source at
+    /// all even after `AdaptiveGeneticOptimizer` got one.
+    pub trial_sharpes: Arc<std::sync::Mutex<Vec<f64>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +156,11 @@ pub fn crowding_distance_assignment(
     for m in 0..num_objectives {
         // Sort front members by objective m
         let mut sorted_indices: Vec<usize> = (0..l).collect();
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 repo-wide NaN-comparator sweep's own rationale; this
+        // occurrence was missed by that sweep.
         sorted_indices.sort_by(|&a, &b| {
-            pop_objectives[front[a]][m]
-                .partial_cmp(&pop_objectives[front[b]][m])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            pop_objectives[front[a]][m].total_cmp(&pop_objectives[front[b]][m])
         });
 
         // Boundary points get infinite distance
@@ -267,7 +279,10 @@ fn hypervolume_2d(front: &[ParetoSolution], objectives: &[ObjectiveDef]) -> f64 
     }).collect();
 
     // Sort by first objective descending
-    pts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the 2026-09-16
+    // production-incident writeup (BacktestingEngine's
+    // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+    pts.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     // Sweep
     let ref_x = 0.0;
@@ -322,6 +337,16 @@ impl<C: Chromosome + 'static> NsgaIIOptimizer<C> {
                 }).collect()
             };
 
+            // Record real (non-hard-gated) IS Sharpe for every viable
+            // candidate this generation -- see `trial_sharpes`'s doc comment.
+            if let Ok(mut guard) = self.trial_sharpes.lock() {
+                guard.extend(
+                    fitness_results.iter()
+                        .filter(|r| !r.hard_gated)
+                        .map(|r| r.sharpe_ratio),
+                );
+            }
+
             // Extract objective values
             let pop_objectives: Vec<Vec<f64>> = fitness_results.iter().map(|r| {
                 self.objectives.iter().map(|o| r.get_objective(&o.field)).collect()
@@ -345,7 +370,7 @@ impl<C: Chromosome + 'static> NsgaIIOptimizer<C> {
             let mut sorted: Vec<usize> = (0..population.len()).collect();
             sorted.sort_by(|&a, &b| {
                 rank[a].cmp(&rank[b])
-                    .then(crowd[b].partial_cmp(&crowd[a]).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(crowd[b].total_cmp(&crowd[a]))
             });
 
             // Per-generation summary

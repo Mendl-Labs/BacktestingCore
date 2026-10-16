@@ -436,6 +436,27 @@ pub fn generate_required_acknowledgments(
 // ============================================================================
 // PLATFORM HARD LIMITS (Non-Negotiable)
 // ============================================================================
+//
+// PR14 (2026-09) audit: `validate_platform_limits` is NOT called from any
+// live path in either this repo or BacktestingEngine -- only its own tests
+// exercise it. In particular, `PlatformLimits::default().max_leverage` (3.0x
+// flat) is NOT the platform's real leverage cap and must not be read as one:
+// actual leverage enforcement is per-exchange and lives in BacktestingEngine
+// (`worker::resolve_leverage`/`resolve_leverage_for_legs` for backtests,
+// `api::deployment_publisher::resolve_deployment_leverage` for deployments),
+// each backed by `config::ExchangeFeeConfig::for_exchange`'s real per-venue
+// limits (e.g. 4x Alpaca equities, 10x Kraken spot, 50x Oanda, 125x Binance)
+// -- a single flat 3.0x is wrong for nearly every one of them. The other
+// fields here (`max_position_pct_cap`, `max_daily_loss_pct_cap`, the
+// admin-review/multi-sig `ApprovalRequirement` tiers) describe a live-capital
+// risk-management gate that also has no caller anywhere today -- deployments
+// go live with no position-size cap, no daily-loss cap, and no
+// approval-tier gate actually enforced, despite this struct's existence
+// implying otherwise. Left in place (not deleted) as a real, substantial,
+// not-yet-wired scaffold rather than removed outright, but the first thing a
+// future wiring effort must fix is this leverage default -- it should defer
+// to the same per-exchange config the rest of the platform already trusts,
+// not reintroduce a second, looser/tighter, inconsistent cap.
 
 /// Platform-enforced limits that cannot be overridden by users
 #[derive(Debug, Clone, Serialize, Deserialize)]

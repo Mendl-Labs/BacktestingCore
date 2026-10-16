@@ -210,7 +210,7 @@ pub fn jacobi_eigen(a: &[Vec<f64>], max_sweeps: usize) -> (Vec<f64>, Vec<Vec<f64
 
     // Sort descending by eigenvalue.
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
     let sorted_values: Vec<f64> = order.iter().map(|&i| eigenvalues[i]).collect();
     let sorted_vectors: Vec<Vec<f64>> = order.iter().map(|&i| eigenvectors[i].clone()).collect();
     eigenvalues = sorted_values;

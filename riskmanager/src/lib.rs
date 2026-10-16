@@ -424,7 +424,7 @@ impl RiskManager {
         }
         
         let mut sorted_returns = self.recent_returns.clone();
-        sorted_returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_returns.sort_by(|a, b| a.total_cmp(b));
         
         // 5th percentile for 95% VaR
         let var_index = (0.05 * sorted_returns.len() as f64) as usize;
@@ -445,7 +445,7 @@ impl RiskManager {
         }
         
         let mut sorted_returns = self.recent_returns.clone();
-        sorted_returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_returns.sort_by(|a, b| a.total_cmp(b));
         
         let var_index = (0.05 * sorted_returns.len() as f64) as usize;
         let tail_returns: Vec<f64> = sorted_returns.iter().take(var_index).copied().collect();
