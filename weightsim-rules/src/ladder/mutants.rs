@@ -12,17 +12,29 @@
 //! | `s1_sma_excludes_current` | independent rule: month-end close > mean of the 10 month-end closes BEFORE the current one |
 //! | `s1_one_bar_late` | configuration: `execution_delay_bars = 1` |
 //! | `s1_daily_rebalanced_20` | wrapper rule whose `rebalance_policy()` is `EveryBar` (weights restored every bar instead of drifting) |
+//!
+//! The five mutants of the momentum evidence set (Amendment 14 section 6, T4; sleeve `S4`, rule
+//! `momentum_rank_weighted`) are listed in [`Mutant::MOMENTUM`]:
+//!
+//! | mutant | how it is built here |
+//! |---|---|
+//! | `momentum_lookahead_peek` | wrapper rule that ranks on the NEXT bar's closes (its own copy of the panel), so the weights earn the bar whose close they were ranked on |
+//! | `momentum_extra_1day_delay` | configuration: `execution_delay_bars = 1` |
+//! | `momentum_lookback_off_by_one` | the real rule with `L = 125` (`close_(t-125)` instead of `close_(t-126)`) |
+//! | `momentum_half_sizing` | wrapper rule: the rank weights times 0.5 (50% cash) |
+//! | `momentum_equal_weight_not_rank_weight` | the real ranking's eligibility with `1/K` for every eligible instrument instead of `(K+1-r)/(K(K+1)/2)` |
 
 use weightsim::{
     DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
 };
 
-use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS};
+use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK};
 
 use super::checks::SeriesRows;
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
+use super::registry::FixtureSetId;
 use super::runner::{rows_from_sim, run_gross};
-use crate::adapters::{crypto_weights, CryptoTrendRule, EtfTrendRule};
+use crate::adapters::{crypto_weights, CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
 
 /// The eight mutants, in the order of the amendment's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,12 +47,20 @@ pub enum Mutant {
     S1SmaExcludesCurrent,
     S1OneBarLate,
     S1WrongRebalanceMode,
+    // The momentum evidence set (Amendment 14 section 6, T4), in the amendment's order.
+    S4LookaheadPeek,
+    S4ExtraDelay,
+    S4LookbackOffByOne,
+    S4HalfSizing,
+    S4EqualWeight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutantSleeve {
     S1,
     S3,
+    /// `momentum_rank_weighted` in the `MomentumEvidence` fixture set.
+    S4,
 }
 
 impl MutantSleeve {
@@ -49,6 +69,7 @@ impl MutantSleeve {
         match self {
             MutantSleeve::S1 => "S1",
             MutantSleeve::S3 => "S3",
+            MutantSleeve::S4 => "S4",
         }
     }
 
@@ -56,6 +77,7 @@ impl MutantSleeve {
         match code {
             "S1" => Some(MutantSleeve::S1),
             "S3" => Some(MutantSleeve::S3),
+            "S4" => Some(MutantSleeve::S4),
             _ => None,
         }
     }
@@ -73,6 +95,24 @@ impl Mutant {
         Mutant::S1WrongRebalanceMode,
     ];
 
+    /// The five mutants of the momentum evidence set (sleeve `S4`), in the order of Amendment 14 section 6 (T4).
+    pub const MOMENTUM: [Mutant; 5] = [
+        Mutant::S4LookaheadPeek,
+        Mutant::S4ExtraDelay,
+        Mutant::S4LookbackOffByOne,
+        Mutant::S4HalfSizing,
+        Mutant::S4EqualWeight,
+    ];
+
+    /// The mutants of one fixture set, in table order: what its ladder runs in Tier IV. [`Mutant::ALL`] is the
+    /// legacy set's eight, unchanged.
+    pub fn of_set(set: FixtureSetId) -> &'static [Mutant] {
+        match set {
+            FixtureSetId::Legacy => &Mutant::ALL,
+            FixtureSetId::MomentumEvidence => &Mutant::MOMENTUM,
+        }
+    }
+
     /// The name used in `mutants.json`.
     pub fn name(self) -> &'static str {
         match self {
@@ -84,12 +124,22 @@ impl Mutant {
             Mutant::S1SmaExcludesCurrent => "s1_sma_excludes_current",
             Mutant::S1OneBarLate => "s1_one_bar_late",
             Mutant::S1WrongRebalanceMode => "s1_daily_rebalanced_20",
+            Mutant::S4LookaheadPeek => "momentum_lookahead_peek",
+            Mutant::S4ExtraDelay => "momentum_extra_1day_delay",
+            Mutant::S4LookbackOffByOne => "momentum_lookback_off_by_one",
+            Mutant::S4HalfSizing => "momentum_half_sizing",
+            Mutant::S4EqualWeight => "momentum_equal_weight_not_rank_weight",
         }
     }
 
     pub fn sleeve(self) -> MutantSleeve {
         match self {
             Mutant::S1SmaExcludesCurrent | Mutant::S1OneBarLate | Mutant::S1WrongRebalanceMode => MutantSleeve::S1,
+            Mutant::S4LookaheadPeek
+            | Mutant::S4ExtraDelay
+            | Mutant::S4LookbackOffByOne
+            | Mutant::S4HalfSizing
+            | Mutant::S4EqualWeight => MutantSleeve::S4,
             _ => MutantSleeve::S3,
         }
     }
@@ -104,6 +154,13 @@ impl Mutant {
             Mutant::S1SmaExcludesCurrent => "SMA over the 10 month-ends before the current one",
             Mutant::S1OneBarLate => "month-end decision executed one bar late",
             Mutant::S1WrongRebalanceMode => "weights restored to 20% every bar instead of drifting",
+            Mutant::S4LookaheadPeek => {
+                "ranks on the next bar's closes, so the weights earn the bar they were ranked on"
+            }
+            Mutant::S4ExtraDelay => "one extra day between decision and fill",
+            Mutant::S4LookbackOffByOne => "trailing return over 125 bars instead of 126",
+            Mutant::S4HalfSizing => "rank weights halved, 50% cash",
+            Mutant::S4EqualWeight => "1/K for every ranked instrument instead of the linear rank weights",
         }
     }
 }
@@ -268,6 +325,97 @@ impl WeightRule for EtfSmaExcludesCurrent {
     }
 }
 
+/// Momentum weights from raw close slices (each ending at the decision bar): rank the instruments that have
+/// `lookback + 1` closes by trailing return, descending, ties by ascending ticker; with `K` ranked, rank `r` gets
+/// `(K + 1 - r) / (K (K + 1) / 2)`, or `1 / K` when `equal` is set. A deliberately independent re-statement of the
+/// reference rule's formula, used by the mutants that need the ranking on data the rule is not given.
+fn momentum_weights(universe: &[&'static str], closes: &[&[f64]], lookback: usize, equal: bool) -> Vec<f64> {
+    let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(universe.len());
+    for (i, c) in closes.iter().enumerate() {
+        if c.len() > lookback {
+            ranked.push((i, c[c.len() - 1] / c[c.len() - 1 - lookback] - 1.0));
+        }
+    }
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(universe[a.0].cmp(universe[b.0]))
+    });
+    let k = ranked.len();
+    let mut w = vec![0.0; universe.len()];
+    for (pos, (i, _)) in ranked.iter().enumerate() {
+        w[*i] = if equal { 1.0 / k as f64 } else { (k + 1 - (pos + 1)) as f64 / ((k * (k + 1)) as f64 / 2.0) };
+    }
+    w
+}
+
+/// Momentum rule that peeks: at the close of bar `t` it ranks on the closes through bar `t+1`. It holds its own copy of
+/// the panel, which is exactly what a leaky rule looks like (the poisoning harness must catch it).
+pub struct PeekMomentum {
+    full: Panel,
+}
+
+impl PeekMomentum {
+    pub fn new(panel: &Panel) -> PeekMomentum {
+        PeekMomentum { full: panel.clone() }
+    }
+}
+
+impl WeightRule for PeekMomentum {
+    fn id(&self) -> &'static str {
+        "mutant_momentum_lookahead_peek"
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        &ETF_SYMBOLS
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        DecisionSchedule::Daily
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::OnDecision
+    }
+    fn min_history_bars(&self) -> usize {
+        MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK + 1
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        let end = (h.len() + 1).min(self.full.n_bars());
+        let cols: Vec<&[f64]> = (0..self.full.n_assets()).map(|i| &self.full.closes(i)[..end]).collect();
+        Ok(momentum_weights(&ETF_SYMBOLS, &cols, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK, false))
+    }
+}
+
+/// Momentum with the right ranking and eligibility but `1/K` for every ranked instrument.
+struct EqualWeightMomentum {
+    inner: MomentumRankWeightedRule,
+}
+
+impl WeightRule for EqualWeightMomentum {
+    fn id(&self) -> &'static str {
+        "mutant_momentum_equal_weight_not_rank_weight"
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        self.inner.universe()
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        self.inner.decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.inner.rebalance_policy()
+    }
+    fn min_history_bars(&self) -> usize {
+        self.inner.min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        let ranking = self.inner.ranking(h);
+        let k = ranking.weights.iter().filter(|w| **w > 0.0).count();
+        Ok(ranking.weights.iter().map(|w| if *w > 0.0 { 1.0 / k as f64 } else { 0.0 }).collect())
+    }
+}
+
 /// Two independent sub-accounts of 0.5 each, invested in a coin (whole account) when its base-run target is on and
 /// never rebalanced back to 50/50. Returns are those of the summed equity, over the sleeve's counted window.
 fn drifting_subaccounts(panel: &Panel, base: &SimResult, key: &SleeveKey) -> Result<SeriesRows, LadderError> {
@@ -333,7 +481,12 @@ pub fn run_mutant(fx: &Fixtures, m: Mutant) -> Result<MutantRun, LadderError> {
     let sf = fx.sleeve(sleeve.code()).ok_or_else(|| {
         LadderError::Inconsistent(format!("the fixture set has no sleeve `{}` for mutant {}", sleeve.code(), m.name()))
     })?;
-    let (panel, key) = (sf.panel, sf.key);
+    run_mutant_on(sf.panel, sf.key, m)
+}
+
+/// [`run_mutant`] on an explicit panel and key (the key supplies the counted window): the mutant replays do not need
+/// a loaded fixture set, which is how the always-on tests exercise them on synthetic prices.
+pub fn run_mutant_on(panel: &Panel, key: &SleeveKey, m: Mutant) -> Result<MutantRun, LadderError> {
     match m {
         Mutant::S3SameDayPeek => from_sim(&run_gross(panel, &PeekCrypto::new(panel), key, 0)?, key),
         Mutant::S3ExtraDelay => from_sim(&run_gross(panel, &CryptoTrendRule::default(), key, 1)?, key),
@@ -359,6 +512,25 @@ pub fn run_mutant(fx: &Fixtures, m: Mutant) -> Result<MutantRun, LadderError> {
                 scale: 1.0,
                 policy: Some(RebalancePolicy::EveryBar),
             };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S4LookaheadPeek => from_sim(&run_gross(panel, &PeekMomentum::new(panel), key, 0)?, key),
+        Mutant::S4ExtraDelay => from_sim(&run_gross(panel, &MomentumRankWeightedRule::default(), key, 1)?, key),
+        Mutant::S4LookbackOffByOne => {
+            let rule = MomentumRankWeightedRule::new(ETF_SYMBOLS.to_vec(), MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK - 1);
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S4HalfSizing => {
+            let rule = Wrapped {
+                inner: MomentumRankWeightedRule::default(),
+                name: "mutant_momentum_half_sizing",
+                scale: 0.5,
+                policy: None,
+            };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S4EqualWeight => {
+            let rule = EqualWeightMomentum { inner: MomentumRankWeightedRule::default() };
             from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
     }
