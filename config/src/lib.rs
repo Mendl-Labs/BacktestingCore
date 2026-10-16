@@ -43,6 +43,17 @@ pub struct BacktestConfig {
     /// Liquidity provision config — when present, runs the LP simulation loop instead of directional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lp: Option<LpConfig>,
+    /// Leading bars of the data slice the strategy may SEE (its vectorized
+    /// `compute_signals` receives them, so lookback indicators are warm) but
+    /// may not TRADE on: no orders, risk checks, or equity samples are
+    /// recorded for ticks before this index, and the buy-and-hold benchmark
+    /// starts at it. Walk-forward test windows set this to the length of the
+    /// preceding train+purge span so a rule whose lookback exceeds the test
+    /// window (e.g. a 180-bar momentum rule inside a 146-bar window) is not
+    /// silently reduced to zero trades. `0` (the default) is byte-for-byte the
+    /// pre-existing behavior.
+    #[serde(default)]
+    pub warmup_bars: usize,
 }
 
 /// Database connection configuration
@@ -1079,9 +1090,19 @@ impl ExchangeFeeConfig {
             // No funding rate — forex uses overnight swap rates instead
             funding_rate_8h: 0.0,
             funding_interval_ms: 24 * 60 * 60 * 1000, // Daily rollover
-            // Overnight swap/rollover fee varies by pair; use approximate average
-            // Actual swap depends on interest rate differential between currencies
-            swap_fee_daily: 0.0,  // Set to 0 — handled separately by forex swap logic
+            // Broker financing MARKUP only: Oanda charges roughly 1%/year
+            // over the interbank rate on both sides of a position, so this
+            // is 0.01/365 per day, applied as a cost to long and short legs
+            // alike (`PairLegFeeConfig::swap_fee_daily`).
+            //
+            // 2026-09-17: was 0.0 with the comment "handled separately by
+            // forex swap logic" -- no such logic existed, so a held FX
+            // position cost nothing beyond spread. What is still NOT modelled
+            // is the interest-rate DIFFERENTIAL (the real carry), which needs
+            // a rate series this platform does not have and which dominates
+            // on EM crosses: the submission path refuses those rather than
+            // inventing a number.
+            swap_fee_daily: 0.01 / 365.0,
             // Verified 2026-07: CFTC/NFA caps US retail forex leverage at
             // 50:1 on major pairs, 20:1 on others; Oanda's US entity follows
             // this exactly. Lower under ESMA/ASIC rules, higher in some
@@ -1156,7 +1177,7 @@ impl ExchangeFeeConfig {
     /// Supports all major CEX exchanges, prop firms, and DEX protocols.
     pub fn for_exchange(exchange: &str) -> Self {
         match exchange.to_lowercase().as_str() {
-            "massive" | "exchange" => Self::kraken(), // Massive aggregates multiple venues; use kraken-like fee model as baseline
+            "exchange" => Self::kraken(),
             "kraken" | "krkn" => Self::kraken(),
             "kraken_colocated" | "kraken-colocated" => Self::kraken_colocated(),
             "kraken_established" | "kraken-established" => Self::kraken_established(),
@@ -1176,7 +1197,12 @@ impl ExchangeFeeConfig {
             "oanda" | "oanda_forex" | "forex" | "fx" => Self::oanda(),
             // US equities: "consolidated" (NBBO) and the individual listing
             // venues all execute through Alpaca's commission-free model.
-            "alpaca" | "alpaca_stocks" | "stocks" | "equities"
+            // "massive" is the market-data VENDOR (Polygon.io), never a real
+            // tradable exchange -- every historical use of it in this
+            // codebase was for equities, so it aliases to Alpaca's fee
+            // model here rather than the unrelated kraken baseline it used
+            // to fall back to (2026-09-16, alpaca/massive labeling fix).
+            "alpaca" | "alpaca_stocks" | "stocks" | "equities" | "massive"
             | "consolidated" | "nasdaq" | "nyse" | "nyse_arca" | "nyse-arca" | "amex" => Self::alpaca(),
             "breakout" => Self::breakout(),
             "deepbook" | "sui" => Self::deepbook(),
@@ -1228,6 +1254,101 @@ impl ExchangeFeeConfig {
     pub fn resolve_leverage(&self, requested: f64) -> (f64, bool) {
         let capped = requested.min(self.max_leverage).max(1.0);
         (capped, capped < requested)
+    }
+}
+
+/// Real per-contract fee structure for US-listed equity/ETF options,
+/// distinct from `ExchangeFeeConfig` (which models spot/crypto/forex fees
+/// as a percentage of notional value via maker_fee/taker_fee). Options fees
+/// are fundamentally NOT a percentage of the premium -- they're near-flat
+/// per-contract regulatory pass-throughs (SEC, FINRA, the options exchanges,
+/// and the Options Clearing Corporation), most of which don't scale with
+/// premium at all. Using `ExchangeFeeConfig`'s percentage model for options
+/// was the platform's actual prior behavior (see `python_simulation.rs`'s
+/// `execute_taker_fill`/maker-fill commission calc, fixed alongside this
+/// type) -- confirmed live: a $5 premium 1-contract fill was charged
+/// Kraken's ~0.25% crypto taker rate against the (also wrongly-unscaled,
+/// missing the 100x contract multiplier) $5 fill value, both errors
+/// compounding to a commission many orders of magnitude off any real
+/// options broker's actual cost.
+///
+/// This platform has exactly one broker integration that both (a) is
+/// already wired for live order execution and (b) actually supports the
+/// same asset class options data comes from (US-listed equities/ETFs via
+/// Massive/Polygon): Alpaca. `alpaca()`'s numbers below are the real,
+/// current retail commission-and-regulatory-fee schedule, verified
+/// directly against Alpaca Securities LLC's own published fee schedule
+/// (files.alpaca.markets/disclosures/library/BrokFeeSched.pdf, revised
+/// 2026-09-01) -- not estimated or approximated. `deribit()`'s crypto-
+/// options fee entry in `ExchangeFeeConfig` above is a different asset
+/// class (BTC/ETH options) with no data provider wired into this platform
+/// at all today, so it's out of scope for this type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OptionsFeeConfig {
+    /// Broker's own per-contract commission, charged on both opens and
+    /// closes. Alpaca retail: $0 (commission-free). A non-retail/
+    /// professional-order-flow trader pays a real tiered rate ($0.10-$0.40/
+    /// contract) under Alpaca's own schedule, but this platform has no
+    /// concept of professional-order-flow classification for a simulated
+    /// backtest, so the retail rate is the only one modeled.
+    pub broker_commission_per_contract: f64,
+    /// SEC Transaction Fee: a rate applied to trade VALUE (premium *
+    /// contracts * contract_multiplier), sells only. $0.0000206 per Alpaca's
+    /// current schedule -- identical rate to equities, since it's a
+    /// government fee on sale proceeds, not options-specific.
+    pub sec_fee_rate: f64,
+    /// FINRA Trading Activity Fee (TAF): flat per contract, sells only.
+    pub finra_taf_per_contract: f64,
+    /// FINRA Consolidated Audit Trail (CAT) fee: per "executed equivalent
+    /// share" -- for options this means per contract times the contract's
+    /// own multiplier (1 standard equity option contract = 100 shares).
+    /// Charged on both opens and closes.
+    pub cat_fee_per_share_equivalent: f64,
+    /// Options Regulatory Fee (ORF), charged by the options exchanges: flat
+    /// per contract, both opens and closes.
+    pub orf_per_contract: f64,
+    /// OCC (Options Clearing Corporation) clearing fee: flat per contract,
+    /// both opens and closes.
+    pub occ_clearing_fee_per_contract: f64,
+}
+
+impl OptionsFeeConfig {
+    /// Alpaca Securities LLC's real retail equity-options fee schedule.
+    /// Source: files.alpaca.markets/disclosures/library/BrokFeeSched.pdf,
+    /// "Revised on September 1, 2026" (the schedule's own effective-date
+    /// stamp, not just when this was checked). Index options (SPX/SPXW/DJX/
+    /// XSP/VIX) carry a different, symbol-specific exchange-fee table on top
+    /// of these regulatory pass-throughs -- out of scope here since this
+    /// platform's options data source (Massive/Polygon) covers standard
+    /// equity/ETF-underlying contracts, not index-settled products.
+    pub fn alpaca() -> Self {
+        Self {
+            broker_commission_per_contract: 0.0,
+            sec_fee_rate: 0.0000206,
+            finra_taf_per_contract: 0.00329,
+            cat_fee_per_share_equivalent: 0.000003,
+            orf_per_contract: 0.015,
+            occ_clearing_fee_per_contract: 0.025,
+        }
+    }
+
+    /// Total commission for one fill: `premium` is the per-contract fill
+    /// price, `contracts` the executed quantity, `contract_multiplier` the
+    /// instrument's own multiplier (100 for a standard equity option), and
+    /// `is_buy` distinguishes the sells-only fees (SEC, TAF) from the
+    /// charged-both-ways ones (CAT, ORF, OCC, broker commission).
+    pub fn commission_for_fill(&self, premium: f64, contracts: f64, contract_multiplier: f64, is_buy: bool) -> f64 {
+        let both_ways = contracts
+            * (self.broker_commission_per_contract
+                + self.cat_fee_per_share_equivalent * contract_multiplier
+                + self.orf_per_contract
+                + self.occ_clearing_fee_per_contract);
+        if is_buy {
+            both_ways
+        } else {
+            let trade_value = premium * contracts * contract_multiplier;
+            both_ways + trade_value * self.sec_fee_rate + contracts * self.finra_taf_per_contract
+        }
     }
 }
 
@@ -1927,7 +2048,7 @@ impl ExchangeFeeConfig {
         let applicable_tier = self.volume_tiers
             .iter()
             .filter(|tier| volume_30d >= tier.min_volume_30d)
-            .max_by(|a, b| a.min_volume_30d.partial_cmp(&b.min_volume_30d).unwrap())
+            .max_by(|a, b| a.min_volume_30d.total_cmp(&b.min_volume_30d))
             .unwrap_or(&fallback_tier);
 
         if is_maker {
@@ -2199,6 +2320,14 @@ pub struct AnalysisConfig {
     pub validation_min_trades: u64,
     /// GA seeding configuration for strategy optimization
     pub ga_seed_params: Option<GASeedParams>,
+    /// Export the per-bar signed held weight of every instrument on the
+    /// result (`backtest::BacktestResult::per_bar_weights`), sampled at the
+    /// equity curve's own sample points. Gap-closure plan W3.5: this is the
+    /// series the replication ladder's Tier III (`weightsim_rules::ladder`)
+    /// needs from the general engine. `false` (the default) is byte-for-byte
+    /// the pre-existing result: the field stays `None` and is not serialised.
+    #[serde(default)]
+    pub export_per_bar_weights: bool,
 }
 
 /// Baseline parameters to seed genetic algorithm population
@@ -2258,6 +2387,7 @@ impl Default for AnalysisConfig {
                 window_ms: 60_000,              // 1 minute
                 min_quote_lifetime_ms: 200,     // 200ms
             }),
+            export_per_bar_weights: false,
         }
     }
 }
@@ -2325,6 +2455,52 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    // ── OptionsFeeConfig: real Alpaca retail equity-options fee schedule ──
+
+    #[test]
+    fn options_fee_alpaca_buy_charges_only_the_both_ways_fees() {
+        let cfg = OptionsFeeConfig::alpaca();
+        // Buy 1 contract at $5.00 premium, standard 100x multiplier.
+        let commission = cfg.commission_for_fill(5.0, 1.0, 100.0, true);
+        // both_ways = 1 * (0 + 0.000003*100 + 0.015 + 0.025) = 1 * (0.0003 + 0.015 + 0.025) = 0.0403
+        assert!((commission - 0.0403).abs() < 1e-9, "commission={commission}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_sell_adds_sec_fee_and_taf_on_top() {
+        let cfg = OptionsFeeConfig::alpaca();
+        let commission = cfg.commission_for_fill(5.0, 1.0, 100.0, false);
+        // both_ways = 0.0403 (same as buy case)
+        // trade_value = 5.0 * 1 * 100 = 500.0; sec = 500 * 0.0000206 = 0.0103
+        // taf = 1 * 0.00329 = 0.00329
+        let expected = 0.0403 + 0.0103 + 0.00329;
+        assert!((commission - expected).abs() < 1e-6, "commission={commission}, expected={expected}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_scales_linearly_with_contract_count() {
+        let cfg = OptionsFeeConfig::alpaca();
+        let one = cfg.commission_for_fill(5.0, 1.0, 100.0, true);
+        let ten = cfg.commission_for_fill(5.0, 10.0, 100.0, true);
+        assert!((ten - one * 10.0).abs() < 1e-9, "one={one}, ten={ten}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_is_never_a_percentage_of_premium() {
+        // The defining property this type exists to fix: a 10x higher
+        // premium on the SAME contract must not change the both-ways fee at
+        // all (unlike ExchangeFeeConfig's maker/taker percentage model).
+        let cfg = OptionsFeeConfig::alpaca();
+        let cheap = cfg.commission_for_fill(1.0, 1.0, 100.0, true);
+        let expensive = cfg.commission_for_fill(50.0, 1.0, 100.0, true);
+        assert!((cheap - expensive).abs() < 1e-12, "cheap={cheap}, expensive={expensive}");
+    }
+
+    #[test]
+    fn options_fee_alpaca_broker_commission_is_zero_for_retail() {
+        assert_eq!(OptionsFeeConfig::alpaca().broker_commission_per_contract, 0.0);
+    }
+
     // ── Exchange fee routing: every id the Massive/Polygon feeds emit must
     //    resolve to the correct preset, not the generic fallback. ──────────
 
@@ -2340,8 +2516,14 @@ mod tests {
 
     #[test]
     fn test_fee_routing_stocks_use_alpaca() {
-        // Stock asset class uses "consolidated"; individual venues also appear
-        for id in ["consolidated", "nasdaq", "nyse", "nyse_arca", "nyse-arca", "amex"] {
+        // Stock asset class uses "consolidated"; individual venues also
+        // appear. "massive" (2026-09-16, alpaca/massive labeling fix) is
+        // included here deliberately -- it's the market-data vendor, not a
+        // real exchange, but every historical use of it in this codebase
+        // was for equities, so a stray occurrence must still resolve to
+        // Alpaca's real fee schedule, not the unrelated kraken baseline it
+        // used to silently fall back to.
+        for id in ["consolidated", "nasdaq", "nyse", "nyse_arca", "nyse-arca", "amex", "massive"] {
             let cfg = ExchangeFeeConfig::for_exchange(id);
             assert_eq!(cfg.exchange, "alpaca", "stock id '{}' must route to alpaca", id);
             assert_eq!(cfg.maker_fee, 0.0, "equities are commission-free");
@@ -2540,4 +2722,97 @@ mod tests {
         let parsed: GeneticConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.random_control);
     }
+}
+
+// ── FX policy rates, for carry ───────────────────────────────────────────
+
+/// First year covered by [`POLICY_RATES`].
+pub const POLICY_RATE_BASE_YEAR: i32 = 2015;
+/// Years covered by [`POLICY_RATES`] (2015..=2030).
+pub const POLICY_RATE_YEARS: usize = 16;
+
+/// Approximate ANNUAL AVERAGE central-bank policy rate, as a fraction
+/// (0.05 = 5%), per currency, for 2015..=2030.
+///
+/// This exists so FX carry -- the interest-rate differential between the two
+/// currencies of a cross -- can be priced at all. Before 2026-09-18 nothing
+/// modelled it: a held FX position cost only spread, which flattered exactly
+/// the trades where carry dominates. The platform's first two Promising
+/// verdicts were both FX baskets (EM crosses on TRY/ZAR/MXN, then G10 crosses
+/// carrying five JPY legs) whose carry was never charged.
+///
+/// These are hand-entered approximations of published policy rates, not a
+/// data feed: good to roughly a percentage point on the majors, cruder on
+/// EM, and the tail years are forecasts that will drift. They are meant to
+/// make carry approximately right instead of exactly zero, which is what
+/// they replace. A real deployment should source a rates series and delete
+/// this table; `annual_policy_rate` returning `None` is what the submission
+/// path refuses on, so adding a currency here is what makes it tradable.
+///
+/// Pegged currencies track their anchor (DKK to EUR, HKD to USD).
+const POLICY_RATES: &[(&str, [f64; POLICY_RATE_YEARS])] = &[
+    //                 2015   2016   2017   2018   2019   2020   2021   2022   2023   2024   2025   2026   2027   2028   2029   2030
+    ("USD", [0.0025, 0.005, 0.0125, 0.020, 0.023, 0.005, 0.001, 0.017, 0.050, 0.051, 0.043, 0.035, 0.030, 0.030, 0.030, 0.030]),
+    ("EUR", [0.0005, 0.000, 0.000, 0.000, 0.000, -0.005, -0.005, 0.005, 0.038, 0.037, 0.024, 0.020, 0.020, 0.020, 0.020, 0.020]),
+    ("JPY", [-0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, -0.001, 0.001, 0.005, 0.0075, 0.010, 0.010, 0.010, 0.010]),
+    ("GBP", [0.005, 0.0025, 0.0050, 0.0075, 0.0075, 0.001, 0.001, 0.015, 0.048, 0.051, 0.043, 0.0375, 0.033, 0.030, 0.030, 0.030]),
+    ("CHF", [-0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0075, -0.0025, 0.016, 0.013, 0.0025, 0.000, 0.000, 0.000, 0.000, 0.000]),
+    ("CAD", [0.0075, 0.005, 0.0075, 0.0150, 0.0175, 0.0025, 0.0025, 0.023, 0.048, 0.045, 0.029, 0.025, 0.025, 0.025, 0.025, 0.025]),
+    ("AUD", [0.020, 0.0150, 0.0150, 0.0150, 0.010, 0.0025, 0.001, 0.016, 0.039, 0.0435, 0.039, 0.034, 0.032, 0.030, 0.030, 0.030]),
+    ("NZD", [0.028, 0.020, 0.0175, 0.0175, 0.0125, 0.0025, 0.0035, 0.029, 0.054, 0.054, 0.033, 0.0275, 0.027, 0.027, 0.027, 0.027]),
+    ("NOK", [0.010, 0.005, 0.005, 0.0075, 0.0150, 0.000, 0.0025, 0.0150, 0.037, 0.045, 0.043, 0.040, 0.035, 0.035, 0.035, 0.035]),
+    ("SEK", [-0.0035, -0.005, -0.005, -0.005, -0.0025, 0.000, 0.000, 0.012, 0.036, 0.037, 0.021, 0.020, 0.020, 0.020, 0.020, 0.020]),
+    ("DKK", [0.0005, 0.000, 0.000, 0.000, 0.000, -0.005, -0.005, 0.006, 0.039, 0.038, 0.025, 0.021, 0.021, 0.021, 0.021, 0.021]),
+    ("TRY", [0.080, 0.080, 0.080, 0.200, 0.180, 0.130, 0.170, 0.120, 0.250, 0.500, 0.400, 0.300, 0.250, 0.200, 0.200, 0.200]),
+    ("ZAR", [0.060, 0.070, 0.0675, 0.0675, 0.0650, 0.040, 0.035, 0.055, 0.081, 0.081, 0.073, 0.070, 0.070, 0.070, 0.070, 0.070]),
+    ("MXN", [0.030, 0.0425, 0.070, 0.0775, 0.0775, 0.045, 0.045, 0.080, 0.1125, 0.108, 0.088, 0.075, 0.070, 0.070, 0.070, 0.070]),
+    ("PLN", [0.0150, 0.0150, 0.0150, 0.0150, 0.0150, 0.0025, 0.007, 0.062, 0.064, 0.0575, 0.050, 0.045, 0.040, 0.040, 0.040, 0.040]),
+    ("HUF", [0.0135, 0.009, 0.009, 0.009, 0.009, 0.006, 0.019, 0.105, 0.135, 0.070, 0.065, 0.060, 0.055, 0.050, 0.050, 0.050]),
+    ("CZK", [0.0005, 0.0005, 0.0025, 0.0125, 0.020, 0.0035, 0.0150, 0.064, 0.070, 0.048, 0.035, 0.035, 0.035, 0.035, 0.035, 0.035]),
+    ("SGD", [0.010, 0.010, 0.010, 0.0150, 0.0175, 0.003, 0.003, 0.020, 0.037, 0.035, 0.020, 0.018, 0.018, 0.018, 0.018, 0.018]),
+    ("HKD", [0.005, 0.0075, 0.0150, 0.0225, 0.025, 0.005, 0.005, 0.020, 0.053, 0.053, 0.045, 0.038, 0.033, 0.033, 0.033, 0.033]),
+    ("CNH", [0.0435, 0.0435, 0.0435, 0.0435, 0.0425, 0.0385, 0.0385, 0.0365, 0.0345, 0.031, 0.030, 0.028, 0.028, 0.028, 0.028, 0.028]),
+    ("INR", [0.0725, 0.0650, 0.060, 0.0650, 0.0515, 0.040, 0.040, 0.050, 0.065, 0.065, 0.060, 0.055, 0.055, 0.055, 0.055, 0.055]),
+    ("KRW", [0.0175, 0.0125, 0.0150, 0.0175, 0.0125, 0.005, 0.0075, 0.025, 0.035, 0.034, 0.026, 0.023, 0.023, 0.023, 0.023, 0.023]),
+    ("ILS", [0.001, 0.001, 0.001, 0.0025, 0.0025, 0.001, 0.001, 0.0150, 0.046, 0.045, 0.044, 0.040, 0.035, 0.035, 0.035, 0.035]),
+    ("BRL", [0.1350, 0.1400, 0.1000, 0.0650, 0.0600, 0.0275, 0.050, 0.1325, 0.130, 0.110, 0.140, 0.130, 0.110, 0.100, 0.100, 0.100]),
+];
+
+/// Approximate annual policy rate for `currency` in `year`, as a fraction.
+/// `None` for a currency with no entry -- the submission path refuses those
+/// rather than pricing their carry at zero. Years outside the table clamp to
+/// its first/last column.
+pub fn annual_policy_rate(currency: &str, year: i32) -> Option<f64> {
+    let code = currency.trim().to_ascii_uppercase();
+    let row = POLICY_RATES.iter().find(|(c, _)| *c == code)?;
+    let idx = (year - POLICY_RATE_BASE_YEAR).clamp(0, POLICY_RATE_YEARS as i32 - 1) as usize;
+    Some(row.1[idx])
+}
+
+/// Split an FX cross symbol into its (base, quote) currency codes --
+/// "EUR-JPY", "EUR/JPY" and "EURJPY" all give ("EUR", "JPY"). `None` when
+/// the symbol isn't a recognizable 3+3 cross.
+pub fn split_fx_pair(symbol: &str) -> Option<(String, String)> {
+    let cleaned: String = symbol.trim().to_ascii_uppercase();
+    let parts: Vec<&str> = cleaned.split(['-', '/', '_']).filter(|p| !p.is_empty()).collect();
+    match parts.as_slice() {
+        [base, quote] if base.len() == 3 && quote.len() == 3 => Some((base.to_string(), quote.to_string())),
+        [single] if single.len() == 6 => Some((single[..3].to_string(), single[3..].to_string())),
+        _ => None,
+    }
+}
+
+/// Signed annual carry on a LONG position in `symbol` for each year the
+/// policy-rate table covers: holding the base currency earns its rate and
+/// funds it in the quote currency, so carry is `rate(base) - rate(quote)`.
+/// A short position earns the negative of this. `None` when the symbol isn't
+/// an FX cross or either currency is missing from the table.
+pub fn fx_carry_by_year(symbol: &str) -> Option<[f64; POLICY_RATE_YEARS]> {
+    let (base, quote) = split_fx_pair(symbol)?;
+    let mut out = [0.0; POLICY_RATE_YEARS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let year = POLICY_RATE_BASE_YEAR + i as i32;
+        *slot = annual_policy_rate(&base, year)? - annual_policy_rate(&quote, year)?;
+    }
+    Some(out)
 }

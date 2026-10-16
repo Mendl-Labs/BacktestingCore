@@ -74,10 +74,81 @@ pub struct Position {
     pub margin_posted: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PositionSide {
     Long,
     Short,
+}
+
+/// Rich outcome of applying a single fill, layered on top of the plain
+/// `executed_quantity` that `apply_fill_executed`/`apply_derivative_fill` have
+/// always returned. Lets a caller build its own trade-level records (e.g.
+/// `backtest::python_simulation`'s `TradeRecord`) directly from this crate's
+/// own authoritative ledger -- the real blended entry price, the real
+/// executed quantity (already capped by available balance/inventory), and
+/// the real realized P&L `reduce_long_position`/`reduce_short_position`
+/// already compute against that blended entry price -- instead of a
+/// caller-side shadow ledger, which is confirmed to have silently diverged
+/// from this one in production (2026-09-06: a real backtest's shadow-ledger
+/// trade log summed to +$23,066.88 while this ledger's real equity only
+/// reached $5,388.94 out of $10,000 starting capital).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FillOutcome {
+    pub executed_quantity: f64,
+    pub symbol: String,
+    /// `Some(side)` when this fill reduced/closed an EXISTING open position
+    /// (buy-to-cover-short or sell-to-close-long). `None` when it opened a
+    /// new position or added to one (an "entry" fill, including scale-ins).
+    pub closed_side: Option<PositionSide>,
+    /// The reduced/closed position's blended entry price BEFORE this fill
+    /// (reflects every prior scale-in). `None` unless `closed_side.is_some()`.
+    pub closed_entry_price: Option<f64>,
+    /// The reduced/closed position's original `open_time` (first fill that
+    /// opened it; unaffected by later scale-ins). `None` unless
+    /// `closed_side.is_some()`.
+    pub closed_open_time: Option<DateTime<Utc>>,
+    /// Realized P&L from this fill's reduction, as already computed by
+    /// `reduce_long_position`/`reduce_short_position`. `None` unless
+    /// `closed_side.is_some()`.
+    pub realized_pnl: Option<f64>,
+    /// Margin released back to `balance` by this reduction. `None` unless
+    /// `closed_side.is_some()`.
+    pub margin_released: Option<f64>,
+    /// `true` if the reduced position's quantity reached ~0 (fully closed).
+    /// Always `false` when `closed_side` is `None`.
+    pub position_fully_closed: bool,
+    /// Quantity still open on the affected position after this fill (`0.0`
+    /// if fully closed). For an entry/add fill, the position's new total
+    /// quantity after this fill.
+    pub remaining_open_quantity: f64,
+}
+
+impl FillOutcome {
+    /// A no-op outcome (nothing executed) for `symbol`. Public so callers can
+    /// build the same "nothing happened" value on their own error paths
+    /// (e.g. logging a fill error and continuing) without duplicating this
+    /// struct's field list.
+    pub fn zero(symbol: String) -> Self {
+        Self {
+            executed_quantity: 0.0, symbol, closed_side: None,
+            closed_entry_price: None, closed_open_time: None,
+            realized_pnl: None, margin_released: None,
+            position_fully_closed: false, remaining_open_quantity: 0.0,
+        }
+    }
+}
+
+/// Extra detail captured while reducing a position, beyond the plain
+/// `(realized_pnl, margin_released)` this crate returned before.
+/// `entry_price`/`open_time` are read from the matching open lot BEFORE the
+/// reduction mutates it.
+struct ReduceOutcome {
+    realized_pnl: f64,
+    margin_released: f64,
+    entry_price: f64,
+    open_time: DateTime<Utc>,
+    fully_closed: bool,
+    remaining_quantity: f64,
 }
 
 impl PortfolioState {
@@ -208,12 +279,23 @@ impl PortfolioState {
     /// (`apply_derivative_fill`'s premium-credit branch), shorting a spot/
     /// futures-style instrument doesn't pay you money upfront.
     pub fn apply_fill_executed(&mut self, fill: &Fill) -> Result<f64> {
+        self.apply_fill_executed_with_outcome(fill).map(|o| o.executed_quantity)
+    }
+
+    /// Like [`apply_fill_executed`](Self::apply_fill_executed) but returns
+    /// full detail about what happened to the ledger -- see `FillOutcome`'s
+    /// doc comment. Added so callers building their own trade-level records
+    /// (e.g. `backtest::python_simulation`'s `TradeRecord`/`trade_log`) can
+    /// derive them directly from this authoritative ledger instead of
+    /// maintaining a parallel shadow ledger of their own, which is confirmed
+    /// to drift from this one in production.
+    pub fn apply_fill_executed_with_outcome(&mut self, fill: &Fill) -> Result<FillOutcome> {
         let symbol = "BTC/USD".to_string(); // TODO: Get from fill/order in production
 
         self.timestamp = fill.timestamp;
         let requested_quantity = fill.quantity;
         if requested_quantity <= 0.0 {
-            return Ok(0.0); // Nothing to do
+            return Ok(FillOutcome::zero(symbol)); // Nothing to do
         }
 
         let has_open_long = self.positions.iter()
@@ -228,16 +310,25 @@ impl PortfolioState {
                 let available = self.get_available_short_quantity(&symbol);
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let fee_amount = fill.fee_amount * execution_ratio;
                 self.fees_paid += fee_amount;
-                let (realized, margin_released) = self.reduce_short_position(&symbol, executed_quantity, fill.price, fill.timestamp);
-                self.balance += margin_released + realized - fee_amount;
-                self.realized_pnl += realized;
+                let reduce = self.reduce_short_position(&symbol, executed_quantity, fill.price, fill.timestamp);
+                self.balance += reduce.margin_released + reduce.realized_pnl - fee_amount;
+                self.realized_pnl += reduce.realized_pnl;
                 self.net_position += executed_quantity;
-                Ok(executed_quantity)
+                Ok(FillOutcome {
+                    executed_quantity, symbol,
+                    closed_side: Some(PositionSide::Short),
+                    closed_entry_price: Some(reduce.entry_price),
+                    closed_open_time: Some(reduce.open_time),
+                    realized_pnl: Some(reduce.realized_pnl),
+                    margin_released: Some(reduce.margin_released),
+                    position_fully_closed: reduce.fully_closed,
+                    remaining_open_quantity: reduce.remaining_quantity,
+                })
             }
             BookSide::Bid => {
                 // Buy-to-open (or add to) a long. Buying power scales with
@@ -245,12 +336,12 @@ impl PortfolioState {
                 // (that helper stays unleveraged since `apply_derivative_fill`
                 // also uses it for the options case, which leverage never applies to).
                 if fill.price <= 0.0 || self.balance <= 0.0 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let available = (self.balance * 0.95 * leverage) / fill.price;
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let trade_value = fill.price * executed_quantity;
@@ -260,36 +351,50 @@ impl PortfolioState {
                 self.balance -= margin_posted;
                 self.balance -= fee_amount;
                 self.net_position += executed_quantity;
-                self.add_to_long_position(&symbol, executed_quantity, fill.price, fill.timestamp, margin_posted);
-                Ok(executed_quantity)
+                let new_total = self.add_to_long_position(&symbol, executed_quantity, fill.price, fill.timestamp, margin_posted);
+                Ok(FillOutcome {
+                    executed_quantity, symbol, closed_side: None,
+                    closed_entry_price: None, closed_open_time: None,
+                    realized_pnl: None, margin_released: None,
+                    position_fully_closed: false, remaining_open_quantity: new_total,
+                })
             }
             BookSide::Ask if has_open_long => {
                 // Sell-to-close an existing long.
                 let available = self.get_available_quantity(&symbol, &fill.side, fill.price);
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let fee_amount = fill.fee_amount * execution_ratio;
                 self.fees_paid += fee_amount;
-                let (realized, margin_released) = self.reduce_long_position(&symbol, executed_quantity, fill.price, fill.timestamp);
-                self.balance += margin_released + realized - fee_amount;
-                self.realized_pnl += realized;
+                let reduce = self.reduce_long_position(&symbol, executed_quantity, fill.price, fill.timestamp);
+                self.balance += reduce.margin_released + reduce.realized_pnl - fee_amount;
+                self.realized_pnl += reduce.realized_pnl;
                 self.net_position -= executed_quantity;
-                Ok(executed_quantity)
+                Ok(FillOutcome {
+                    executed_quantity, symbol,
+                    closed_side: Some(PositionSide::Long),
+                    closed_entry_price: Some(reduce.entry_price),
+                    closed_open_time: Some(reduce.open_time),
+                    realized_pnl: Some(reduce.realized_pnl),
+                    margin_released: Some(reduce.margin_released),
+                    position_fully_closed: reduce.fully_closed,
+                    remaining_open_quantity: reduce.remaining_quantity,
+                })
             }
             BookSide::Ask => {
                 // Sell-to-open (or add to) a new Short. Capped by margin/
                 // buying power the same way as opening a long -- NOT
                 // uncapped like an option premium credit.
                 if fill.price <= 0.0 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let available = ((self.balance * 0.95 * leverage) / fill.price).max(0.0);
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let trade_value = fill.price * executed_quantity;
@@ -299,8 +404,13 @@ impl PortfolioState {
                 self.balance -= margin_posted;
                 self.balance -= fee_amount;
                 self.net_position -= executed_quantity;
-                self.add_to_short_position_with_instrument(&symbol, executed_quantity, fill.price, fill.timestamp, None, margin_posted);
-                Ok(executed_quantity)
+                let new_total = self.add_to_short_position_with_instrument(&symbol, executed_quantity, fill.price, fill.timestamp, None, margin_posted);
+                Ok(FillOutcome {
+                    executed_quantity, symbol, closed_side: None,
+                    closed_entry_price: None, closed_open_time: None,
+                    realized_pnl: None, margin_released: None,
+                    position_fully_closed: false, remaining_open_quantity: new_total,
+                })
             }
         }
     }
@@ -310,6 +420,7 @@ impl PortfolioState {
     /// `margin_posted` is the cash actually debited for this fill (see
     /// `portfoliomanager::margin`) -- summed into the position's running
     /// total so a later partial/full close knows how much margin to release.
+    /// Returns the position's new total quantity after this add.
     fn add_to_long_position(
         &mut self,
         symbol: &str,
@@ -317,7 +428,7 @@ impl PortfolioState {
         price: f64,
         timestamp: DateTime<Utc>,
         margin_posted: f64,
-    ) {
+    ) -> f64 {
         // Find existing open Long position
         let existing = self.positions.iter_mut()
             .find(|p| p.symbol == symbol && p.close_time.is_none() && p.side == PositionSide::Long);
@@ -335,6 +446,7 @@ impl PortfolioState {
                 position.quantity = new_quantity;
                 position.mark_price = Some(price);
                 position.margin_posted += margin_posted;
+                new_quantity
             }
             None => {
                 // Create new Long position
@@ -352,6 +464,7 @@ impl PortfolioState {
                     instrument: None,
                     greeks: None,
                 });
+                quantity
             }
         }
     }
@@ -362,21 +475,35 @@ impl PortfolioState {
     /// INVARIANT: quantity must be <= available position quantity
     /// This is enforced by apply_fill() before calling this method
     ///
-    /// Returns `(realized_pnl, margin_released)` -- `margin_released` is the
-    /// slice of the position's posted margin proportional to the fraction
-    /// closed (e.g. closing half a position releases half its margin_posted),
-    /// which the caller credits back to `balance` instead of the raw trade
-    /// value once leverage is in play (see `portfoliomanager::margin`).
+    /// Returns a `ReduceOutcome` -- `margin_released` is the slice of the
+    /// position's posted margin proportional to the fraction closed (e.g.
+    /// closing half a position releases half its margin_posted), which the
+    /// caller credits back to `balance` instead of the raw trade value once
+    /// leverage is in play (see `portfoliomanager::margin`). `entry_price`/
+    /// `open_time` are read from the matching lot BEFORE this call mutates
+    /// it, so a caller building its own trade record (see `FillOutcome`) gets
+    /// the position's real blended cost basis, not a caller-side guess.
     fn reduce_long_position(
         &mut self,
         symbol: &str,
         quantity: f64,
         price: f64,
         timestamp: DateTime<Utc>
-    ) -> (f64, f64) {
+    ) -> ReduceOutcome {
         let mut remaining_to_sell = quantity;
         let mut total_realized_pnl = 0.0;
         let mut total_margin_released = 0.0;
+        let mut entry_price = 0.0;
+        let mut open_time = timestamp;
+        let mut fully_closed = false;
+        let mut remaining_quantity = 0.0;
+        // By this crate's single-open-lot-per-(symbol,side) invariant (see
+        // `add_to_long_position`, which always merges into the one existing
+        // open lot rather than creating a second), this loop matches at most
+        // one position per call -- guard that invariant loudly rather than
+        // silently reporting the wrong entry_price/open_time if it's ever
+        // broken by a future change.
+        let mut matched = 0u32;
 
         // Process positions in order (FIFO)
         for position in self.positions.iter_mut()
@@ -390,6 +517,10 @@ impl PortfolioState {
             let sell_from_this = remaining_to_sell.min(position.quantity);
 
             if sell_from_this > 0.0 {
+                matched += 1;
+                entry_price = position.entry_price;
+                open_time = position.open_time;
+
                 // Calculate realized P&L: (sell_price - entry_price) * quantity
                 let pnl = (price - position.entry_price) * sell_from_this;
                 let margin_fraction = if position.quantity > 0.0 { sell_from_this / position.quantity } else { 0.0 };
@@ -407,20 +538,41 @@ impl PortfolioState {
                 if position.quantity < 1e-10 {
                     position.quantity = 0.0;
                     position.close_time = Some(timestamp);
+                    fully_closed = true;
+                } else {
+                    remaining_quantity = position.quantity;
                 }
             }
         }
+        debug_assert!(matched <= 1, "reduce_long_position matched {} lots for {} -- single-open-lot-per-side invariant broken", matched, symbol);
 
-        (total_realized_pnl, total_margin_released)
+        ReduceOutcome {
+            realized_pnl: total_realized_pnl,
+            margin_released: total_margin_released,
+            entry_price,
+            open_time,
+            fully_closed,
+            remaining_quantity,
+        }
     }
 
     /// Get total portfolio value including the market value of all open positions.
     ///
     /// Two valuation models coexist, matched per-position by whether it's an
     /// option:
-    /// - Options (untouched by leverage -- see module docs): the pre-existing
-    ///   credit-premium model, `+price*qty` for a long holding, `-price*qty`
-    ///   for a short (written) position.
+    /// - Options (untouched by leverage -- see module docs): `apply_derivative_fill`
+    ///   already debited/credited the full premium (`x contract_multiplier`)
+    ///   from `balance` at fill time, so what this position still
+    ///   contributes ON TOP of that is its unrealized P&L since entry --
+    ///   `position.unrealized_pnl`, the same value `update_position_greeks`
+    ///   computes from the real Black-Scholes mark (sign already handled
+    ///   per side there). NOT `mark_price * quantity` (a real, pre-existing
+    ///   bug fixed 2026-09-02: that formula omits `contract_multiplier`
+    ///   entirely, which doesn't cancel against the multiplier-scaled
+    ///   premium debit already reflected in `balance` -- dormant only
+    ///   because `mark_price` was always `None` before `update_position_greeks`
+    ///   had any callers, at which point it silently fell back to
+    ///   `entry_price`, itself still wrong for any multiplier != 1.0).
     /// - Everything else (spot and futures/perps, with or without leverage):
     ///   `margin_posted + unrealized_pnl`. At `leverage = 1.0` this is
     ///   algebraically identical to the old `mark_price * quantity` formula
@@ -438,11 +590,7 @@ impl PortfolioState {
                     .map(|i| i.instrument_kind.is_option())
                     .unwrap_or(false);
                 if is_option {
-                    let price = position.mark_price.unwrap_or(position.entry_price);
-                    match position.side {
-                        PositionSide::Long => position_value += price * position.quantity,
-                        PositionSide::Short => position_value -= price * position.quantity,
-                    }
+                    position_value += position.unrealized_pnl;
                 } else {
                     position_value += position.margin_posted + position.unrealized_pnl;
                 }
@@ -452,14 +600,35 @@ impl PortfolioState {
         self.balance + position_value
     }
 
-    /// Update unrealized P&L for all open positions based on current market price
+    /// Update unrealized P&L for all open positions based on current market
+    /// price. Skips option positions entirely (2026-09-02): when Greeks
+    /// wiring is active, `update_position_greeks` already marked them this
+    /// same tick from the real Black-Scholes theoretical price -- `current_price`
+    /// here is frequently the WRONG series for an option anyway (the
+    /// option's own tick price in the single-leg engine, not the
+    /// underlying's -- see `PythonSimConfig.underlying_series`'s doc
+    /// comment), and even when it happened to be the underlying's price,
+    /// the plain `(current_price - entry) * quantity` formula is simply
+    /// wrong for option economics. Overwriting a fresher, correct mark with
+    /// this formula would silently clobber it. An option position not yet
+    /// marked by `update_position_greeks` this run keeps its default
+    /// `unrealized_pnl` (`0.0`), which still folds into `total_unrealized`
+    /// below exactly like every other position.
     pub fn update_unrealized_pnl(&mut self, current_price: f64) {
         let mut total_unrealized = 0.0;
-        
+
         for position in &mut self.positions {
             if position.close_time.is_none() && position.quantity > 0.0 {
+                let is_option = position.instrument.as_ref()
+                    .map(|i| i.instrument_kind.is_option())
+                    .unwrap_or(false);
+                if is_option {
+                    total_unrealized += position.unrealized_pnl;
+                    continue;
+                }
+
                 position.mark_price = Some(current_price);
-                
+
                 let pnl = match position.side {
                     PositionSide::Long => {
                         (current_price - position.entry_price) * position.quantity
@@ -468,7 +637,7 @@ impl PortfolioState {
                         (position.entry_price - current_price) * position.quantity
                     }
                 };
-                
+
                 position.unrealized_pnl = pnl;
                 total_unrealized += pnl;
             }
@@ -494,26 +663,52 @@ impl PortfolioState {
             .sum()
     }
 
-    /// Unrealized P&L across all open, non-option positions if marked at
-    /// `current_price`. Read-only sibling to [`update_unrealized_pnl`], for
-    /// use mid-tick when a fresh mark-to-market equity figure is needed
-    /// without waiting for the once-per-tick `update_unrealized_pnl` call
-    /// (or mutating position state).
+    /// Unrealized P&L across all open positions if marked at `current_price`
+    /// -- plain (non-derivative) positions using that price directly; option
+    /// positions using their own `unrealized_pnl` (already freshly computed
+    /// from a real Black-Scholes mark by `update_position_greeks`, when
+    /// Greeks wiring is active for this run -- see `get_total_value`'s doc
+    /// comment for why `current_price` can't be used for an option the same
+    /// way, and why this must match its formula). Read-only sibling to
+    /// [`update_unrealized_pnl`], for use mid-tick when a fresh mark-to-
+    /// market equity figure is needed without waiting for the once-per-tick
+    /// `update_unrealized_pnl` call (or mutating position state).
+    ///
+    /// Futures/perps (a derivative position that isn't an option) still
+    /// contribute `0.0` here, unchanged from before this option fix
+    /// (2026-09-02) -- no per-tick mark-to-market wiring exists for them
+    /// yet (`update_position_greeks` only prices options via Black-Scholes),
+    /// and applying the plain formula to them would be wrong in the same
+    /// multiplier-omitting way `get_total_value`'s old option formula was.
+    /// A real, separate follow-up, not fixed here.
     pub fn unrealized_pnl_at(&self, current_price: f64) -> f64 {
         self.positions.iter()
-            .filter(|p| p.close_time.is_none() && p.quantity > 0.0 && p.instrument.is_none())
-            .map(|p| match p.side {
-                PositionSide::Long => (current_price - p.entry_price) * p.quantity,
-                PositionSide::Short => (p.entry_price - current_price) * p.quantity,
+            .filter(|p| p.close_time.is_none() && p.quantity > 0.0)
+            .map(|p| {
+                let is_option = p.instrument.as_ref()
+                    .map(|i| i.instrument_kind.is_option())
+                    .unwrap_or(false);
+                if is_option {
+                    p.unrealized_pnl
+                } else if p.instrument.is_none() {
+                    match p.side {
+                        PositionSide::Long => (current_price - p.entry_price) * p.quantity,
+                        PositionSide::Short => (p.entry_price - current_price) * p.quantity,
+                    }
+                } else {
+                    0.0
+                }
             })
             .sum()
     }
 
     /// Mark-to-market equity at `current_price`: free cash + margin currently
-    /// posted for open positions + unrealized P&L. This is the leverage-
-    /// correct successor to the naive `balance + net_position * current_price`
-    /// formula, which overstates equity once a position is only margin-backed
-    /// rather than fully owned (see `portfoliomanager::margin`'s module docs).
+    /// posted for open positions + unrealized P&L (options included via
+    /// their own Greeks-derived mark, see `unrealized_pnl_at`'s doc comment
+    /// -- 2026-09-02). This is the leverage-correct successor to the naive
+    /// `balance + net_position * current_price` formula, which overstates
+    /// equity once a position is only margin-backed rather than fully owned
+    /// (see `portfoliomanager::margin`'s module docs).
     pub fn equity_at(&self, current_price: f64) -> f64 {
         self.balance + self.margin_used() + self.unrealized_pnl_at(current_price)
     }
@@ -546,6 +741,13 @@ impl PortfolioState {
     /// short -- shorting a future/perp requires posting margin, it doesn't
     /// pay you a premium), capped by available margin/buying power.
     pub fn apply_derivative_fill(&mut self, fill: &Fill, instrument: &DerivativeMetadata) -> Result<f64> {
+        self.apply_derivative_fill_with_outcome(fill, instrument).map(|o| o.executed_quantity)
+    }
+
+    /// Like [`apply_derivative_fill`](Self::apply_derivative_fill) but returns
+    /// full detail about what happened to the ledger -- see `FillOutcome`'s
+    /// doc comment and [`apply_fill_executed_with_outcome`](Self::apply_fill_executed_with_outcome).
+    pub fn apply_derivative_fill_with_outcome(&mut self, fill: &Fill, instrument: &DerivativeMetadata) -> Result<FillOutcome> {
         let symbol = instrument.symbol.clone();
         let multiplier = instrument.contract_multiplier;
         let is_option = instrument.instrument_kind.is_option();
@@ -554,7 +756,7 @@ impl PortfolioState {
         self.timestamp = fill.timestamp;
         let requested_quantity = fill.quantity;
         if requested_quantity <= 0.0 {
-            return Ok(0.0);
+            return Ok(FillOutcome::zero(symbol));
         }
 
         let has_open_long = self.positions.iter()
@@ -568,22 +770,31 @@ impl PortfolioState {
                 let available = self.get_available_short_quantity(&symbol);
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let trade_value = fill.price * executed_quantity * multiplier;
                 let fee_amount = fill.fee_amount * execution_ratio;
                 self.fees_paid += fee_amount;
-                let (realized, margin_released) = self.reduce_short_position(&symbol, executed_quantity, fill.price, fill.timestamp);
+                let reduce = self.reduce_short_position(&symbol, executed_quantity, fill.price, fill.timestamp);
                 if is_option {
                     self.balance -= trade_value;
                 } else {
-                    self.balance += margin_released;
+                    self.balance += reduce.margin_released;
                 }
                 self.balance -= fee_amount;
                 self.net_position += executed_quantity;
-                self.realized_pnl += realized;
-                Ok(executed_quantity)
+                self.realized_pnl += reduce.realized_pnl;
+                Ok(FillOutcome {
+                    executed_quantity, symbol,
+                    closed_side: Some(PositionSide::Short),
+                    closed_entry_price: Some(reduce.entry_price),
+                    closed_open_time: Some(reduce.open_time),
+                    realized_pnl: Some(reduce.realized_pnl),
+                    margin_released: Some(reduce.margin_released),
+                    position_fully_closed: reduce.fully_closed,
+                    remaining_open_quantity: reduce.remaining_quantity,
+                })
             }
             BookSide::Bid => {
                 // Buy-to-open (or add to) a long.
@@ -594,7 +805,7 @@ impl PortfolioState {
                 };
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let trade_value = fill.price * executed_quantity * multiplier;
@@ -604,7 +815,7 @@ impl PortfolioState {
                 self.balance -= margin_posted;
                 self.balance -= fee_amount;
                 self.net_position += executed_quantity;
-                self.add_to_long_position_with_instrument(
+                let new_total = self.add_to_long_position_with_instrument(
                     &symbol,
                     executed_quantity,
                     fill.price,
@@ -612,29 +823,43 @@ impl PortfolioState {
                     Some(instrument.clone()),
                     if is_option { 0.0 } else { margin_posted },
                 );
-                Ok(executed_quantity)
+                Ok(FillOutcome {
+                    executed_quantity, symbol, closed_side: None,
+                    closed_entry_price: None, closed_open_time: None,
+                    realized_pnl: None, margin_released: None,
+                    position_fully_closed: false, remaining_open_quantity: new_total,
+                })
             }
             BookSide::Ask if has_open_long => {
                 // Sell-to-close an existing long.
                 let available = self.get_available_quantity(&symbol, &fill.side, fill.price);
                 let executed_quantity = requested_quantity.min(available);
                 if executed_quantity < 1e-10 {
-                    return Ok(0.0);
+                    return Ok(FillOutcome::zero(symbol));
                 }
                 let execution_ratio = executed_quantity / requested_quantity;
                 let trade_value = fill.price * executed_quantity * multiplier;
                 let fee_amount = fill.fee_amount * execution_ratio;
                 self.fees_paid += fee_amount;
-                let (realized, margin_released) = self.reduce_long_position(&symbol, executed_quantity, fill.price, fill.timestamp);
+                let reduce = self.reduce_long_position(&symbol, executed_quantity, fill.price, fill.timestamp);
                 if is_option {
                     self.balance += trade_value;
                 } else {
-                    self.balance += margin_released;
+                    self.balance += reduce.margin_released;
                 }
                 self.balance -= fee_amount;
                 self.net_position -= executed_quantity;
-                self.realized_pnl += realized;
-                Ok(executed_quantity)
+                self.realized_pnl += reduce.realized_pnl;
+                Ok(FillOutcome {
+                    executed_quantity, symbol,
+                    closed_side: Some(PositionSide::Long),
+                    closed_entry_price: Some(reduce.entry_price),
+                    closed_open_time: Some(reduce.open_time),
+                    realized_pnl: Some(reduce.realized_pnl),
+                    margin_released: Some(reduce.margin_released),
+                    position_fully_closed: reduce.fully_closed,
+                    remaining_open_quantity: reduce.remaining_quantity,
+                })
             }
             BookSide::Ask => {
                 // Sell-to-open (write) a new short, or add to an existing one.
@@ -650,19 +875,24 @@ impl PortfolioState {
                     self.balance += trade_value;
                     self.balance -= fee_amount;
                     self.net_position -= executed_quantity;
-                    self.add_to_short_position_with_instrument(
+                    let new_total = self.add_to_short_position_with_instrument(
                         &symbol, executed_quantity, fill.price, fill.timestamp,
                         Some(instrument.clone()), 0.0,
                     );
-                    Ok(executed_quantity)
+                    Ok(FillOutcome {
+                        executed_quantity, symbol, closed_side: None,
+                        closed_entry_price: None, closed_open_time: None,
+                        realized_pnl: None, margin_released: None,
+                        position_fully_closed: false, remaining_open_quantity: new_total,
+                    })
                 } else {
                     if fill.price <= 0.0 {
-                        return Ok(0.0);
+                        return Ok(FillOutcome::zero(symbol));
                     }
                     let available = ((self.balance * 0.95 * leverage) / (fill.price * multiplier)).max(0.0);
                     let executed_quantity = requested_quantity.min(available);
                     if executed_quantity < 1e-10 {
-                        return Ok(0.0);
+                        return Ok(FillOutcome::zero(symbol));
                     }
                     let execution_ratio = executed_quantity / requested_quantity;
                     let trade_value = fill.price * executed_quantity * multiplier;
@@ -672,11 +902,16 @@ impl PortfolioState {
                     self.balance -= margin_posted;
                     self.balance -= fee_amount;
                     self.net_position -= executed_quantity;
-                    self.add_to_short_position_with_instrument(
+                    let new_total = self.add_to_short_position_with_instrument(
                         &symbol, executed_quantity, fill.price, fill.timestamp,
                         Some(instrument.clone()), margin_posted,
                     );
-                    Ok(executed_quantity)
+                    Ok(FillOutcome {
+                        executed_quantity, symbol, closed_side: None,
+                        closed_entry_price: None, closed_open_time: None,
+                        realized_pnl: None, margin_released: None,
+                        position_fully_closed: false, remaining_open_quantity: new_total,
+                    })
                 }
             }
         }
@@ -704,7 +939,7 @@ impl PortfolioState {
         timestamp: DateTime<Utc>,
         instrument: Option<DerivativeMetadata>,
         margin_posted: f64,
-    ) {
+    ) -> f64 {
         let existing = self.positions.iter_mut()
             .find(|p| p.symbol == symbol && p.close_time.is_none() && p.side == PositionSide::Short);
 
@@ -722,6 +957,7 @@ impl PortfolioState {
                 if position.instrument.is_none() {
                     position.instrument = instrument;
                 }
+                new_quantity
             }
             None => {
                 self.positions.push(Position {
@@ -738,6 +974,7 @@ impl PortfolioState {
                     greeks: None,
                     margin_posted,
                 });
+                quantity
             }
         }
     }
@@ -754,10 +991,15 @@ impl PortfolioState {
         quantity: f64,
         price: f64,
         timestamp: DateTime<Utc>,
-    ) -> (f64, f64) {
+    ) -> ReduceOutcome {
         let mut remaining_to_cover = quantity;
         let mut total_realized_pnl = 0.0;
         let mut total_margin_released = 0.0;
+        let mut entry_price = 0.0;
+        let mut open_time = timestamp;
+        let mut fully_closed = false;
+        let mut remaining_quantity = 0.0;
+        let mut matched = 0u32;
 
         for position in self.positions.iter_mut()
             .filter(|p| p.symbol == symbol && p.close_time.is_none() && p.side == PositionSide::Short)
@@ -767,6 +1009,10 @@ impl PortfolioState {
             }
             let cover_from_this = remaining_to_cover.min(position.quantity);
             if cover_from_this > 0.0 {
+                matched += 1;
+                entry_price = position.entry_price;
+                open_time = position.open_time;
+
                 let pnl = (position.entry_price - price) * cover_from_this;
                 let margin_fraction = if position.quantity > 0.0 { cover_from_this / position.quantity } else { 0.0 };
                 let margin_released = position.margin_posted * margin_fraction;
@@ -781,11 +1027,22 @@ impl PortfolioState {
                 if position.quantity < 1e-10 {
                     position.quantity = 0.0;
                     position.close_time = Some(timestamp);
+                    fully_closed = true;
+                } else {
+                    remaining_quantity = position.quantity;
                 }
             }
         }
+        debug_assert!(matched <= 1, "reduce_short_position matched {} lots for {} -- single-open-lot-per-side invariant broken", matched, symbol);
 
-        (total_realized_pnl, total_margin_released)
+        ReduceOutcome {
+            realized_pnl: total_realized_pnl,
+            margin_released: total_margin_released,
+            entry_price,
+            open_time,
+            fully_closed,
+            remaining_quantity,
+        }
     }
 
     /// Like [`add_to_long_position`] but tags a new position with derivative metadata.
@@ -800,7 +1057,7 @@ impl PortfolioState {
         timestamp: DateTime<Utc>,
         instrument: Option<DerivativeMetadata>,
         margin_posted: f64,
-    ) {
+    ) -> f64 {
         let existing = self.positions.iter_mut()
             .find(|p| p.symbol == symbol && p.close_time.is_none() && p.side == PositionSide::Long);
 
@@ -818,6 +1075,7 @@ impl PortfolioState {
                 if position.instrument.is_none() {
                     position.instrument = instrument;
                 }
+                new_quantity
             }
             None => {
                 self.positions.push(Position {
@@ -834,6 +1092,7 @@ impl PortfolioState {
                     greeks: None,
                     margin_posted,
                 });
+                quantity
             }
         }
     }
@@ -1139,6 +1398,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_fill_executed_with_outcome_reports_closed_side_and_realized_pnl_on_cover_short() {
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let sell_fill = create_fill(BookSide::Ask, 50_000.0, 1.0);
+        portfolio.apply_fill_executed_with_outcome(&sell_fill).unwrap(); // opens a short
+
+        let cover_fill = create_fill(BookSide::Bid, 48_000.0, 1.0);
+        let outcome = portfolio.apply_fill_executed_with_outcome(&cover_fill).unwrap();
+
+        assert_eq!(outcome.closed_side, Some(PositionSide::Short));
+        assert!((outcome.closed_entry_price.unwrap() - 50_000.0).abs() < 1e-6);
+        assert!((outcome.realized_pnl.unwrap() - 2_000.0).abs() < 1e-6, "short covered $2k cheaper than opened, got {:?}", outcome.realized_pnl);
+        assert!(outcome.position_fully_closed);
+        assert!((outcome.remaining_open_quantity - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_fill_executed_with_outcome_partial_close_reports_remaining_quantity() {
+        let mut portfolio = PortfolioState::with_balance(200_000.0);
+        let buy_fill = create_fill(BookSide::Bid, 100.0, 10.0);
+        portfolio.apply_fill_executed_with_outcome(&buy_fill).unwrap();
+
+        let sell_fill = create_fill(BookSide::Ask, 110.0, 4.0);
+        let outcome = portfolio.apply_fill_executed_with_outcome(&sell_fill).unwrap();
+
+        assert_eq!(outcome.closed_side, Some(PositionSide::Long));
+        assert!(!outcome.position_fully_closed, "selling 4 of 10 must not report a full close");
+        assert!((outcome.remaining_open_quantity - 6.0).abs() < 1e-9);
+        assert!((outcome.closed_entry_price.unwrap() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_fill_executed_with_outcome_scale_in_reports_none_closed_side_and_new_total() {
+        let mut portfolio = PortfolioState::with_balance(200_000.0);
+        let first = create_fill(BookSide::Bid, 100.0, 10.0);
+        portfolio.apply_fill_executed_with_outcome(&first).unwrap();
+
+        let second = create_fill(BookSide::Bid, 110.0, 5.0);
+        let outcome = portfolio.apply_fill_executed_with_outcome(&second).unwrap();
+
+        assert_eq!(outcome.closed_side, None, "adding to a long is an entry, not a close");
+        let expected_blended_total = 15.0;
+        assert!((outcome.remaining_open_quantity - expected_blended_total).abs() < 1e-9);
+        let position = portfolio.positions.iter().find(|p| p.close_time.is_none()).unwrap();
+        let expected_entry = (10.0 * 100.0 + 5.0 * 110.0) / 15.0;
+        assert!((position.entry_price - expected_entry).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_cannot_buy_more_than_balance_allows() {
         let mut portfolio = PortfolioState::with_balance(10_000.0);
         
@@ -1391,6 +1698,79 @@ mod tests {
         let equity_at = portfolio.equity_at(52_000.0);
         assert!((total_value - equity_at).abs() < 1e-6,
             "get_total_value and equity_at should agree: {total_value} vs {equity_at}");
+    }
+
+    #[test]
+    fn get_total_value_matches_equity_at_for_a_marked_long_option() {
+        // Regression test for the 2026-09-02 fix: get_total_value's old
+        // option formula (`mark_price * quantity`, no contract_multiplier)
+        // disagreed with the economically correct value the moment
+        // mark_price stopped being None -- confirm both now agree AND both
+        // equal the textbook value (uninvested cash + current P&L).
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = Fill { fee_amount: 0.0, ..create_fill(BookSide::Bid, 5.0, 10.0) }; // $5 premium, 10 contracts, no fee
+        let executed = portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        assert_eq!(executed, 10.0);
+
+        let balance_after_open = portfolio.balance;
+        assert!((balance_after_open - (100_000.0 - 5.0 * 10.0 * 100.0)).abs() < 1e-6);
+
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+        let position = portfolio.positions.iter().find(|p| p.symbol == instrument.symbol).unwrap();
+        let mark = position.mark_price.expect("update_position_greeks should have set a mark price");
+        let expected_pnl = (mark - 5.0) * 10.0 * 100.0;
+        assert!((position.unrealized_pnl - expected_pnl).abs() < 1e-6);
+
+        let total_value = portfolio.get_total_value();
+        let equity_at = portfolio.equity_at(999_999.0); // deliberately nonsensical for an option -- must be ignored
+        assert!((total_value - equity_at).abs() < 1e-6,
+            "get_total_value and equity_at should agree: {total_value} vs {equity_at}");
+
+        let expected_equity = balance_after_open + expected_pnl;
+        assert!((equity_at - expected_equity).abs() < 1e-6,
+            "expected equity {expected_equity} (uninvested cash + current option P&L), got {equity_at}");
+    }
+
+    #[test]
+    fn update_unrealized_pnl_does_not_clobber_an_option_positions_greeks_derived_mark() {
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = create_fill(BookSide::Bid, 5.0, 1.0);
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+        let mark_before = portfolio.positions[0].mark_price;
+        let pnl_before = portfolio.positions[0].unrealized_pnl;
+        assert!(mark_before.is_some());
+
+        // A wildly different "current_price" -- if this were applied via the
+        // plain formula it would produce a completely different mark/pnl.
+        portfolio.update_unrealized_pnl(1.0);
+
+        assert_eq!(portfolio.positions[0].mark_price, mark_before,
+            "an option's Greeks-derived mark must not be overwritten by the plain mark-to-market formula");
+        assert_eq!(portfolio.positions[0].unrealized_pnl, pnl_before);
+        // Still folds into the aggregate.
+        assert!((portfolio.unrealized_pnl - pnl_before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unrealized_pnl_at_uses_the_options_own_greeks_derived_pnl_not_current_price() {
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let expiry = Utc::now() + chrono::Duration::days(30);
+        let instrument = call_instrument(450.0, expiry);
+        let fill = create_fill(BookSide::Bid, 5.0, 1.0);
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, Utc::now());
+
+        let expected_pnl = portfolio.positions[0].unrealized_pnl;
+        // current_price is irrelevant for an option leg -- confirm two very
+        // different values produce the identical result.
+        assert_eq!(portfolio.unrealized_pnl_at(1.0), expected_pnl);
+        assert_eq!(portfolio.unrealized_pnl_at(999_999.0), expected_pnl);
     }
 
     #[test]

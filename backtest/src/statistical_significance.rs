@@ -216,12 +216,18 @@ pub fn compute_bootstrap_confidence_intervals(
     let mut win_rates: Vec<f64> = results.iter().map(|r| r.3).collect();
     let mut profit_factors: Vec<f64> = results.iter().map(|r| r.4).collect();
     
-    // Sort for percentile calculation
-    sharpes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    drawdowns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    win_rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    profit_factors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort for percentile calculation. total_cmp, not
+    // partial_cmp().unwrap_or(Equal) -- a NaN Sharpe/profit_factor from a
+    // degenerate (e.g. 0-trade) result treated as "equal" to every value
+    // breaks transitivity; this exact pattern crashed the BacktestingEngine
+    // job-coordinator in a self-perpetuating restart loop, blocking every
+    // queued job for ~5 hours (2026-09-16 production incident). total_cmp
+    // defines a genuine total order over every f64 including NaN.
+    sharpes.sort_by(f64::total_cmp);
+    returns.sort_by(f64::total_cmp);
+    drawdowns.sort_by(f64::total_cmp);
+    win_rates.sort_by(f64::total_cmp);
+    profit_factors.sort_by(f64::total_cmp);
     
     let p025 = (0.025 * n_iterations as f64) as usize;
     let p005 = (0.005 * n_iterations as f64) as usize;

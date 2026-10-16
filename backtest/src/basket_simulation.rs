@@ -19,8 +19,9 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::pair_simulation::PairLegFeeConfig;
+use crate::pair_simulation::{leg_multiplier, PairLegFeeConfig};
 use crate::types::{TradeLeg, TradeRecord};
+use derivatives::DerivativeMetadata;
 use portfoliomanager::PositionSide;
 use strategy::traits::{BasketSpec, BasketWeightMode, VenueSeries};
 
@@ -73,6 +74,9 @@ struct OpenLeg {
     entry_price: f64,
     entry_commission: f64,
     entry_slippage: f64,
+    /// See `pair_simulation::OpenLeg::option_instrument`'s doc comment --
+    /// identical role here, N-leg generalized.
+    option_instrument: Option<DerivativeMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,13 +153,28 @@ fn close_basket_position(
 
     for i in 0..n_legs {
         let leg = &pos.legs[i];
-        let (exit_fill, exit_comm, exit_slip) = crate::pair_simulation::taker_fill(exit_prices[i], leg.quantity, leg.side == "short", fees[i]);
-        let raw = (exit_fill - leg.entry_price) * leg.quantity;
-        let leg_pnl = (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission - exit_comm;
+        let (exit_fill, exit_comm, exit_slip) = crate::pair_simulation::taker_fill(exit_prices[i], leg.quantity, leg.side == "short", fees[i], leg.option_instrument.as_ref());
+        let multiplier = leg_multiplier(leg.option_instrument.as_ref());
+        let raw = (exit_fill - leg.entry_price) * leg.quantity * multiplier;
+        // Overnight financing over the holding period -- see
+        // PairLegFeeConfig::swap_fee_daily.
+        let financing = crate::pair_simulation::swap_cost(
+            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+            fees[i],
+            pos.entry_time,
+            exit_time,
+        ) - crate::pair_simulation::carry_pnl(
+            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+            leg.side == "long",
+            fees[i],
+            pos.entry_time,
+            exit_time,
+        );
+        let leg_pnl = (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission - exit_comm - financing;
         net_pnl += leg_pnl;
         total_commission += leg.entry_commission + exit_comm;
         total_slippage += leg.entry_slippage + exit_slip;
-        entry_notional += leg.entry_price * leg.quantity;
+        entry_notional += leg.entry_price * leg.quantity * multiplier;
 
         leg_records.push(TradeLeg {
             exchange: leg.exchange.clone(),
@@ -258,14 +277,23 @@ pub fn run_basket_backtest(
         // Margin-call liquidation check, evaluated before this tick's
         // ordinary signal handling -- mirrors `pair_simulation.rs`'s exact
         // placement/priority and atomic-close-of-every-leg reasoning (see
-        // that module's doc note). No-op at `leverage<=1.0`.
-        if config.leverage > 1.0 {
+        // that module's doc note). Runs at every leverage: a basket carries
+        // short legs, and a 1x short's posted margin is exhausted once its
+        // price doubles (`margin::liquidation_price`; 1x long legs never
+        // trigger).
+        {
             if let Some(pos_ref) = open.as_ref() {
                 let extremes: Vec<(f64, f64)> = leg_venues.iter().map(|v| (v.lows[t], v.highs[t])).collect();
                 let extremes_valid = extremes.iter().all(|(l, h)| l.is_finite() && h.is_finite());
                 if extremes_valid {
                     let sides: Vec<PositionSide> = pos_ref.legs.iter().map(|leg| crate::pair_simulation::leg_position_side(leg.side)).collect();
+                    // An option leg is exempt from this leveraged-futures
+                    // margin-call formula -- see `OpenLeg::option_instrument`'s
+                    // doc comment.
                     let triggered: Vec<bool> = (0..n_legs).map(|i| {
+                        if pos_ref.legs[i].option_instrument.is_some() {
+                            return false;
+                        }
                         let extreme = if sides[i] == PositionSide::Long { extremes[i].0 } else { extremes[i].1 };
                         portfoliomanager::margin::is_liquidated(extreme, pos_ref.legs[i].entry_price, sides[i], config.leverage, config.maintenance_margin_ratio)
                     }).collect();
@@ -352,7 +380,8 @@ pub fn run_basket_backtest(
                                 let weight_sign = if i == 0 { 1.0 } else { w[i].signum() };
                                 let is_long = if long_combination { weight_sign > 0.0 } else { weight_sign < 0.0 };
                                 let side: &'static str = if is_long { "long" } else { "short" };
-                                let (fill_price, commission, slippage) = crate::pair_simulation::taker_fill(prices[i], quantities[i], is_long, fees[i]);
+                                let option_instrument = basket_spec.legs[i].option_instrument.clone();
+                                let (fill_price, commission, slippage) = crate::pair_simulation::taker_fill(prices[i], quantities[i], is_long, fees[i], option_instrument.as_ref());
                                 open_legs.push(OpenLeg {
                                     symbol: basket_spec.legs[i].symbol.clone(),
                                     exchange: basket_spec.legs[i].exchange.clone(),
@@ -361,6 +390,7 @@ pub fn run_basket_backtest(
                                     entry_price: fill_price,
                                     entry_commission: commission,
                                     entry_slippage: slippage,
+                                    option_instrument,
                                 });
                             }
                             open = Some(OpenBasketPosition {
@@ -390,9 +420,23 @@ pub fn run_basket_backtest(
             if !prices_valid {
                 0.0
             } else {
+                let now = timestamp_from_millis(leg_venues[0].timestamps[t]);
                 pos.legs.iter().enumerate().map(|(i, leg)| {
-                    let raw = (prices[i] - leg.entry_price) * leg.quantity;
+                    let raw = (prices[i] - leg.entry_price) * leg.quantity * leg_multiplier(leg.option_instrument.as_ref());
                     (if leg.side == "long" { raw } else { -raw }) - leg.entry_commission
+                        - crate::pair_simulation::swap_cost(
+                            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+                            fees[i],
+                            pos.entry_time,
+                            now,
+                        )
+                        + crate::pair_simulation::carry_pnl(
+                            crate::pair_simulation::leg_notional(leg.entry_price, leg.quantity, leg.option_instrument.as_ref()),
+                            leg.side == "long",
+                            fees[i],
+                            pos.entry_time,
+                            now,
+                        )
                 }).sum()
             }
         }).unwrap_or(0.0);
@@ -478,15 +522,26 @@ mod tests {
     }
 
     fn zero_fee() -> PairLegFeeConfig {
-        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0 }
+        PairLegFeeConfig { taker_fee: 0.0, slippage_bps: 0.0, swap_fee_daily: 0.0, carry_annual_by_year: [0.0; config::POLICY_RATE_YEARS] }
+    }
+
+    fn test_call_instrument(symbol: &str, underlying: &str, strike: f64) -> DerivativeMetadata {
+        DerivativeMetadata::new(
+            symbol,
+            underlying,
+            derivatives::InstrumentKind::Call { strike, expiry: Utc::now() },
+            100.0,
+            "USD",
+            "test",
+        )
     }
 
     fn simple_basket_spec() -> BasketSpec {
         BasketSpec {
             legs: vec![
-                BasketLeg { symbol: "AAA".to_string(), exchange: "test".to_string() },
-                BasketLeg { symbol: "BBB".to_string(), exchange: "test".to_string() },
-                BasketLeg { symbol: "CCC".to_string(), exchange: "test".to_string() },
+                BasketLeg { symbol: "AAA".to_string(), exchange: "test".to_string(), option_instrument: None },
+                BasketLeg { symbol: "BBB".to_string(), exchange: "test".to_string(), option_instrument: None },
+                BasketLeg { symbol: "CCC".to_string(), exchange: "test".to_string(), option_instrument: None },
             ],
             weight_mode: BasketWeightMode::Fixed(vec![1.0, -1.0, -0.5]),
         }
@@ -504,8 +559,8 @@ mod tests {
     fn rejects_baskets_with_fewer_than_three_legs() {
         let spec = BasketSpec {
             legs: vec![
-                BasketLeg { symbol: "AAA".to_string(), exchange: "test".to_string() },
-                BasketLeg { symbol: "BBB".to_string(), exchange: "test".to_string() },
+                BasketLeg { symbol: "AAA".to_string(), exchange: "test".to_string(), option_instrument: None },
+                BasketLeg { symbol: "BBB".to_string(), exchange: "test".to_string(), option_instrument: None },
             ],
             weight_mode: BasketWeightMode::Fixed(vec![1.0, -1.0]),
         };
@@ -725,12 +780,13 @@ mod tests {
         assert!(reason.contains("CCC"), "reason={reason}");
     }
 
-    #[test]
-    fn liquidation_never_triggers_at_leverage_one_regardless_of_price() {
+    /// Runs the 3-leg basket at 1x with leg C (a SHORT leg, weight -0.5 in
+    /// `simple_basket_spec`) spiking intrabar to `c_spike_high`.
+    fn run_leverage_one_short_leg_spike(c_spike_high: f64) -> BasketBacktestResult {
         let a_prices = vec![100.0, 100.0];
         let b_prices = vec![50.0, 50.0];
         let c_prices = vec![30.0, 30.0];
-        let c_highs = vec![30.0, 1000.0]; // catastrophic intrabar spike
+        let c_highs = vec![30.0, c_spike_high];
 
         let mut venues = HashMap::new();
         venues.insert(("AAA".to_string(), "test".to_string()), venue_series_with_range(a_prices.clone(), a_prices.clone(), a_prices));
@@ -740,9 +796,90 @@ mod tests {
         let fees = vec![zero_fee(); 3];
         let config = BasketBacktestConfig { max_net_exposure_pct: 1.0, leverage: 1.0, ..BasketBacktestConfig::default() };
         let signals = vec![1i8, 0];
-        let result = run_basket_backtest(&venues, &simple_basket_spec(), &signals, &fees, config).unwrap();
+        run_basket_backtest(&venues, &simple_basket_spec(), &signals, &fees, config).unwrap()
+    }
 
+    #[test]
+    fn leverage_one_short_leg_liquidates_once_its_price_doubles() {
+        // Previously asserted ZERO liquidations for this exact 33x spike --
+        // "leverage-off = no liquidation" -- which let an unleveraged short
+        // lose an unbounded multiple of its posted margin. A 1x short has
+        // posted 100% margin; it is gone once price doubles.
+        let result = run_leverage_one_short_leg_spike(1000.0);
+        assert_eq!(result.liquidations, 1);
+        let reason = result.trades[0].exit_reason.as_ref().unwrap();
+        assert!(reason.contains("margin_call_liquidation"), "reason={reason}");
+    }
+
+    #[test]
+    fn leverage_one_short_leg_survives_an_adverse_move_short_of_doubling() {
+        // +67% against the short leg: painful, but its 100% margin covers it.
+        let result = run_leverage_one_short_leg_spike(50.0);
         assert_eq!(result.liquidations, 0);
+    }
+
+    // -- option legs (mirrors pair_simulation's own option-leg tests) -----
+
+    #[test]
+    fn option_leg_pnl_is_scaled_by_contract_multiplier_and_charged_the_real_fee_schedule() {
+        // Leg C (weight -0.5, opens short relative to leg 0's long) is an
+        // option contract -- its PnL and commission must both scale by
+        // `contract_multiplier` (100), using the real Alpaca schedule
+        // regardless of `PairLegFeeConfig.taker_fee`.
+        let a = vec![100.0, 100.0]; // leg A flat
+        let b = vec![50.0, 50.0]; // leg B flat
+        let c = vec![5.0, 4.0]; // leg C (option) premium drops -- profits the short
+        let venues = build_venues(a, b, c);
+
+        let mut spec = simple_basket_spec();
+        spec.legs[2].option_instrument = Some(test_call_instrument("CCC260320C00050000", "CCC", 50.0));
+        let fees = vec![zero_fee(); 3];
+        let config = BasketBacktestConfig { max_net_exposure_pct: 1.0, ..BasketBacktestConfig::default() };
+
+        let signals = vec![1i8, 2];
+        let result = run_basket_backtest(&venues, &spec, &signals, &fees, config).unwrap();
+
+        assert_eq!(result.trades.len(), 1);
+        let leg_c = &result.trades[0].legs[2];
+        assert_eq!(leg_c.side, "short");
+        assert!(leg_c.quantity > 0.0);
+        assert!(leg_c.commission > 0.0, "option leg must be charged the real per-contract fee schedule even at taker_fee=0.0");
+
+        // short leg C: profits when price falls -- raw (5.0-4.0)*qty*100,
+        // less the real Alpaca commission on both fills.
+        let fee_cfg = config::OptionsFeeConfig::alpaca();
+        let entry_comm = fee_cfg.commission_for_fill(5.0, leg_c.quantity, 100.0, false);
+        let exit_comm = fee_cfg.commission_for_fill(4.0, leg_c.quantity, 100.0, true);
+        let expected_leg_c_pnl = (5.0 - 4.0) * leg_c.quantity * 100.0 - entry_comm - exit_comm;
+        // legs A and B are flat plain legs at zero_fee -- contribute 0.
+        assert!((result.trades[0].pnl.unwrap() - expected_leg_c_pnl).abs() < 1e-6,
+            "expected pnl {}, got {}", expected_leg_c_pnl, result.trades[0].pnl.unwrap());
+    }
+
+    #[test]
+    fn option_leg_is_exempt_from_margin_call_liquidation_in_a_basket() {
+        // Same fixture as `single_leg_liquidation_force_closes_the_whole_basket`
+        // (leg C's intrabar high would trigger a short's liquidation at 5x
+        // leverage) but leg C is now an option -- it must never be margin-
+        // called, so no liquidation should fire at all.
+        let a_prices = vec![100.0, 100.0];
+        let b_prices = vec![50.0, 50.0];
+        let c_prices = vec![30.0, 30.0];
+        let c_highs = vec![30.0, 40.0];
+
+        let mut venues = HashMap::new();
+        venues.insert(("AAA".to_string(), "test".to_string()), venue_series_with_range(a_prices.clone(), a_prices.clone(), a_prices));
+        venues.insert(("BBB".to_string(), "test".to_string()), venue_series_with_range(b_prices.clone(), b_prices.clone(), b_prices));
+        venues.insert(("CCC".to_string(), "test".to_string()), venue_series_with_range(c_prices.clone(), c_prices, c_highs));
+
+        let mut spec = simple_basket_spec();
+        spec.legs[2].option_instrument = Some(test_call_instrument("CCC260320C00030000", "CCC", 30.0));
+        let fees = vec![zero_fee(); 3];
+        let config = BasketBacktestConfig { max_net_exposure_pct: 1.0, leverage: 5.0, ..BasketBacktestConfig::default() };
+        let signals = vec![1i8, 0];
+        let result = run_basket_backtest(&venues, &spec, &signals, &fees, config).unwrap();
+
+        assert_eq!(result.liquidations, 0, "an option leg must never be margin-called");
     }
 
     #[test]

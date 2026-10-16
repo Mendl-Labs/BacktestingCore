@@ -7,6 +7,8 @@ use serde::{Serialize, Deserialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use derivatives::Greeks;
+
 use data_prep::SimulationTick;
 use dataloader::{MarketData, TradeData};
 
@@ -159,6 +161,26 @@ pub struct TradeRecord {
     pub legs: Vec<TradeLeg>,
 }
 
+/// Count trades force-closed by a margin call during the simulation.
+///
+/// The single-asset (`python_simulation.rs`), pair (`pair_simulation.rs`) and
+/// basket (`basket_simulation.rs`) engines each record a liquidated position's
+/// forced exit as an ordinary `TradeRecord` whose `exit_reason` starts with
+/// `"margin_call_liquidation"` (the pair/basket engines append the triggering
+/// leg(s), e.g. `"margin_call_liquidation (BTC-USD leg)"`) -- `starts_with`
+/// rather than an exact match so all three variants count. Cross-sectional
+/// backtests model no leverage at all, so this is always 0 there. Used to
+/// populate `VerdictInputs.had_liquidation`: a backtest that blew through its
+/// maintenance margin should never be Promising regardless of how good its
+/// other metrics look, mirroring the Rust-native GA path's existing
+/// `total_liquidations > 0` hard-reject (`genetic::fitness`).
+pub fn count_liquidations(trade_log: &[TradeRecord]) -> usize {
+    trade_log
+        .iter()
+        .filter(|t| t.exit_reason.as_deref().is_some_and(|r| r.starts_with("margin_call_liquidation")))
+        .count()
+}
+
 /// One venue's fill within a multi-venue trade. See `TradeRecord::legs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeLeg {
@@ -192,6 +214,22 @@ pub enum BacktestEvent {
         timestamp: DateTime<Utc>,
     },
     // Add more event types as needed
+}
+
+/// Per-bar signed held weights per instrument (gap-closure plan W3.5), produced only when
+/// `AnalysisConfig::export_per_bar_weights` is on. One row per equity-curve sample point; see
+/// [`crate::per_bar_weights`] for the exact definition of a cell.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PerBarWeights {
+    /// Instrument symbols, in column order of `rows`. The run's data symbol is always the first column (even if
+    /// nothing ever traded); further instruments (option legs) are appended when they first appear and their
+    /// earlier rows are `0.0`.
+    pub symbols: Vec<String>,
+    /// Unix milliseconds of each sampled bar, parallel to `rows` and identical to `equity_curve_timestamps`.
+    pub timestamps: Vec<i64>,
+    /// `rows[bar][column]`: signed held weight at the CLOSE of that bar, after that bar's fills, as a fraction of
+    /// the equity the equity curve records at the same point. Long positive, short negative, flat `0.0`.
+    pub rows: Vec<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -279,6 +317,13 @@ pub struct BacktestResult {
     /// Cleared before serialization (not included in API response).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub price_series: Vec<f64>,
+    /// Opt-in (`AnalysisConfig::export_per_bar_weights`): the signed held
+    /// weight of every instrument at the close of each sampled bar, for the
+    /// replication ladder's Tier III (gap-closure plan W3.5). `None` unless
+    /// the option is on, and then not serialised, so no existing output
+    /// changes. Exact semantics: [`crate::per_bar_weights`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_bar_weights: Option<PerBarWeights>,
     /// Counts of BUY/SELL/HOLD/CLOSE signals emitted by compute_signals().
     /// None when the per-tick fallback path was used instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +374,48 @@ pub struct BacktestResult {
     /// affects trading signals or the pass/fail of the backtest itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_diagnostics: Option<Vec<FeatureDiagnostic>>,
+    /// Contract identity + final Greeks snapshot -- present only when this
+    /// run traded an option instrument or spread (`PythonSimConfig.
+    /// option_instrument`/`option_spread`). `None` for every non-option run,
+    /// unchanged from before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_summary: Option<OptionResultSummary>,
+}
+
+/// Contract identity + final Greeks snapshot for an option-instrument or
+/// option-spread backtest. `contracts` has one entry for a single-leg run,
+/// two for a vertical spread (see `OptionSpreadLeg`'s own scope note).
+/// `final_greeks` is the portfolio's aggregated Greeks as of the last tick
+/// `update_position_greeks` actually ran -- `None` when
+/// `PythonSimConfig.underlying_series` wasn't supplied for this run (Greeks
+/// were never computed at all in that case), or once every option position
+/// has closed (nothing left to aggregate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionResultSummary {
+    pub contracts: Vec<OptionContractInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_greeks: Option<Greeks>,
+}
+
+/// One option contract's static identity -- strike/expiry/type/ratio the
+/// frontend can't derive from the plain trade P&L numbers alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionContractInfo {
+    /// Exchange contract ticker, e.g. "O:AAPL260501C00130000".
+    pub symbol: String,
+    pub underlying: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strike: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<DateTime<Utc>>,
+    /// "call" | "put" | "other" (option_instrument/option_spread are only
+    /// ever populated with actual options today, but this stays honest
+    /// about what InstrumentKind actually said rather than assuming).
+    pub contract_type: String,
+    pub contract_multiplier: f64,
+    /// Signed ratio for this leg (+1 = long, -1 = short). Always 1 for a
+    /// single-leg run; the leg's own `OptionSpreadLeg.ratio` for a spread.
+    pub ratio: i32,
 }
 
 /// IC + quantile analysis for one strategy-declared feature, evaluated
@@ -628,6 +715,78 @@ mod tests {
         assert!(decoded.legs.is_empty());
     }
 
+    // ========================================================================
+    // count_liquidations tests
+    // ========================================================================
+
+    fn mk_trade_with_exit_reason(exit_reason: Option<&str>) -> TradeRecord {
+        TradeRecord {
+            trade_id: 1,
+            side: "long".to_string(),
+            entry_signal_price: 100.0,
+            entry_fill_price: 100.05,
+            exit_signal_price: Some(90.0),
+            exit_fill_price: Some(89.9),
+            quantity: 1.0,
+            pnl: Some(-10.1),
+            pnl_pct: Some(-0.1),
+            commission: 0.1,
+            slippage_cost: 0.1,
+            entry_time: Utc::now(),
+            exit_time: Some(Utc::now()),
+            duration_secs: Some(3600),
+            entry_liquidity: "taker".to_string(),
+            exit_liquidity: Some("taker".to_string()),
+            entry_reason: "signal_buy".to_string(),
+            exit_reason: exit_reason.map(String::from),
+            mae: Some(-0.1),
+            mfe: Some(0.0),
+            legs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn count_liquidations_is_zero_with_no_trades() {
+        assert_eq!(count_liquidations(&[]), 0);
+    }
+
+    #[test]
+    fn count_liquidations_ignores_ordinary_exits() {
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("signal_sell")),
+            mk_trade_with_exit_reason(Some("stop_loss")),
+            mk_trade_with_exit_reason(None),
+        ];
+        assert_eq!(count_liquidations(&trades), 0);
+    }
+
+    #[test]
+    fn count_liquidations_matches_the_single_asset_python_engine_reason() {
+        let trades = vec![mk_trade_with_exit_reason(Some("margin_call_liquidation"))];
+        assert_eq!(count_liquidations(&trades), 1);
+    }
+
+    #[test]
+    fn count_liquidations_matches_the_pair_and_basket_engines_suffixed_reason() {
+        // pair_simulation.rs / basket_simulation.rs append the triggering
+        // leg(s) to the reason string -- must still count as a prefix match.
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("margin_call_liquidation (BTC-USD leg)")),
+            mk_trade_with_exit_reason(Some("margin_call_liquidation (ETH-USD+SOL-USD leg)")),
+        ];
+        assert_eq!(count_liquidations(&trades), 2);
+    }
+
+    #[test]
+    fn count_liquidations_counts_only_the_matching_subset() {
+        let trades = vec![
+            mk_trade_with_exit_reason(Some("signal_sell")),
+            mk_trade_with_exit_reason(Some("margin_call_liquidation")),
+            mk_trade_with_exit_reason(Some("take_profit")),
+        ];
+        assert_eq!(count_liquidations(&trades), 1);
+    }
+
     #[test]
     fn test_trade_record_legs_round_trip_a_multi_venue_trade() {
         let leg_a = TradeLeg {
@@ -750,6 +909,28 @@ mod tests {
         assert_eq!(deser.num_trades, 50);
         assert_eq!(deser.sharpe_ratio, Some(1.5));
         assert_eq!(deser.equity_curve.len(), 3);
+    }
+
+    #[test]
+    fn test_backtest_result_per_bar_weights_absent_unless_exported() {
+        // Off (the default): the field is `None`, never appears in the JSON, and a JSON without it reads back.
+        let result = BacktestResult::default();
+        assert!(result.per_bar_weights.is_none());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("per_bar_weights"));
+        let back: BacktestResult = serde_json::from_str(&json).unwrap();
+        assert!(back.per_bar_weights.is_none());
+        // On: it round-trips exactly.
+        let mut result = BacktestResult::default();
+        result.per_bar_weights = Some(PerBarWeights {
+            symbols: vec!["BTC/USD".into()],
+            timestamps: vec![1_700_000_000_000, 1_700_000_060_000],
+            rows: vec![vec![0.0], vec![1.0]],
+        });
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("per_bar_weights"));
+        let back: BacktestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.per_bar_weights, result.per_bar_weights);
     }
 
     #[test]

@@ -232,7 +232,7 @@ impl IvSurface {
                 + (a.expiry.signed_duration_since(expiry).num_seconds() as f64 / 86400.0).abs();
             let db = (b.strike - strike).abs()
                 + (b.expiry.signed_duration_since(expiry).num_seconds() as f64 / 86400.0).abs();
-            da.partial_cmp(&db).unwrap()
+            da.total_cmp(&db)
         })
     }
 }

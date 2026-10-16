@@ -744,6 +744,39 @@ async fn run_cross_sectional_check(
 // Public types
 // ---------------------------------------------------------------------------
 
+/// One leg of a pre-configured multi-leg option spread -- see
+/// `ValidationConfig.option_spread` / `python_simulation::PythonSimConfig.
+/// option_spread`. Every leg carries its OWN price series, aligned tick-
+/// for-tick (same length and timestamp order) with the primary market_data
+/// series and every other leg's series here -- the caller
+/// (`options_backtest_data` in the `program` crate) is responsible for that
+/// alignment before constructing this; `python_simulation::i8_to_signals`/
+/// the `OptionSpread` fill path both index into `prices` by the SAME
+/// `tick_idx` the primary series uses, with no independent timestamp
+/// matching of their own.
+///
+/// Defined here (not in `python_simulation`, which is gated behind the
+/// `python` feature) because `ValidationConfig` below is NOT feature-gated
+/// and needs this type unconditionally.
+///
+/// Scope: this platform's `job_queue::OptionLeg` array (and therefore
+/// `option_legs.len()`) already supports any leg count, but only 2-leg
+/// (vertical) spreads are wired end-to-end today -- `options_backtest_data`
+/// only resolves and aligns 2 legs. 3+-leg structures (iron condors,
+/// butterflies) are a real, larger follow-up (N-way series alignment,
+/// N-way margin/risk treatment) deliberately not attempted here.
+#[derive(Debug, Clone)]
+pub struct OptionSpreadLeg {
+    pub instrument: derivatives::DerivativeMetadata,
+    /// Signed ratio: positive = long, negative = short -- same convention
+    /// as `signal::SpreadLeg.ratio` and `job_queue::OptionLeg.ratio`.
+    pub ratio: i32,
+    /// This leg's own price at each tick, aligned 1:1 with the primary
+    /// `market_data` series by index (not by re-matching timestamps at
+    /// fill time).
+    pub prices: Vec<f64>,
+}
+
 /// Configuration for the validation pipeline.
 pub struct ValidationConfig {
     /// User Python source code.
@@ -752,8 +785,10 @@ pub struct ValidationConfig {
     pub backtest_config: BacktestConfig,
     /// Exchange fee config.
     pub fee_config: Option<ExchangeFeeConfig>,
-    /// Supplementary data.
-    pub supplementary_data: HashMap<String, f64>,
+    /// User-uploaded alt-data series: key → `(timestamp_ms, value)` points,
+    /// sorted ascending. See `python_simulation::PythonSimConfig::supplementary_data`
+    /// for the point-in-time lookup contract -- this is passed straight through.
+    pub supplementary_data: HashMap<String, Vec<(i64, f64)>>,
     /// Strategy parameters.
     pub parameters: HashMap<String, ParameterValue>,
     /// Number of walk-forward windows (0 = auto, default ~8).
@@ -809,6 +844,25 @@ pub struct ValidationConfig {
     /// gated by the caller on `data_requirements().needs_iv_surface`, not
     /// unconditionally computed for every job.
     pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
+    /// Same shape and same forwarding pattern as `historical_iv_surfaces`
+    /// above: forwarded verbatim into every `run_single_backtest` call this
+    /// config drives, which is the pipeline's central, widely-reused single-
+    /// evaluation primitive (GA candidate scoring, walk-forward IS/OOS
+    /// splits, quick pre-checks, the final full-rigor evaluation -- all of
+    /// them route through it), so setting this once here reaches every
+    /// stage. See `PythonSimConfig.option_instrument`'s doc comment for what
+    /// it actually does. `None` (the default) is the existing, unaffected
+    /// behavior for every non-options job.
+    pub option_instrument: Option<derivatives::DerivativeMetadata>,
+    /// Same forwarding pattern as `option_instrument` above, for a multi-leg
+    /// spread instead of a single contract. See `crate::python_simulation::
+    /// OptionSpreadLeg`'s doc comment for the exact scope (2-leg verticals
+    /// only today).
+    pub option_spread: Option<Vec<OptionSpreadLeg>>,
+    /// Same forwarding pattern as `option_instrument`/`option_spread` above.
+    /// See `PythonSimConfig.underlying_series`'s doc comment -- required for
+    /// `update_position_greeks` to have anything to price Greeks against.
+    pub underlying_series: Option<Vec<f64>>,
 }
 
 impl Default for ValidationConfig {
@@ -833,6 +887,9 @@ impl Default for ValidationConfig {
             mc_confidence_level: 0.95,
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
+            option_instrument: None,
+            option_spread: None,
+            underlying_series: None,
         }
     }
 }
@@ -869,6 +926,11 @@ pub struct ValidationResult {
     /// Whether look-ahead bias was detected (Stage 0 perturbation test).
     #[serde(default)]
     pub look_ahead_detected: Option<bool>,
+    /// W2.1 / G1: the typed result of the causality-by-truncation gate (Stage 0, BLOCKING). `None` when the gate
+    /// could not run (the strategy failed to build or its full run failed -- Stage 1 reports that) or on results
+    /// persisted before the gate existed.
+    #[serde(default)]
+    pub causality_truncation: Option<crate::causality_gate::CausalityTruncationReport>,
     /// Total elapsed time in seconds.
     pub elapsed_seconds: f64,
 }
@@ -1082,6 +1144,22 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         stat_returns.iter().sum::<f64>() / n as f64
     } else { 0.0 };
 
+    // Real observation rate from the actual OOS time span, mirroring the fix
+    // already applied to the in-sample Sharpe calc elsewhere in this file
+    // (see its own comment on `observations_per_year_from_span`). A fixed
+    // sqrt(252) here assumes exactly one trade per trading day; combined
+    // with a handful of sparse OOS trades and no ceiling, that silently
+    // produced meaningless Sharpe ratios in production (e.g. 96.25 on 6
+    // trades, 53.54 on 4 trades) whenever the real trade cadence was
+    // sparser than daily -- which walk-forward OOS windows usually are.
+    let oos_first_ts = results.first().and_then(|r| r.first_trade_timestamp);
+    let oos_last_ts = results.last().and_then(|r| r.last_trade_timestamp);
+    let oos_span_secs: Option<f64> = match (oos_first_ts, oos_last_ts) {
+        (Some(a), Some(b)) if b > a => Some((b - a).num_seconds() as f64),
+        _ => None,
+    };
+    let annualization_factor = metrics::significance::observations_per_year_from_span(n, oos_span_secs).sqrt();
+
     // Sharpe ratio from combined pct returns
     let sharpe = if n > 1 {
         let mean = avg_return;
@@ -1089,7 +1167,10 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
             .map(|r| (r - mean).powi(2))
             .sum::<f64>() / (n - 1) as f64;
         let std = variance.sqrt();
-        if std > 1e-12 { mean / std * 252.0_f64.sqrt() } else { 0.0 }
+        // Clamp at ±20, matching the in-sample Sharpe calc -- prevents
+        // blowup when std dev is tiny relative to mean (a handful of
+        // near-identical winning OOS trades).
+        if std > 1e-12 { (mean / std * annualization_factor).clamp(-20.0, 20.0) } else { 0.0 }
     } else { 0.0 };
 
     // Sortino ratio from combined pct returns
@@ -1100,7 +1181,7 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
             .map(|r| r.powi(2))
             .sum::<f64>() / n as f64;
         let downside_std = downside_var.sqrt();
-        if downside_std > 1e-12 { mean / downside_std * 252.0_f64.sqrt() } else { 0.0 }
+        if downside_std > 1e-12 { (mean / downside_std * annualization_factor).clamp(-20.0, 20.0) } else { 0.0 }
     } else { 0.0 };
 
     // Max drawdown from chained equity curve
@@ -1115,9 +1196,10 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         max_dd
     } else { 0.0 };
 
-    // First/last timestamps and prices from trade log
-    let first_ts = results.first().and_then(|r| r.first_trade_timestamp);
-    let last_ts = results.last().and_then(|r| r.last_trade_timestamp);
+    // First/last prices from trade log (timestamps already computed above
+    // as oos_first_ts/oos_last_ts for the annualization factor; reused here
+    // under their original names for the calmar calc below).
+    let (first_ts, last_ts) = (oos_first_ts, oos_last_ts);
     let first_price = results.first().and_then(|r| r.first_trade_price);
     let last_price = results.last().and_then(|r| r.last_trade_price);
 
@@ -1141,13 +1223,14 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         Some(annualized / max_drawdown)
     } else { None };
 
-    // Volatility of returns (from pct returns — annualized)
+    // Volatility of returns (from pct returns — annualized, same real
+    // observation-rate factor as sharpe/sortino above).
     let volatility = if n > 1 {
         let mean = avg_return;
         let var = stat_returns.iter()
             .map(|r| (r - mean).powi(2))
             .sum::<f64>() / (n - 1) as f64;
-        Some(var.sqrt() * 252.0_f64.sqrt())
+        Some(var.sqrt() * annualization_factor)
     } else { None };
 
     // Net profit
@@ -1175,7 +1258,7 @@ pub fn combine_oos_results(results: &[BacktestResult], initial_capital: f64) -> 
         avg_trade_return: Some(avg_return),
         median_trade_return: if n > 0 {
             let mut sorted = stat_returns.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| a.total_cmp(b));
             Some(sorted[n / 2])
         } else { None },
         avg_trade_duration: {
@@ -1280,6 +1363,7 @@ pub async fn run_validation_pipeline(
                 ),
                 stage_verdicts: stages,
                 look_ahead_detected: None,
+            causality_truncation: None,
                 elapsed_seconds: timing_start.elapsed().as_secs_f64(),
             });
         }
@@ -1288,26 +1372,102 @@ pub async fn run_validation_pipeline(
     }
 
     // -----------------------------------------------------------------------
-    // Stage 0: Look-ahead bias detection (perturbation test)
+    // Stage 0: Look-ahead bias detection.
+    //
+    // 0a (W2.1 / G1, BLOCKING): the causality-by-truncation gate. For each
+    // sampled bar t the strategy's compute_signals() is re-run on the series
+    // that ENDS at t; the signal at t must not change. This is the exact
+    // defect ("end-of-array") behind 7 of the 9 failures of the 2026-09-21
+    // benchmark, which the legacy 60%-vs-full trade-count test (0b) does not
+    // catch. Mode knob: `PYTHON_LOOKAHEAD_SCAN_MODE` = sampled (default, K
+    // bars per asset) | full (every bar, plus the legacy test 0b).
+    //
+    // 0b (legacy, advisory): the 60%-vs-full perturbation test. Runs only in
+    // `full` mode; in `sampled` mode `look_ahead_detected` is derived from 0a.
     // -----------------------------------------------------------------------
-    report_progress(0, "lookahead_detection", 0, 1);
-    log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0: Look-ahead bias detection");
-
-    let look_ahead_detected = match detect_lookahead_bias(market_data, &config).await {
-        Ok(detected) => {
-            if detected {
-                log_warn!(BACKTEST_LOGGER, "[VALIDATION] LOOK-AHEAD BIAS DETECTED: strategy signals change when future data is present");
-            } else {
-                log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0 passed: no look-ahead bias detected");
-            }
-            Some(detected)
-        }
+    let gate_cfg = crate::causality_gate::CausalityGateConfig::from_env();
+    report_progress(0, "causality_truncation", 0, 1);
+    log_info!(
+        BACKTEST_LOGGER,
+        "[VALIDATION] Stage 0a: causality-by-truncation gate ({} mode, K={}, seed={:#x})",
+        gate_cfg.mode.as_str(), gate_cfg.sample_bars_per_asset, gate_cfg.seed
+    );
+    let causality_truncation = match crate::causality_gate::causality_truncation_check(
+        market_data,
+        &config.python_source,
+        config.parameters.clone(),
+        &gate_cfg,
+    )
+    .await
+    {
+        Ok(report) => Some(report),
         Err(e) => {
-            log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0 skipped (error): {}", e);
+            // A strategy that cannot be built or whose FULL run fails is Stage 1's error to report; the gate has no
+            // evidence either way, so it neither passes nor fails here.
+            log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0a skipped (error): {}", e);
             None
         }
     };
-    report_progress(0, "lookahead_detection", 1, 1);
+    if let Some(report) = &causality_truncation {
+        stages.push(StageVerdict {
+            stage: 0,
+            name: "Causality (truncation)".into(),
+            passed: report.passed(),
+            message: report.message.clone(),
+        });
+    }
+    report_progress(0, "causality_truncation", 1, 1);
+    if let Some(report) = causality_truncation.as_ref().filter(|r| !r.passed()) {
+        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CAUSALITY GATE FAILED: {}", report.message);
+        return Ok(ValidationResult {
+            stages_completed: 0,
+            quick_backtest: None,
+            walk_forward: None,
+            monte_carlo: None,
+            block_bootstrap: None,
+            regime_mc: None,
+            ga_report: None,
+            optimized_backtest: None,
+            cpcv_pbo: None,
+            cpcv_deflated_sharpe: None,
+            cpcv_parameter_stability: None,
+            verdict: "fail".into(),
+            summary: format!(
+                "Causality gate failed: {}. Compute each bar's signal from bars up to and including that bar only (no `prices[-k:]` anchored to the array end, no `len(prices) - 1` as a decision point).",
+                report.message
+            ),
+            stage_verdicts: stages,
+            look_ahead_detected: Some(true),
+            causality_truncation: causality_truncation.clone(),
+            elapsed_seconds: timing_start.elapsed().as_secs_f64(),
+        });
+    }
+
+    let look_ahead_detected = match gate_cfg.mode {
+        crate::causality_gate::LookaheadScanMode::Full => {
+            report_progress(0, "lookahead_detection", 0, 1);
+            log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b: Look-ahead bias detection (legacy perturbation test)");
+            let detected = match detect_lookahead_bias(market_data, &config).await {
+                Ok(detected) => {
+                    if detected {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] LOOK-AHEAD BIAS DETECTED: strategy signals change when future data is present");
+                    } else {
+                        log_info!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b passed: no look-ahead bias detected");
+                    }
+                    Some(detected)
+                }
+                Err(e) => {
+                    log_warn!(BACKTEST_LOGGER, "[VALIDATION] Stage 0b skipped (error): {}", e);
+                    None
+                }
+            };
+            report_progress(0, "lookahead_detection", 1, 1);
+            detected
+        }
+        crate::causality_gate::LookaheadScanMode::Sampled => {
+            causality_truncation.as_ref().filter(|r| r.applicable).map(|r| !r.passed())
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Stage 1: Quick single-pass backtest (subsampled for speed)
@@ -1387,6 +1547,7 @@ pub async fn run_validation_pipeline(
             summary: "Strategy generated no trades — check entry/exit logic and date range.".into(),
             stage_verdicts: stages,
             look_ahead_detected,
+            causality_truncation: causality_truncation.clone(),
             elapsed_seconds: timing_start.elapsed().as_secs_f64(),
         });
     }
@@ -1464,6 +1625,7 @@ pub async fn run_validation_pipeline(
             summary: fail_msg,
             stage_verdicts: stages,
             look_ahead_detected,
+            causality_truncation: causality_truncation.clone(),
             elapsed_seconds: timing_start.elapsed().as_secs_f64(),
         });
     }
@@ -1783,6 +1945,9 @@ pub async fn run_validation_pipeline(
                             orderbook_snapshots: None,
                             historical_iv_surfaces: None,
                             multi_venue_data: None,
+                            option_instrument: None,
+                            option_spread: None,
+                            underlying_series: None,
                         };
                         crate::python_simulation::run(eval_data, sim_config).await
                             .map(|r| r.backtest_result)
@@ -1831,6 +1996,13 @@ pub async fn run_validation_pipeline(
 
         // --- Decide single-objective vs multi-objective ---
         let mut nsga2_result: Option<NsgaIIResult> = None;
+        // Real (non-hard-gated) IS Sharpe across every candidate the GA/NSGA-II
+        // actually evaluated -- the sigma (standard deviation of trial
+        // Sharpes) the Deflated Sharpe Ratio needs to convert its
+        // expected-max-under-null figure into an actual Sharpe bar (2026-09-08
+        // DSR fix). Stays empty for the Bayesian-optimization branch, which
+        // has no population/generation loop to source this from.
+        let mut ga_trial_sharpes: Vec<f64> = Vec::new();
 
         let (best_chromosome, best_fitness) = match &ga_config.optimization_mode {
             config::OptimizationMode::MultiObjective { objectives } => {
@@ -1854,11 +2026,13 @@ pub async fn run_validation_pipeline(
                     fitness_fn: fitness_fn.clone(),
                     sampling_config: AdaptiveSamplingConfig::default(),
                     force_sequential: ga_config.force_sequential,
+                    trial_sharpes: Arc::new(std::sync::Mutex::new(Vec::new())),
                 };
 
                 let (result, knee_chromo, knee_fitness) = nsga_optimizer.run().await;
                 log_info!(BACKTEST_LOGGER, "[VALIDATION] NSGA-II complete: pareto_front={} solutions, hypervolume={:.4}",
                     result.pareto_front.len(), result.hypervolume);
+                ga_trial_sharpes = nsga_optimizer.trial_sharpes.lock().map(|g| g.clone()).unwrap_or_default();
                 nsga2_result = Some(result);
                 (knee_chromo, knee_fitness)
             }
@@ -1900,7 +2074,9 @@ pub async fn run_validation_pipeline(
                 ).await
             }
             config::OptimizationMode::SingleObjective => {
-                optimizer.run().await
+                let result = optimizer.run().await;
+                ga_trial_sharpes = optimizer.trial_sharpes.lock().map(|g| g.clone()).unwrap_or_default();
+                result
             }
         };
 
@@ -2279,7 +2455,26 @@ pub async fn run_validation_pipeline(
                 }
             };
 
-            if let Ok(opt_br) = run_single_backtest(market_data, &opt_config).await {
+            if let Ok(mut opt_br) = run_single_backtest(market_data, &opt_config).await {
+                // IS Sharpe distribution across viable (non-hard-gated) GA/
+                // NSGA-II candidates -- mirrors backtest::engine's native-path
+                // computation exactly (engine.rs run_genetic_optimization).
+                // This is the sigma the Deflated Sharpe Ratio needs to turn
+                // its expected-max-under-null figure into an actual Sharpe
+                // bar instead of a dimensionless z-score (2026-09-08 DSR fix)
+                // -- previously only ever computed on the native path, never
+                // here on the Python-execution path that ~100% of production
+                // GA runs actually go through.
+                if !ga_trial_sharpes.is_empty() {
+                    let n = ga_trial_sharpes.len() as f64;
+                    let mean = ga_trial_sharpes.iter().sum::<f64>() / n;
+                    let variance = ga_trial_sharpes.iter().map(|&s| (s - mean).powi(2)).sum::<f64>() / n;
+                    let pct_above = ga_trial_sharpes.iter().filter(|&&s| s >= 1.0).count() as f64 / n;
+                    opt_br.ga_is_sharpe_mean = Some(mean);
+                    opt_br.ga_is_sharpe_std = Some(variance.sqrt());
+                    opt_br.ga_is_sharpe_pct_above_threshold = Some(pct_above);
+                }
+
                 // Defensive guard: a GA "winner" that produces zero trades on
                 // the full dataset is a degenerate parameter set (e.g.
                 // min_position_size > max_position_size). Surface it loudly
@@ -2396,12 +2591,34 @@ pub async fn run_validation_pipeline(
                 // is `Some`, so an unreliable value here silently wins over a
                 // trustworthy one -- gating it at the source is simpler than
                 // threading a reliability flag through every caller.
-                cpcv_deflated_sharpe = if result.min_trades_per_fold >= walkforward::MIN_RELIABLE_TRADES_PER_FOLD {
-                    Some(result.deflated_sharpe_ratio)
-                } else {
-                    log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: min_trades_per_fold={} < {}",
-                        result.min_trades_per_fold, walkforward::MIN_RELIABLE_TRADES_PER_FOLD);
-                    None
+                // Even when every fold clears the trade-count floor, CPCV's DSR
+                // is estimated from only C(n_folds, n_test_folds) per-combination
+                // OOS Sharpes (10 for this platform's fixed 5-fold/2-test-fold
+                // config) -- too few for the extreme-value asymptotics DSR
+                // relies on to hold reliably. A single noisy combination can
+                // still blow up sharpe_variance_across_folds and collapse the
+                // result to an astronomically extreme tail value regardless of
+                // trade count (observed in production: 1e-118, 1e-141 -- see
+                // this field's own doc comment). A real, well-calibrated DSR
+                // from this method essentially never lands beyond a ~4.75-sigma
+                // tail; anything more extreme is the noise artifact that same
+                // comment already warns about, not a real result -- 2026-09-08
+                // fix (found live: a real replay of a real production job's
+                // exact strategy/data still hit this after the DSR sigma-scaling
+                // fix, because THIS override -- not that bug -- had final say).
+                cpcv_deflated_sharpe = match cpcv_dsr_reliability(result.min_trades_per_fold, result.deflated_sharpe_ratio) {
+                    Ok(dsr) => Some(dsr),
+                    Err(CpcvDsrUnreliable::TooFewTradesPerFold) => {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: min_trades_per_fold={} < {}",
+                            result.min_trades_per_fold, walkforward::MIN_RELIABLE_TRADES_PER_FOLD);
+                        None
+                    }
+                    Err(CpcvDsrUnreliable::ImplausiblyExtreme) => {
+                        log_warn!(BACKTEST_LOGGER, "[VALIDATION] CPCV DSR not trusted: implausibly extreme value {} \
+                            (likely cross-fold variance noise from only {} combinations, not a real signal)",
+                            result.deflated_sharpe_ratio, result.total_combinations);
+                        None
+                    }
                 };
                 cpcv_parameter_stability = Some(result.parameter_stability_score);
 
@@ -2591,6 +2808,7 @@ pub async fn run_validation_pipeline(
         summary,
         stage_verdicts: stages,
         look_ahead_detected,
+        causality_truncation,
         elapsed_seconds: timing_start.elapsed().as_secs_f64(),
     })
 }
@@ -2605,9 +2823,23 @@ async fn run_single_backtest(
     data: &[MarketData],
     config: &ValidationConfig,
 ) -> Result<BacktestResult> {
+    run_single_backtest_with_warmup(data, config, 0).await
+}
+
+/// `run_single_backtest` with the first `warmup_bars` ticks of `data`
+/// visible to the strategy but not tradable -- see
+/// `BacktestConfig::warmup_bars`. Used by walk-forward test windows.
+#[cfg(feature = "python")]
+async fn run_single_backtest_with_warmup(
+    data: &[MarketData],
+    config: &ValidationConfig,
+    warmup_bars: usize,
+) -> Result<BacktestResult> {
+        let mut backtest_config = config.backtest_config.clone();
+        backtest_config.warmup_bars = warmup_bars;
         let sim_config = crate::PythonSimConfig {
             python_source: config.python_source.clone(),
-            backtest_config: config.backtest_config.clone(),
+            backtest_config,
             fee_config: config.fee_config.clone(),
             supplementary_data: config.supplementary_data.clone(),
             parameters: config.parameters.clone(),
@@ -2617,9 +2849,77 @@ async fn run_single_backtest(
             orderbook_snapshots: None,
             multi_venue_data: None,
             historical_iv_surfaces: config.historical_iv_surfaces.clone(),
+            option_instrument: config.option_instrument.clone(),
+            option_spread: config.option_spread.clone(),
+            underlying_series: config.underlying_series.clone(),
         };
         let result = crate::python_simulation::run(data, sim_config).await?;
         Ok(result.backtest_result)
+}
+
+/// Fixed-parameter evaluation entry points for the rule-first discovery
+/// flow. Both take `config.parameters` as given -- no Stage 0/1 pre-checks,
+/// no GA, no Monte Carlo -- so a caller evaluating one frozen rule across a
+/// wide instrument universe pays for exactly the simulations it needs and
+/// gets back the raw per-asset material it pools itself.
+///
+/// One full-span simulation. For a rule with no fitted parameters the entire
+/// span is legitimately out-of-sample, which is why this exists separately
+/// from the walk-forward wrapper below: its train slices fit nothing and
+/// would discard `WF_TRAIN_FRAC` of the usable history for no gain.
+#[cfg(feature = "python")]
+pub async fn run_fixed_parameter_backtest(
+    data: &[MarketData],
+    config: &ValidationConfig,
+) -> Result<BacktestResult> {
+    run_single_backtest(data, config).await
+}
+
+/// Purged walk-forward on one frozen parameter set. `num_windows == 0`
+/// resolves the count exactly as `run_validation_pipeline` does (see
+/// `resolve_fixed_parameter_wf_windows`). The per-window consistency and
+/// profitability statistics are the useful output here; the stitched OOS
+/// material is in `oos_combined_result`.
+#[cfg(feature = "python")]
+pub async fn run_fixed_parameter_walk_forward(
+    data: &[MarketData],
+    config: &ValidationConfig,
+    num_windows: usize,
+) -> Result<WalkForwardResult> {
+    let num_windows = resolve_fixed_parameter_wf_windows(data, num_windows);
+    run_walk_forward(data, config, num_windows, |_, _| {}).await
+}
+
+/// `requested` when non-zero, otherwise the pipeline's own auto count for
+/// this data (calendar span + regime count, `resolve_auto_wf_windows`).
+/// Fewer than two bars can't span a calendar range, so that degenerate
+/// input returns the same floor `resolve_auto_wf_windows` clamps to.
+pub fn resolve_fixed_parameter_wf_windows(data: &[MarketData], requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    if data.len() < 2 {
+        return 3;
+    }
+    let calendar_days = data.first()
+        .zip(data.last())
+        .map(|(first, last)| ((market_data_timestamp_ms(last) - market_data_timestamp_ms(first)) / 86_400_000).max(0) as usize)
+        .unwrap_or(0);
+    let close_prices = close_prices_from_market_data(data);
+    resolve_auto_wf_windows(calendar_days, data.len(), Some(&close_prices))
+}
+
+/// Unix-millisecond timestamp of one `MarketData` element. Unlike
+/// `market_data_timestamp` this needs no `DateTime` import, so it is usable
+/// (and testable) without the `python` feature.
+pub fn market_data_timestamp_ms(md: &MarketData) -> i64 {
+    match md {
+        MarketData::Trade(t) => t.timestamp.timestamp_millis(),
+        MarketData::Candle(c) => c.timestamp.timestamp_millis(),
+        MarketData::PoolSwap(s) => s.timestamp.timestamp_millis(),
+        MarketData::Generic(g) => g.timestamp_ms,
+        MarketData::OptionCandle(c) => c.timestamp.timestamp_millis(),
+    }
 }
 
 /// Evaluate one FIXED parameter set (`config.parameters`) across `num_folds`
@@ -2769,6 +3069,48 @@ pub async fn quick_signal_dry_run(
 /// granularity.
 const WF_PURGE_GAP_DAYS: f64 = 5.0;
 
+/// Why CPCV's own `deflated_sharpe_ratio` was not trusted as the job's final
+/// DSR. See `cpcv_dsr_reliability`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpcvDsrUnreliable {
+    TooFewTradesPerFold,
+    ImplausiblyExtreme,
+}
+
+/// Whether CPCV's own `deflated_sharpe_ratio` should be trusted as the job's
+/// final DSR (`worker.rs`'s override unconditionally replaces the properly
+/// lineage-aware DSR with this value whenever it's `Some`). Split out from
+/// its call site (Stage 3.5) so the two independent reliability conditions
+/// are each testable without a full CPCV run:
+///
+/// 1. `min_trades_per_fold` below `walkforward::MIN_RELIABLE_TRADES_PER_FOLD`
+///    -- a low-trade-count strategy can leave individual test folds with
+///    2-3 trades each, whose unstable Sharpe blows up
+///    `sharpe_variance_across_folds` (pre-existing gate).
+/// 2. Even when every fold clears that floor, CPCV's DSR is estimated from
+///    only `C(n_folds, n_test_folds)` per-combination OOS Sharpes (10 for
+///    this platform's fixed 5-fold/2-test-fold config) -- too few for the
+///    extreme-value asymptotics DSR relies on to hold reliably. A single
+///    noisy combination can still blow up the cross-fold variance and
+///    collapse the result to an astronomically extreme tail value
+///    regardless of trade count (observed in production: 1e-118, 1e-141).
+///    A real, well-calibrated DSR from this method essentially never lands
+///    beyond a ~4.75-sigma tail; anything more extreme is a noise artifact,
+///    not a real result (2026-09-08 fix -- found live: a real replay of a
+///    real production job's exact strategy/data still hit this after the
+///    DSR sigma-scaling fix, because THIS override, not that bug, had final
+///    say over the persisted value).
+fn cpcv_dsr_reliability(min_trades_per_fold: usize, deflated_sharpe_ratio: f64) -> Result<f64, CpcvDsrUnreliable> {
+    const CPCV_DSR_PLAUSIBLE_FLOOR: f64 = 1e-6;
+    if min_trades_per_fold < walkforward::MIN_RELIABLE_TRADES_PER_FOLD {
+        return Err(CpcvDsrUnreliable::TooFewTradesPerFold);
+    }
+    if !(CPCV_DSR_PLAUSIBLE_FLOOR..=1.0 - CPCV_DSR_PLAUSIBLE_FLOOR).contains(&deflated_sharpe_ratio) {
+        return Err(CpcvDsrUnreliable::ImplausiblyExtreme);
+    }
+    Ok(deflated_sharpe_ratio)
+}
+
 /// Pure conversion of `WF_PURGE_GAP_DAYS` into a bar count for data spanning
 /// `span_ms` over `n` bars, capped at half of `test_size` -- split out from
 /// `run_walk_forward` so the arithmetic (the part most worth locking down
@@ -2810,6 +3152,135 @@ pub fn resolve_wf_step(n: usize, window_size: usize, num_windows: usize) -> usiz
     ((n - window_size) / (num_windows - 1)).max(1)
 }
 
+/// One walk-forward window's fold boundaries, as bar indices into the same
+/// `data` slice `run_walk_forward` was called with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WfFoldBounds {
+    pub train_start: usize,
+    pub train_end: usize,
+    pub test_start: usize,
+    pub test_end: usize,
+}
+
+/// Translate this crate's own `VolatilityRegime` into `portfolio_eval::folds::RegimeLabel`
+/// -- the same three-way Low/Medium/High split, structurally identical, kept as a separate
+/// type on the `portfolio-eval` side only because that crate is deliberately zero-dependency
+/// (see `RegimeLabel`'s own doc comment). A pure, allocating, one-shot mapping -- not new
+/// classification logic; it doesn't invent, reorder or reinterpret any label.
+fn to_shared_regime_labels(
+    regimes: &[Option<quant_diagnostics::VolatilityRegime>],
+) -> Vec<Option<portfolio_eval::folds::RegimeLabel>> {
+    regimes
+        .iter()
+        .map(|r| {
+            r.map(|v| match v {
+                quant_diagnostics::VolatilityRegime::Low => portfolio_eval::folds::RegimeLabel::Low,
+                quant_diagnostics::VolatilityRegime::Medium => {
+                    portfolio_eval::folds::RegimeLabel::Medium
+                }
+                quant_diagnostics::VolatilityRegime::High => {
+                    portfolio_eval::folds::RegimeLabel::High
+                }
+            })
+        })
+        .collect()
+}
+
+/// Resolve every walk-forward window's train/test bar-index boundaries for a
+/// series of `n` bars split into (up to) `num_windows` windows -- the exact
+/// fold-boundary construction `run_walk_forward` used to compute inline,
+/// extracted (shared verification infra, slice A3,
+/// `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) purely so
+/// it is directly, synchronously testable without a full async Python
+/// backtest harness.
+///
+/// The window/train/test/purge-gap sizing and the final train/test bar-index
+/// assembly are unchanged from before this slice (own formula -- see
+/// `resolve_wf_purge_gap_bars`'s doc comment; `portfolio_eval::folds` has no
+/// equivalent purge-gap-from-calendar-days formula to substitute). What DOES
+/// now call into `portfolio_eval::folds` is the regime-stratified window
+/// OFFSET-PLACEMENT step itself: `portfolio_eval::folds::resolve_wf_window_offsets`
+/// is a verified byte-for-byte port of this crate's own (still-present,
+/// still separately tested) `resolve_wf_window_offsets` -- see
+/// `scratch_probe_offset_placement_primitive_matches`-style differential
+/// testing in this module's test suite, and `portfolio_eval::folds`' own
+/// module doc, which states the port explicitly. This is the genuinely safe
+/// half of A3 for this function.
+///
+/// **What did NOT migrate, and why (the honest exception this slice's task
+/// explicitly allows for):** `portfolio_eval::folds::walk_forward_folds_stratified`
+/// -- the higher-level function that ALSO assembles train/test/purge bounds,
+/// not just offsets -- is NOT a safe substitute for this function's overall
+/// boundary construction. Two independent, empirically-confirmed reasons:
+/// (1) its `window_size` bakes the purge gap directly into the spacing used
+/// to place windows (`train_span + purge + test_len`), whereas this
+/// function's own `window_size` (`n / num_windows`) deliberately excludes
+/// the purge gap, adding it only when constructing each window's actual
+/// train/test bounds -- these are different, incompatible placement widths,
+/// and swapping to the former shifts (or entirely drops, once a window's
+/// footprint no longer fits) every window whenever `purge_gap_bars > 0`
+/// (the common case). (2) `walk_forward_folds_stratified`'s `regime_labels:
+/// None` path delegates to plain `walk_forward_folds`, whose OWN doc comment
+/// states it places "the LAST `n_folds x test_len` bars" as contiguous test
+/// windows -- i.e. it evaluates ONLY the tail of the series. This function's
+/// own placement (via `resolve_wf_window_offsets`, ported faithfully as
+/// described above) spreads test windows across the FULL range by design --
+/// the exact "2026-08 full-range-coverage fix" `resolve_wf_step`'s own doc
+/// comment describes, deliberately built to close a 33-46%-of-the-range
+/// blind spot. Migrating to `walk_forward_folds_stratified` wholesale would
+/// silently reintroduce that exact regression for any caller without regime
+/// data, and change window count/placement whenever it does. Both effects
+/// were confirmed empirically against real golden vectors before this
+/// function's design was finalized -- not merely reasoned about.
+///
+/// `span_ms` is the timestamp delta between the data's first and last bar (0
+/// if fewer than 2 bars) -- feeds `resolve_wf_purge_gap_bars`. `regimes` is
+/// `run_walk_forward`'s own per-return volatility-tercile classification
+/// (one entry per RETURN, i.e. one shorter than `n`); `None` is a valid,
+/// deliberate input (e.g. a dataset too short to classify at all), not an
+/// error -- it reproduces the prior uniform-only placement exactly.
+pub fn resolve_wf_fold_bounds(
+    n: usize,
+    num_windows: usize,
+    span_ms: i64,
+    regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
+) -> Vec<WfFoldBounds> {
+    let window_size = n / num_windows.max(1);
+    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+    let test_size = window_size - train_size;
+    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+
+    let mapped_regimes: Option<Vec<Option<portfolio_eval::folds::RegimeLabel>>> =
+        regimes.map(to_shared_regime_labels);
+    let offsets: Vec<usize> = portfolio_eval::folds::resolve_wf_window_offsets(
+        n,
+        window_size,
+        num_windows,
+        test_size,
+        mapped_regimes.as_deref(),
+    )
+    .into_iter()
+    .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+    .collect();
+
+    offsets
+        .into_iter()
+        .take(num_windows)
+        .map(|offset| {
+            let train_start = offset;
+            let train_end = offset + train_size;
+            let test_start = train_end + purge_gap_bars;
+            let test_end = (test_start + test_size).min(n);
+            WfFoldBounds {
+                train_start,
+                train_end,
+                test_start,
+                test_end,
+            }
+        })
+        .collect()
+}
+
 /// Run walk-forward analysis over market data, splitting into rolling windows.
 ///
 /// Each window uses a train slice then (optionally) skips a `WF_PURGE_GAP_DAYS`-wide embargo
@@ -2830,13 +3301,6 @@ async fn run_walk_forward(
         anyhow::bail!("Insufficient data for walk-forward analysis (need >= 100 ticks, got {})", n);
     }
 
-    // Calculate window sizes
-    // Each window covers (window_size = n / num_windows) ticks, spanning the FULL
-    // range n across num_windows windows (see resolve_wf_step's doc comment).
-    let window_size = n / num_windows.max(1);
-    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-    let test_size = window_size - train_size;
-
     // Convert WF_PURGE_GAP_DAYS to a bar count from the data's own average
     // spacing (capped at half the test window so a short/coarse-granularity
     // window can never purge the ENTIRE test slice away -- see
@@ -2845,7 +3309,6 @@ async fn run_walk_forward(
         (Some(first), Some(last)) => (last - first).num_milliseconds(),
         _ => 0,
     };
-    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
 
     // Bar-based annualization factor derived from this dataset's OWN average
     // bar spacing (2026-08 annualization fix) -- every per-window OOS Sharpe
@@ -2861,27 +3324,24 @@ async fn run_walk_forward(
 
     // Window placement (2026-08 stratified-by-regime upgrade, Phase 2):
     // reserves a window per detected regime before falling back to uniform
-    // spacing -- see resolve_wf_window_offsets' doc comment. Filtered against
-    // the same bound the original while-loop enforced (offset + train + gap
-    // + test <= n), since the placement function itself doesn't know about
-    // the purge gap.
-    let offsets: Vec<usize> = resolve_wf_window_offsets(n, window_size, num_windows, test_size, Some(&regimes))
-        .into_iter()
-        .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
-        .collect();
+    // spacing. Extracted into `resolve_wf_fold_bounds` (shared verification
+    // infra, slice A3) purely so the fold-boundary math is directly
+    // testable -- see that function's doc comment; this call is the exact
+    // same window/train/test/purge arithmetic that used to be inline here.
+    let fold_bounds = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
 
     let mut windows: Vec<WalkForwardWindow> = Vec::new();
     let mut oos_results: Vec<BacktestResult> = Vec::new();
     let mut window_idx = 0usize;
 
-    for offset in offsets {
+    for bounds in fold_bounds {
         if windows.len() >= num_windows {
             break;
         }
-        let train_start = offset;
-        let train_end = offset + train_size;
-        let test_start = train_end + purge_gap_bars;
-        let test_end = (test_start + test_size).min(n);
+        let train_start = bounds.train_start;
+        let train_end = bounds.train_end;
+        let test_start = bounds.test_start;
+        let test_end = bounds.test_end;
 
         // Subsample each window slice to cap at ~500K ticks for speed.
         // Walk-forward is a relative comparison (train vs test), so subsampling
@@ -2906,9 +3366,19 @@ async fn run_walk_forward(
             }
         };
 
-        // Run on test period (subsampled)
-        let test_data = subsample_slice(&data[test_start..test_end]);
-        let test_result = match run_single_backtest(&test_data, config).await {
+        // Run on test period (subsampled). The slice handed to the strategy
+        // starts at `train_start`, not `test_start`, with the preceding
+        // train+purge span marked as warmup (`BacktestConfig::warmup_bars`):
+        // the strategy's vectorized `compute_signals` sees that history so
+        // lookback indicators are warm on the first test bar, but no trade
+        // or equity sample is recorded before `test_start`. Without this, any
+        // rule whose lookback exceeds the test window (a 180-bar momentum
+        // rule inside a 146-bar window) produced zero trades in EVERY window
+        // -- and a consistency score of 0.0 that looked like evidence.
+        let test_slice = &data[train_start..test_end];
+        let test_data = subsample_slice(test_slice);
+        let warmup_bars = (test_start - train_start) / (test_slice.len() / 500_000).max(1);
+        let test_result = match run_single_backtest_with_warmup(&test_data, config, warmup_bars).await {
             Ok(r) => r,
             Err(e) => {
                 log_warn!(BACKTEST_LOGGER, "[WF] Window {} test backtest failed, skipping: {}", windows.len() + 1, e);
@@ -3391,7 +3861,7 @@ pub fn extract_parameter_schema(_python_source: &str) -> Option<Arc<ParameterSch
 /// cost only lands on strategies mentioning these APIs (regime models, MC
 /// sampling), never on plain indicator strategies.
 #[cfg(feature = "python")]
-fn source_may_be_stochastic(source: &str) -> bool {
+pub(crate) fn source_may_be_stochastic(source: &str) -> bool {
     const MARKERS: &[&str] = &[
         "random", "default_rng", "RandomState", "np.random", "numpy.random",
         "shuffle", "permutation", "KMeans", "GaussianMixture", ".sample(",
@@ -3435,6 +3905,9 @@ pub async fn detect_lookahead_bias(
         orderbook_snapshots: None,
         historical_iv_surfaces: None,
         multi_venue_data: None,
+        option_instrument: None,
+        option_spread: None,
+        underlying_series: None,
     };
 
     let result_truncated = python_simulation::run(truncated_data, sim_config()).await?;
@@ -3584,6 +4057,298 @@ pub fn compute_tick_divergence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // A3 migration evidence (shared verification infra,
+    // `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`) --
+    // permanent tests documenting exactly what did and did not migrate to
+    // `portfolio_eval::folds`, and why, so a future reader doesn't have to
+    // re-derive this from scratch. See `resolve_wf_fold_bounds`'s own doc
+    // comment for the prose version of the same finding.
+    // ---------------------------------------------------------------------
+
+    /// The genuinely safe half of A3: `resolve_wf_fold_bounds` now calls
+    /// `portfolio_eval::folds::resolve_wf_window_offsets` for its regime-
+    /// stratified placement step instead of this module's own (still
+    /// present, still separately tested) `resolve_wf_window_offsets`. This
+    /// differential test proves the two are byte-for-byte identical across
+    /// a diverse set of configs (uniform/no-regime, regime-present,
+    /// scarce-regime, an odd `n` not evenly divisible by `num_windows`) --
+    /// i.e. `portfolio_eval::folds` really is a faithful port of this exact
+    /// algorithm, not merely documented as one.
+    #[test]
+    fn offset_placement_primitive_matches_portfolio_eval_byte_for_byte() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let cases: Vec<(
+            usize,
+            usize,
+            usize,
+            Option<Vec<Option<quant_diagnostics::VolatilityRegime>>>,
+        )> = vec![
+            (10_000, 200, 8, None),
+            (1000, 200, 5, None),
+            (
+                900,
+                150,
+                3,
+                Some(make_regimes(&[(600, Low), (60, High), (240, Medium)])),
+            ),
+            (
+                500,
+                120,
+                3,
+                Some(make_regimes(&[(420, Low), (30, High), (49, Medium)])),
+            ),
+            (2000, 250, 8, None),
+            (
+                997,
+                90,
+                5,
+                Some({
+                    let mut r = make_regimes(&[(500, Low), (496, High)]);
+                    r.truncate(996);
+                    r
+                }),
+            ),
+        ];
+        for (n, window_size, num_windows, regimes) in cases {
+            let test_size = window_size / 3;
+            let mapped = regimes.as_ref().map(|r| to_shared_regime_labels(r));
+            let old = resolve_wf_window_offsets(
+                n,
+                window_size,
+                num_windows,
+                test_size,
+                regimes.as_deref(),
+            );
+            let new = portfolio_eval::folds::resolve_wf_window_offsets(
+                n,
+                window_size,
+                num_windows,
+                test_size,
+                mapped.as_deref(),
+            );
+            assert_eq!(
+                old, new,
+                "offset placement primitive diverged for n={n} window_size={window_size} num_windows={num_windows}"
+            );
+        }
+    }
+
+    /// The NOT-safe half of A3, pinned as a permanent regression test rather
+    /// than left as a one-off finding: `portfolio_eval::folds::walk_forward_folds_stratified`
+    /// is not a drop-in substitute for `resolve_wf_fold_bounds`'s overall
+    /// boundary construction, for two independent, structural reasons (see
+    /// `resolve_wf_fold_bounds`'s doc comment for the full explanation).
+    /// This test exercises both on the SAME golden-vector config
+    /// (n=1000, 5 daily-bar windows, `WF_TRAIN_FRAC`=0.7) and asserts they
+    /// genuinely disagree today -- if `portfolio_eval::folds` is ever
+    /// extended with a full-range-spread, gracefully-degrading stratified
+    /// mode (the plan doc's own section 4 risk item 2 anticipates exactly
+    /// this kind of gap), this test is the tripwire that should fail and
+    /// prompt re-evaluating whether the full migration has become safe.
+    #[test]
+    fn walk_forward_folds_stratified_is_not_a_safe_substitute_for_resolve_wf_fold_bounds() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * 86_400_000i64; // ordinary daily bars
+        let window_size = n / num_windows;
+        let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+        let test_size = window_size - train_size;
+        let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+
+        let today = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        let today_tuples: Vec<(usize, usize, usize, usize)> = today
+            .iter()
+            .map(|b| (b.train_start, b.train_end, b.test_start, b.test_end))
+            .collect();
+        // TODAY spreads test windows across the full range (2026-08 fix);
+        // its first window's test slice starts near bar 145, not near the
+        // tail of the series.
+        assert!(
+            today_tuples[0].2 < n / 2,
+            "today's placement should cover early data, got {:?}",
+            today_tuples
+        );
+
+        let via_shared = portfolio_eval::folds::walk_forward_folds_stratified(
+            n,
+            num_windows,
+            test_size,
+            train_size,
+            purge_gap_bars,
+            portfolio_eval::folds::TrainMode::Rolling {
+                train_len: train_size,
+            },
+            None, // no regime data -- delegates straight to plain walk_forward_folds
+        )
+        .expect("walk_forward_folds_stratified should succeed for this config");
+        let shared_tuples: Vec<(usize, usize, usize, usize)> = via_shared
+            .iter()
+            .map(|f| {
+                (
+                    f.train[0].start,
+                    f.train[0].end,
+                    f.test[0].start,
+                    f.test[0].end,
+                )
+            })
+            .collect();
+        // Reason 1: `walk_forward_folds`'s `None` path packs ALL test
+        // windows into the LAST `n_folds * test_len` bars only (its own doc
+        // comment) -- every window's test slice starts well past the
+        // midpoint, the opposite of today's full-range spread.
+        assert!(
+            shared_tuples.iter().all(|t| t.2 >= n / 2),
+            "walk_forward_folds_stratified's None path should be tail-packed, got {:?}",
+            shared_tuples
+        );
+        assert_ne!(
+            today_tuples, shared_tuples,
+            "expected these two placement strategies to genuinely disagree on this config"
+        );
+
+        // Reason 2: even the regime-aware path is strict (all n_folds
+        // windows or an Err), where today's code gracefully degrades to
+        // fewer windows -- reproduce the "with regimes" golden-vector
+        // config (which today succeeds with only 3 of 5 requested windows)
+        // and confirm the shared function refuses it outright.
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let regimes = make_regimes(&[(600, Low), (150, High), (249, Medium)]);
+        let today_with_regimes = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_eq!(
+            today_with_regimes.len(),
+            3,
+            "today's code should still gracefully return fewer windows than requested"
+        );
+        let mapped = to_shared_regime_labels(&regimes);
+        let shared_with_regimes = portfolio_eval::folds::walk_forward_folds_stratified(
+            n,
+            num_windows,
+            test_size,
+            train_size,
+            purge_gap_bars,
+            portfolio_eval::folds::TrainMode::Rolling {
+                train_len: train_size,
+            },
+            Some(&mapped),
+        );
+        assert!(
+            shared_with_regimes.is_err(),
+            "walk_forward_folds_stratified is expected to refuse outright (not gracefully degrade) on this config, got {:?}",
+            shared_with_regimes
+        );
+    }
+
+    // ── resolve_fixed_parameter_wf_windows — rule-first discovery flow ──
+
+    fn synthetic_daily_candles(n: usize) -> Vec<MarketData> {
+        use chrono::TimeZone;
+        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        (0..n)
+            .map(|i| MarketData::Candle(dataloader::Candle {
+                timestamp: start + chrono::Duration::days(i as i64),
+                symbol: "TEST".into(),
+                exchange: "test".into(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0 + (i as f64 * 0.37).sin(),
+                volume: 1000.0,
+                trade_count: 10,
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_honours_an_explicit_request() {
+        assert_eq!(resolve_fixed_parameter_wf_windows(&synthetic_daily_candles(400), 5), 5);
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_auto_matches_the_pipeline_rule() {
+        let data = synthetic_daily_candles(400);
+        let expected = resolve_auto_wf_windows(399, data.len(), Some(&close_prices_from_market_data(&data)));
+        assert_eq!(resolve_fixed_parameter_wf_windows(&data, 0), expected);
+        assert!((3..=12).contains(&expected));
+    }
+
+    #[test]
+    fn resolve_fixed_parameter_wf_windows_degenerate_data_returns_the_floor() {
+        assert_eq!(resolve_fixed_parameter_wf_windows(&[], 0), 3);
+        assert_eq!(resolve_fixed_parameter_wf_windows(&synthetic_daily_candles(1), 0), 3);
+    }
+
+    // ── cpcv_dsr_reliability — 2026-09-08 fix ──────────────────────────
+
+    #[test]
+    fn cpcv_dsr_reliability_rejects_too_few_trades_per_fold() {
+        let err = cpcv_dsr_reliability(walkforward::MIN_RELIABLE_TRADES_PER_FOLD - 1, 0.5)
+            .expect_err("below the trade-count floor must be rejected regardless of the DSR value");
+        assert_eq!(err, CpcvDsrUnreliable::TooFewTradesPerFold);
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_accepts_the_trade_count_floor_exactly() {
+        assert_eq!(
+            cpcv_dsr_reliability(walkforward::MIN_RELIABLE_TRADES_PER_FOLD, 0.5),
+            Ok(0.5),
+        );
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_rejects_the_exact_production_incidents() {
+        // The two real production values this fix was written to catch --
+        // both cleared the trade-count floor and still slipped through as
+        // the job's final, persisted DSR before this fix existed.
+        for extreme in [1e-118, 1e-141, 1.0 - 1e-118] {
+            let err = cpcv_dsr_reliability(50, extreme)
+                .expect_err("an astronomically extreme DSR must be rejected even with plenty of trades per fold");
+            assert_eq!(err, CpcvDsrUnreliable::ImplausiblyExtreme);
+        }
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_accepts_ordinary_values_across_the_full_plausible_range() {
+        // Deliberately excludes exact 0.0/1.0 -- the codebase's own erfc
+        // clamping (see the "[DSR] erfc saturated ... clamping to avoid a
+        // deceptive exact 0.0/1.0" production log line) means the real
+        // formula should never actually produce those two values; an exact
+        // 0.0 or 1.0 reaching this gate is itself a sign something upstream
+        // degenerated, not an "ordinary" result.
+        for ordinary in [0.001, 0.05, 0.5, 0.95, 0.999] {
+            assert_eq!(
+                cpcv_dsr_reliability(50, ordinary),
+                Ok(ordinary),
+                "an ordinary DSR of {ordinary} should never be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_boundary_is_inclusive() {
+        const FLOOR: f64 = 1e-6;
+        assert_eq!(cpcv_dsr_reliability(50, FLOOR), Ok(FLOOR));
+        assert_eq!(cpcv_dsr_reliability(50, 1.0 - FLOOR), Ok(1.0 - FLOOR));
+        assert_eq!(
+            cpcv_dsr_reliability(50, FLOOR * 0.999999).unwrap_err(),
+            CpcvDsrUnreliable::ImplausiblyExtreme,
+        );
+    }
+
+    #[test]
+    fn cpcv_dsr_reliability_reproduces_the_exact_live_replay_finding() {
+        // job efca77b0-style replay (2026-09-08): a real production strategy
+        // re-run end-to-end with the DSR sigma-scaling fix already in place
+        // still persisted deflated_sharpe=7.7e-141 as the job's headline DSR,
+        // because CPCV's override -- not the sigma-scaling bug -- had final
+        // say. This is that exact observed value.
+        let observed_in_production = 0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007718581228466977_f64;
+        assert_eq!(
+            cpcv_dsr_reliability(50, observed_in_production).unwrap_err(),
+            CpcvDsrUnreliable::ImplausiblyExtreme,
+        );
+    }
 
     #[test]
     fn exceeds_param_complexity_gate_passes_a_well_sampled_candidate() {
@@ -4086,6 +4851,186 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // resolve_wf_fold_bounds -- golden-vector regression (shared
+    // verification infra, slice A3,
+    // `product-mandate/SHARED_VERIFICATION_INFRASTRUCTURE_PLAN.md`).
+    //
+    // Each case's `expected` is computed by literally re-deriving the same
+    // arithmetic `resolve_wf_fold_bounds` itself performs (window_size,
+    // train_size, test_size, `resolve_wf_purge_gap_bars`,
+    // `resolve_wf_window_offsets`, the `<= n` filter, then
+    // train/test bar-index construction) -- i.e. a second, independent
+    // expression of TODAY'S exact formula, not a hand-picked number. This is
+    // the pinned "before" behavior: run against the current (unmigrated)
+    // internals first; after migrating `resolve_wf_fold_bounds` to call
+    // `portfolio_eval::folds::walk_forward_folds_stratified`, these same
+    // assertions are re-run unchanged. A handful of the literal (offset,
+    // train_start, train_end, test_start, test_end) tuples observed from a
+    // real `cargo test -p backtest -- resolve_wf_fold_bounds` run are also
+    // pasted in the PR description for a paper-trail independent of this
+    // source file.
+    // ---------------------------------------------------------------------
+
+    /// Re-derive the expected fold bounds directly from the same primitives
+    /// `resolve_wf_fold_bounds` calls, so this test file has its own,
+    /// separate expression of "today's formula" to compare against.
+    fn expected_wf_fold_bounds(
+        n: usize,
+        num_windows: usize,
+        span_ms: i64,
+        regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let window_size = n / num_windows.max(1);
+        let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+        let test_size = window_size - train_size;
+        let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+        resolve_wf_window_offsets(n, window_size, num_windows, test_size, regimes)
+            .into_iter()
+            .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
+            .take(num_windows)
+            .map(|offset| {
+                let train_start = offset;
+                let train_end = offset + train_size;
+                let test_start = train_end + purge_gap_bars;
+                let test_end = (test_start + test_size).min(n);
+                (train_start, train_end, test_start, test_end)
+            })
+            .collect()
+    }
+
+    fn assert_fold_bounds_match(
+        actual: &[WfFoldBounds],
+        expected: &[(usize, usize, usize, usize)],
+    ) {
+        let actual_tuples: Vec<(usize, usize, usize, usize)> = actual
+            .iter()
+            .map(|b| (b.train_start, b.train_end, b.test_start, b.test_end))
+            .collect();
+        assert_eq!(actual_tuples, expected);
+    }
+
+    const DAY_MS: i64 = 86_400_000;
+
+    #[test]
+    fn golden_wf_fold_bounds_1000_daily_bars_5_windows_no_regimes() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS; // daily bars
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+        // Pinned literal values (pasted into the PR description too) --
+        // window_size=200, train_size=140, test_size=60, purge_gap_bars=5,
+        // uniform step=200 (back-to-back, see resolve_wf_step). Only 4 of
+        // the 5 requested windows survive: the 5th candidate offset (800)
+        // is spaced by the uniform step (200, computed WITHOUT the purge
+        // gap) but its actual footprint is train+purge+test = 205 bars, so
+        // 800 + 140 + 5 + 60 = 1005 > n (1000) and the existing `<= n`
+        // filter drops it outright -- TODAY's code asks for 5 windows and
+        // silently returns 4 whenever purge_gap_bars > 0 and the data
+        // divides evenly. Preserved here byte-for-byte as "today's" real
+        // behavior, not smoothed over.
+        assert_eq!(
+            expected,
+            vec![
+                (0, 140, 145, 205),
+                (200, 340, 345, 405),
+                (400, 540, 545, 605),
+                (600, 740, 745, 805)
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_1000_daily_bars_5_windows_with_regimes() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS;
+        // Regimes are indexed over returns (n - 1 = 999 entries): a long Low
+        // run, then a short High spike, then Medium -- the same
+        // "uniform spacing alone would plausibly miss the short segment"
+        // shape used by the existing resolve_wf_window_offsets tests.
+        let regimes = make_regimes(&[(600, Low), (150, High), (249, Medium)]);
+        assert_eq!(regimes.len(), n - 1);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_fold_bounds_match(&actual, &expected);
+        assert!(
+            !expected.is_empty(),
+            "regime-stratified placement must still produce windows"
+        );
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_500_bars_3_windows_scarce_regime() {
+        use quant_diagnostics::VolatilityRegime::{High, Low, Medium};
+        let n = 500usize;
+        let num_windows = 3usize;
+        let span_ms = 499 * DAY_MS;
+        let regimes = make_regimes(&[(420, Low), (30, High), (49, Medium)]);
+        assert_eq!(regimes.len(), n - 1);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_2000_hourly_bars_8_windows_no_regimes() {
+        let n = 2000usize;
+        let num_windows = 8usize;
+        // Hourly bars: same calendar span expressed in far more bars, so
+        // resolve_wf_purge_gap_bars's calendar-day-to-bar-count conversion
+        // is exercised at a different granularity than the daily cases.
+        let span_ms = 1999 * (DAY_MS / 24);
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    #[test]
+    fn golden_wf_fold_bounds_short_series_purge_gap_capped() {
+        // Small enough that resolve_wf_purge_gap_bars' test_size/2 cap binds
+        // (see resolve_wf_purge_gap_bars_never_exceeds_half_the_test_window).
+        let n = 120usize;
+        let num_windows = 3usize;
+        let span_ms = 119 * DAY_MS;
+        let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
+        let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert_fold_bounds_match(&actual, &expected);
+    }
+
+    // ---------------------------------------------------------------------
+    // Historical bug regression #1 (named in the plan doc): missing purge
+    // gap -- a purge gap of 0 between train_end and test_start would let a
+    // training observation's label/holding period reach directly into the
+    // test window. For any realistic (sub-half-test_size) calendar spacing,
+    // resolve_wf_fold_bounds's test_start must be strictly ahead of
+    // train_end by a positive number of bars.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn historical_bug_missing_purge_gap_regression() {
+        let n = 1000usize;
+        let num_windows = 5usize;
+        let span_ms = 999 * DAY_MS; // ordinary daily bars -> a real, positive gap is expected
+        let bounds = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
+        assert!(!bounds.is_empty());
+        for b in &bounds {
+            let gap = b.test_start.saturating_sub(b.train_end);
+            assert!(
+                gap > 0,
+                "train_end={} test_start={} must be separated by a positive purge gap (bug: missing purge gap), got gap={}",
+                b.train_end, b.test_start, gap
+            );
+            assert_eq!(
+                gap, 5,
+                "daily bars should convert WF_PURGE_GAP_DAYS=5.0 into ~5 bars of purge, got {gap}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // window_regime_label / regime_coverage_narrative
     // ---------------------------------------------------------------------
 
@@ -4220,19 +5165,21 @@ mod tests {
         assert!(result.margin.is_infinite());
     }
 
+    /// Both env-var cases in ONE test (2026-09-17). They were two tests
+    /// mutating the same process-wide `ENABLE_CROSS_SECTIONAL_CHECK` on
+    /// different threads, so whichever lost the race read the other's value
+    /// and failed -- a real flake that surfaced as soon as unrelated new
+    /// tests shifted the scheduling.
     #[test]
-    fn cross_sectional_check_disabled_by_default() {
+    fn cross_sectional_check_reads_its_env_var() {
         std::env::remove_var("ENABLE_CROSS_SECTIONAL_CHECK");
         assert!(!cross_sectional_check_enabled());
-    }
-
-    #[test]
-    fn cross_sectional_check_enabled_via_env_var() {
         std::env::set_var("ENABLE_CROSS_SECTIONAL_CHECK", "true");
         assert!(cross_sectional_check_enabled());
         std::env::set_var("ENABLE_CROSS_SECTIONAL_CHECK", "1");
         assert!(cross_sectional_check_enabled());
         std::env::remove_var("ENABLE_CROSS_SECTIONAL_CHECK");
+        assert!(!cross_sectional_check_enabled());
     }
 
     #[test]
@@ -4275,6 +5222,7 @@ mod tests {
             summary: "Strategy passed all stages".into(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 42.5,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -4371,6 +5319,7 @@ mod tests {
             summary: String::new(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 0.0,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -4400,6 +5349,7 @@ mod tests {
                 message: "P(ruin) > 20%".into(),
             }],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 100.0,
         };
         let cloned = result.clone();
@@ -4426,6 +5376,7 @@ mod tests {
             summary: "OK".into(),
             stage_verdicts: vec![],
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 1.0,
         };
         let debug = format!("{:?}", result);
@@ -4571,6 +5522,9 @@ mod tests {
             mc_confidence_level: 0.99,
             max_drawdown_hard_cap: None,
             historical_iv_surfaces: None,
+            option_instrument: None,
+            option_spread: None,
+            underlying_series: None,
         };
         assert_eq!(config.wf_windows, 5);
         assert_eq!(config.mc_runs, 500);
@@ -4603,6 +5557,7 @@ mod tests {
             summary: "High ruin probability".into(),
             stage_verdicts: verdicts,
             look_ahead_detected: None,
+            causality_truncation: None,
             elapsed_seconds: 120.0,
         };
         assert_eq!(result.stage_verdicts.len(), 3);
@@ -4670,6 +5625,47 @@ mod tests {
         assert!((net_pct - (combined.total_pnl / initial_capital * 100.0)).abs() < 1e-6);
         // realized_pnl must agree with total_pnl too.
         assert!((combined.realized_pnl.unwrap() - combined.total_pnl).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_combine_oos_sharpe_uses_real_span_and_is_clamped() {
+        // Regression test for a 2026-09-06 production bug: combine_oos_results
+        // annualized Sharpe/Sortino/volatility with a FIXED sqrt(252) factor
+        // (assumes exactly one trade per trading day) and no ceiling. Combined
+        // with a handful of sparse OOS trades spread over a much longer real
+        // span, this produced nonsense Sharpe ratios in production (96.25 on
+        // 6 trades, 53.54 on 4 trades). The fix derives the annualization
+        // factor from the real elapsed time between the first and last trade
+        // and clamps the result at +/-20, matching the in-sample Sharpe calc.
+        let start = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        // 6 trades spread over 2 years, all small, consistent +1% winners --
+        // exactly the "sparse but suspiciously clean" shape that blew up
+        // under the old fixed-252 factor.
+        let mut w = oos_window(
+            vec![10_000.0, 10_100.0, 10_201.0, 10_303.01, 10_406.04, 10_510.10, 10_615.20],
+            vec![0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+        );
+        w.first_trade_timestamp = Some(start);
+        w.last_trade_timestamp = Some(start + chrono::Duration::days(730));
+
+        let combined = combine_oos_results(&[w], 10_000.0);
+
+        let sharpe = combined.sharpe_ratio.expect("sharpe should be computed");
+        assert!(
+            sharpe <= 20.0 && sharpe >= -20.0,
+            "sharpe must stay within the +/-20 clamp, got {sharpe}"
+        );
+        // With the real ~2-year span (a handful of trades/year, not one/day),
+        // annualizing should be far more conservative than the old fixed-252
+        // factor would have produced -- assert it lands well under the old
+        // bug's observed magnitude (96.25) as a sanity floor on the fix.
+        assert!(sharpe < 20.0, "expected the real span to avoid pinning the clamp, got {sharpe}");
+
+        let sortino = combined.sortino_ratio.expect("sortino should be computed");
+        assert!(
+            sortino <= 20.0 && sortino >= -20.0,
+            "sortino must stay within the +/-20 clamp, got {sortino}"
+        );
     }
 
     #[test]

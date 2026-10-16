@@ -213,7 +213,10 @@ impl RegimeAwareMC {
     /// Calculate regime boundaries using quantiles
     fn calculate_regime_boundaries(&self, valid_vols: &[(usize, f64)]) -> Vec<f64> {
         let mut sorted_vols: Vec<f64> = valid_vols.iter().map(|(_, v)| *v).collect();
-        sorted_vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup (BacktestingEngine's
+        // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+        sorted_vols.sort_by(f64::total_cmp);
         
         let n = sorted_vols.len();
         let mut boundaries = Vec::with_capacity(self.config.num_regimes - 1);
@@ -318,7 +321,9 @@ impl RegimeAwareMC {
             return RegimeMCResult::default();
         }
         
-        simulated_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the fix
+        // earlier in this file for why (2026-09-16 production incident).
+        simulated_values.sort_by(f64::total_cmp);
         
         let n = simulated_values.len();
         let mean: f64 = simulated_values.iter().sum::<f64>() / n as f64;

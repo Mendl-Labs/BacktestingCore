@@ -16,8 +16,8 @@ use config::{BacktestConfig, ExchangeFeeConfig, ParameterValue};
 use dataloader::MarketData;
 use derivatives::DerivativeMetadata;
 use orderbook::{BookSide, Fill, LiquidityType};
-use portfoliomanager::PortfolioState;
-use signal::{Signal, SignalStrength, SignalReason, SignalType};
+use portfoliomanager::{PortfolioState, PositionSide, FillOutcome};
+use signal::{Signal, SignalStrength, SignalReason, SignalType, SpreadLeg};
 use strategy::traits::{
     MarketSession, PricePoint, PriceSource, SessionType, StrategyContext, VolumePoint,
     PortfolioSnapshot,
@@ -25,7 +25,9 @@ use strategy::traits::{
 use strategy::Strategy; // trait import — required for .initialize() / .generate_signals()
 use strategy::executor::{self, StrategyExecutor, ExecutionTier};
 
-use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel};
+use crate::types::{BacktestResult, TradeRecord, MarketDataInput, BookSnapshot, OrderBookLevel, PerBarWeights};
+use crate::per_bar_weights::PerBarWeightTracker;
+use crate::python_validation::OptionSpreadLeg;
 use crate::rolling_window::RollingWindow;
 use genetic::adaptive_sampling::StableRegionDetector;
 use metrics::significance;
@@ -56,6 +58,28 @@ fn tardis_to_orderbook(snap: &BookSnapshot) -> OrderbookSnapshot {
     let total = bid_depth + ask_depth;
     let imbalance = if total > 0.0 { (bid_depth - ask_depth) / total } else { 0.0 };
     OrderbookSnapshot { bids, asks, spread, mid_price, bid_depth, ask_depth, imbalance }
+}
+
+/// Binary-search a pre-sorted `(timestamp_ms, value)` series for the value
+/// observable as-of the given tick timestamp: the last entry at-or-before it.
+///
+/// Unlike `find_nearest_snapshot` below, this deliberately returns `None`
+/// (not the earliest entry) when every entry is still in the future relative
+/// to `timestamp` -- an orderbook snapshot approximates market microstructure
+/// and a same-day fallback is harmless, but a user-supplied alt-data series
+/// (e.g. insider-buying intensity) is a candidate alpha signal, and silently
+/// exposing tomorrow's value on today's tick would be real lookahead bias.
+pub(crate) fn find_asof_value(series: &[(i64, f64)], timestamp: &chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    if series.is_empty() {
+        return None;
+    }
+    let tick_ms = timestamp.timestamp_millis();
+    let idx = series.partition_point(|(ts, _)| *ts <= tick_ms);
+    if idx == 0 {
+        None
+    } else {
+        Some(series[idx - 1].1)
+    }
 }
 
 /// Binary-search the pre-sorted snapshots for the entry whose `timestamp_us`
@@ -102,8 +126,12 @@ pub struct PythonSimConfig {
     pub backtest_config: BacktestConfig,
     /// Optional exchange fee config for maker/taker fee lookup.
     pub fee_config: Option<ExchangeFeeConfig>,
-    /// Optional user-supplied supplementary data (key → value per tick).
-    pub supplementary_data: HashMap<String, f64>,
+    /// Optional user-uploaded alt-data series: key (e.g. filename stem) →
+    /// `(timestamp_ms, value)` points, sorted ascending by timestamp.
+    /// Looked up per tick via `find_asof_value` (last value at-or-before the
+    /// tick's own timestamp -- never a future value), so a key is simply
+    /// absent from `StrategyContext.custom_data` before its series starts.
+    pub supplementary_data: HashMap<String, Vec<(i64, f64)>>,
     /// Optional pre-parsed parameters to pass to the strategy.
     pub parameters: HashMap<String, ParameterValue>,
     /// Optional progress callback: receives (current_tick, total_ticks).
@@ -134,6 +162,41 @@ pub struct PythonSimConfig {
     /// every tick exactly as before -- zero behavior change for any
     /// strategy that doesn't opt in via `data_requirements().needs_iv_surface`.
     pub historical_iv_surfaces: Option<Vec<derivatives::IvSurface>>,
+    /// When set, this run is trading a single pre-resolved option contract
+    /// rather than the underlying spot asset -- `market_data` must already
+    /// be that contract's OWN OHLCV series (see `options_backtest_data` in
+    /// the `program` crate, which resolves a job's `OptionLeg` into this
+    /// exact shape). The strategy's Python `compute_signals()` still only
+    /// ever returns the plain int8 BUY/SELL/HOLD/CLOSE vocabulary (the SDK
+    /// has no way to embed contract metadata in a signal) -- `i8_to_signals`
+    /// reinterprets a bulk BUY/SELL code as `SignalType::BuyOption`/
+    /// `SellOption` on THIS instrument when set, instead of a plain spot
+    /// `Buy`/`Sell`, so the strategy's existing directional logic (when to
+    /// be long/flat) drives the option position without the strategy code
+    /// itself needing to know it's trading an option at all. CLOSE needs no
+    /// equivalent handling: `close_all_positions` already closes each open
+    /// position using ITS OWN recorded instrument (set when the position
+    /// was opened), not a signal-level one. `None` (the default) is the
+    /// existing, unaffected spot/futures behavior.
+    pub option_instrument: Option<DerivativeMetadata>,
+    /// When set, this run is trading a pre-configured multi-leg option
+    /// spread (a vertical, currently -- 2 legs, see `OptionSpreadLeg`'s doc
+    /// comment for the exact scope) instead of a single option or the
+    /// underlying spot asset. Mutually exclusive with `option_instrument`
+    /// (a run is single-leg or multi-leg, never both) -- when both are
+    /// `Some`, `option_spread` takes precedence. `None` (the default) is
+    /// the existing, unaffected behavior.
+    pub option_spread: Option<Vec<OptionSpreadLeg>>,
+    /// The underlying's own spot price at each tick, aligned index-for-index
+    /// with `market_data`/`input` -- required to price Greeks at all when
+    /// `option_instrument`/`option_spread` is set, since in that mode
+    /// `current_price` in the tick loop is the OPTION CONTRACT's own price,
+    /// not the underlying's (see `option_instrument`'s doc comment: the
+    /// whole point of that field is trading the contract's own OHLCV
+    /// series). `None` (the default) leaves Greeks unpopulated exactly as
+    /// before this field existed -- `update_position_greeks` is simply never
+    /// called, matching every existing call site.
+    pub underlying_series: Option<Vec<f64>>,
 }
 
 /// Binary-search the pre-sorted historical IV series for the entry whose
@@ -154,6 +217,78 @@ fn find_nearest_iv_surface<'a>(
     } else {
         Some(&surfaces[idx - 1])
     }
+}
+
+/// Annualized trailing realized-vol series for `update_position_greeks`'s
+/// fallback vol source (see that call site's doc comment for when the
+/// fallback is actually used vs. the real IV surface). `series` is the
+/// underlying's own spot price at each tick (`PythonSimConfig.underlying_series`);
+/// `timestamps_ms` its aligned tick timestamps, used only to derive the real
+/// bars-per-year annualization factor from the data's own actual cadence
+/// (`metrics::significance::observations_per_year_from_span`) rather than a
+/// hardcoded 252/365. Empty when `series` has fewer than 2 points.
+fn annualized_underlying_realized_vol(series: &[f64], timestamps_ms: &[i64], lookback: usize) -> Vec<Option<f64>> {
+    if series.len() < 2 {
+        return Vec::new();
+    }
+    let annualization = if timestamps_ms.len() >= 2 {
+        let span_secs = (timestamps_ms[timestamps_ms.len() - 1] - timestamps_ms[0]) as f64 / 1000.0;
+        significance::observations_per_year_from_span(timestamps_ms.len(), Some(span_secs))
+    } else {
+        365.0
+    };
+    portfoliomanager::margin::trailing_realized_vol_series(series, lookback)
+        .into_iter()
+        .map(|v| v.map(|std| std * annualization.sqrt()))
+        .collect()
+}
+
+/// Pick the vol to price `instrument`'s Greeks with at this tick: the real
+/// historical IV surface's nearest point for this exact strike/expiry when
+/// available, falling back to `fallback_vol` (the precomputed annualized
+/// realized-vol reading for this tick, from `annualized_underlying_realized_vol`)
+/// otherwise. `None` when neither source has a usable (finite, positive)
+/// reading -- callers must skip `update_position_greeks` entirely in that
+/// case rather than pricing off a zero/garbage vol.
+fn select_greeks_vol(iv_surface: Option<&derivatives::IvSurface>, instrument: &DerivativeMetadata, fallback_vol: Option<f64>) -> Option<f64> {
+    iv_surface
+        .and_then(|surf| {
+            let strike = instrument.instrument_kind.strike()?;
+            let expiry = instrument.instrument_kind.expiry()?;
+            surf.nearest_iv(strike, expiry).map(|p| p.iv)
+        })
+        .or(fallback_vol)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Whether `position` is exempt from the engine's leveraged-futures-style
+/// margin-call check (`portfoliomanager::margin::is_liquidated`, applied at
+/// this function's call site in the tick loop). `true` for an already-closed
+/// position, or an option (long or short) -- see that call site's own doc
+/// comment for the full reasoning on why options are exempt in BOTH
+/// directions despite a short option's real unbounded loss potential
+/// (no real option margin-call formula exists in this platform; the
+/// account-level `risk_manager` drawdown gate is the applicable backstop
+/// instead). `false` for futures/perps (2026-09-02 fix): unlike options,
+/// they use the exact leveraged-margin accounting `is_liquidated` models.
+/// Where a liquidation fills once a position's isolated-margin level has
+/// been breached intrabar: the level itself, clamped to the bar's traded
+/// range. A bar that gapped entirely past the level fills at the nearest
+/// price that bar actually traded (its high for a long, its low for a
+/// short). Filling at the bar's CLOSE instead -- the previous behavior --
+/// let a daily bar sit far past the level and book a loss several times
+/// the posted margin, which is precisely what a liquidation exists to
+/// prevent. `fallback` is used when the bar has no OHLC (tick data).
+fn liquidation_fill_price(liq_level: f64, high_low: Option<(f64, f64)>, fallback: f64) -> f64 {
+    match high_low {
+        Some((high, low)) if low <= high => liq_level.max(low).min(high),
+        _ => fallback,
+    }
+}
+
+fn is_exempt_from_leverage_liquidation_check(position: &portfoliomanager::Position) -> bool {
+    position.close_time.is_some()
+        || position.instrument.as_ref().map(|i| i.instrument_kind.is_option()).unwrap_or(false)
 }
 
 /// Run a directional Python strategy simulation.
@@ -178,6 +313,46 @@ pub async fn run_sim_ticks(
     config: PythonSimConfig,
 ) -> Result<PythonSimResult> {
     run_with_input(MarketDataInput::SimTicks { ticks, symbol, exchange }, config).await
+}
+
+/// Compute a strategy's `compute_features()` output over `data` with NO
+/// trading simulation -- no signals, no fills, no portfolio, no walk-forward.
+/// The rule-first discovery flow's signal-test stage uses this to check
+/// whether a strategy's underlying feature predicts forward returns at all
+/// before spending a single real backtest on it: build the executor exactly
+/// as `run_with_input` does, extract the same price/volume/timestamp arrays
+/// `compute_all_features` expects, and return whatever the strategy computes
+/// alongside the aligned prices/timestamps a caller needs to build forward
+/// returns from. `Ok((None, ..))` when the strategy has no `compute_features()`
+/// override (not an error -- see `compute_all_features`'s own contract) or
+/// when the hook is disabled via `ENABLE_COMPUTE_FEATURES=0`.
+pub async fn compute_strategy_features(
+    python_source: &str,
+    parameters: HashMap<String, ParameterValue>,
+    data: &[MarketData],
+) -> Result<(Option<HashMap<String, Vec<f64>>>, Vec<f64>, Vec<i64>)> {
+    if data.is_empty() {
+        anyhow::bail!("No market data provided for feature computation");
+    }
+    let (mut executor, _tier_analysis) = executor::build_executor(python_source, parameters)
+        .await
+        .context("Failed to build strategy executor")?;
+
+    let mut prices = Vec::with_capacity(data.len());
+    let mut volumes = Vec::with_capacity(data.len());
+    let mut timestamps = Vec::with_capacity(data.len());
+    for md in data {
+        let (p, v, ts) = extract_price_volume_ts(md);
+        prices.push(p);
+        volumes.push(v);
+        timestamps.push(ts.timestamp_millis());
+    }
+
+    let (features, error) = executor.compute_all_features(&prices, &volumes, &timestamps).await;
+    if let Some(e) = error {
+        log_warn!(BACKTEST_LOGGER, "compute_features() failed in compute_strategy_features: {}", e);
+    }
+    Ok((features, prices, timestamps))
 }
 
 async fn run_with_input(
@@ -263,9 +438,16 @@ async fn run_with_input(
     let adverse_selection = config.backtest_config.trading.adverse_selection;
     let fill_volume_fraction = config.backtest_config.trading.fill_volume_fraction;
     let synthetic_book_cfg = if config.backtest_config.trading.use_synthetic_book {
+        // Bar length from the candles' own timestamps, not a config field:
+        // the book's volatility-widening term is scaled by it (see
+        // `SyntheticBookConfig::bar_minutes`), and a mislabelled interval
+        // would silently mis-price every fill.
+        let bar_minutes = median_candle_spacing_minutes(&input).unwrap_or(crate::synthetic_book::REFERENCE_BAR_MINUTES);
+        log_info!(BACKTEST_LOGGER, "Synthetic book: {:.0}-minute bars (median candle spacing)", bar_minutes);
         Some(SyntheticBookConfig {
             spread_bps: config.backtest_config.trading.synthetic_spread_bps,
             depth_levels: config.backtest_config.trading.synthetic_depth_levels,
+            bar_minutes,
             ..Default::default()
         })
     } else {
@@ -280,6 +462,14 @@ async fn run_with_input(
     };
     let equity_capacity = (input.len() / equity_sample_interval) + 100;
 
+    // W3.5: opt-in per-bar held weights, sampled at exactly the equity curve's sample points
+    // (see `crate::per_bar_weights`). `None` (the default) leaves the result untouched.
+    let mut per_bar_weights: Option<PerBarWeightTracker> = if config.backtest_config.analysis.export_per_bar_weights {
+        Some(PerBarWeightTracker::new(input_symbol(&input), equity_capacity))
+    } else {
+        None
+    };
+
     // Tracking state
     let mut equity_curve: Vec<f64> = Vec::with_capacity(equity_capacity);
     // Bug #33 — parallel timestamps (Unix ms) for equity_curve, populated at the
@@ -289,7 +479,7 @@ async fn run_with_input(
     let mut trade_returns: Vec<f64> = Vec::new();
     let mut trade_maes: Vec<f64> = Vec::new();
     let mut trade_log: Vec<TradeRecord> = Vec::new();
-    let mut open_positions: Vec<OpenPosition> = Vec::new();
+    let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
     let mut next_trade_id: usize = 1;
     let max_trade_log_size = config.max_trade_log_size;
     let mut total_commission = 0.0_f64;
@@ -396,6 +586,20 @@ async fn run_with_input(
     // never looks at a bar's own close), and `None` end-to-end when
     // `vol_target_cfg` is `None`.
     let mut precomputed_trailing_vol: Option<Vec<Option<f64>>> = None;
+    // Greeks/mark-to-market wiring (2026-09-02): fallback realized-vol
+    // series, used per-tick to price an option position's Greeks whenever
+    // no historical IV surface point is available for that tick/strike
+    // (see the tick loop's `update_position_greeks` call below). `20` bars
+    // is a conventional realized-vol lookback (roughly a trading month at
+    // daily granularity); annualized by the data's own ACTUAL bar cadence
+    // (`observations_per_year_from_span`, populated just below once
+    // `timestamps_arr` is built) rather than a hardcoded 252/365, matching
+    // how Sharpe/DSR annualization already works elsewhere in this
+    // pipeline. Empty (the default) whenever no option instrument/spread is
+    // configured, or no `underlying_series` was supplied -- `None` end to
+    // end, `update_position_greeks` is simply never called.
+    const GREEKS_REALIZED_VOL_LOOKBACK: usize = 20;
+    let mut underlying_realized_vol: Vec<Option<f64>> = Vec::new();
     let (precomputed_signals, compute_signals_error): (Option<Vec<i8>>, Option<String>) = {
         let mut prices_arr: Vec<f64>    = Vec::with_capacity(total_ticks);
         let mut volumes_arr: Vec<f64>   = Vec::with_capacity(total_ticks);
@@ -420,6 +624,11 @@ async fn run_with_input(
                 prices_arr.push(p);
                 volumes_arr.push(v);
                 timestamps_arr.push(ts.timestamp_millis());
+            }
+        }
+        if let Some(series) = config.underlying_series.as_ref() {
+            if config.option_instrument.is_some() || config.option_spread.is_some() {
+                underlying_realized_vol = annualized_underlying_realized_vol(series, &timestamps_arr, GREEKS_REALIZED_VOL_LOOKBACK);
             }
         }
         let (features, features_error) = executor.compute_all_features(&prices_arr, &volumes_arr, &timestamps_arr).await;
@@ -536,6 +745,12 @@ async fn run_with_input(
     // the per-tick `generate_signals` path counts via `diag_*` and we merge those
     // into a `SignalCounts` after the dispatch loop completes (see below).
     let mut signal_counts = signal_counts;
+    let risk_free_rate = config.backtest_config.trading.risk_free_rate;
+    // See `BacktestConfig::warmup_bars`: the strategy's vectorized signals
+    // were computed over the WHOLE slice above (so lookback indicators are
+    // warm by the time trading starts), but nothing is traded or recorded
+    // before this index.
+    let warmup_bars = config.backtest_config.warmup_bars.min(total_ticks);
 
     for (tick_idx, data_cow) in input.iter().enumerate() {
         let data = &*data_cow;
@@ -544,24 +759,30 @@ async fn run_with_input(
         if current_price <= 0.0 {
             continue;
         }
+        last_price = current_price;
+        price_series.push(current_price);
+        if tick_idx < warmup_bars {
+            continue;
+        }
         if first_price.is_none() {
             first_price = Some(current_price);
         }
-        last_price = current_price;
-        price_series.push(current_price);
 
-        // Update MAE/MFE for all open positions
-        for pos in &mut open_positions {
-            let unrealized = if pos.side == "long" {
-                (current_price - pos.entry_fill_price) / pos.entry_fill_price
-            } else {
-                (pos.entry_fill_price - current_price) / pos.entry_fill_price
-            };
-            if unrealized < pos.worst_unrealized {
-                pos.worst_unrealized = unrealized;
-            }
-            if unrealized > pos.best_unrealized {
-                pos.best_unrealized = unrealized;
+        // Update MAE/MFE for all open positions, reading side/entry price
+        // from the portfolio's own real ledger (correct for shorts) rather
+        // than the old shadow ledger.
+        for position in portfolio.positions.iter().filter(|p| p.close_time.is_none()) {
+            if let Some(meta) = open_lot_meta.get_mut(&(position.symbol.clone(), position.side)) {
+                let unrealized = match position.side {
+                    PositionSide::Long => (current_price - position.entry_price) / position.entry_price,
+                    PositionSide::Short => (position.entry_price - current_price) / position.entry_price,
+                };
+                if unrealized < meta.worst_unrealized {
+                    meta.worst_unrealized = unrealized;
+                }
+                if unrealized > meta.best_unrealized {
+                    meta.best_unrealized = unrealized;
+                }
             }
         }
 
@@ -576,7 +797,7 @@ async fn run_with_input(
             &mut trade_returns,
             &mut trade_maes,
             &mut trade_log,
-            &mut open_positions,
+            &mut open_lot_meta,
             &mut next_trade_id,
             max_trade_log_size,
             timestamp,
@@ -617,8 +838,10 @@ async fn run_with_input(
         // BEFORE building StrategyContext, so on_tick avoids cloning ~48 KB of
         // price/volume history.
         custom_data_buf.clear();
-        for (k, v) in &supplementary_data {
-            custom_data_buf.insert(k.clone(), *v);
+        for (k, series) in &supplementary_data {
+            if let Some(v) = find_asof_value(series, &timestamp) {
+                custom_data_buf.insert(k.clone(), v);
+            }
         }
         executor.pre_enrich(data, &mut custom_data_buf);
         
@@ -626,6 +849,36 @@ async fn run_with_input(
         let iv_surface_for_tick = config.historical_iv_surfaces.as_deref()
             .and_then(|s| find_nearest_iv_surface(s, &timestamp))
             .cloned();
+
+        // Greeks/mark-to-market wiring (2026-09-02): needs the underlying's
+        // OWN spot at this tick (`config.underlying_series`, NOT
+        // `current_price` -- see that field's doc comment for why those
+        // differ whenever an option instrument/spread is configured) and a
+        // vol reading -- prefer the real historical IV surface for this
+        // exact strike/expiry when available, falling back to the
+        // precomputed annualized realized-vol estimate otherwise. Updates
+        // `position.greeks`/`mark_price`/`unrealized_pnl` for every open
+        // position on that symbol via `apply_derivative_fill`'s own bounds
+        // (a no-op if nothing is open on it yet, e.g. before entry). A
+        // no-op end to end whenever `underlying_series` wasn't supplied.
+        if let Some(spot) = config.underlying_series.as_ref()
+            .and_then(|s| s.get(tick_idx).copied())
+            .filter(|s| s.is_finite() && *s > 0.0)
+        {
+            let fallback_vol = underlying_realized_vol.get(tick_idx).copied().flatten();
+            if let Some(instr) = config.option_instrument.as_ref() {
+                if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), instr, fallback_vol) {
+                    portfolio.update_position_greeks(&instr.symbol, spot, risk_free_rate, vol, timestamp);
+                }
+            }
+            if let Some(legs) = config.option_spread.as_ref() {
+                for leg in legs {
+                    if let Some(vol) = select_greeks_vol(iv_surface_for_tick.as_ref(), &leg.instrument, fallback_vol) {
+                        portfolio.update_position_greeks(&leg.instrument.symbol, spot, risk_free_rate, vol, timestamp);
+                    }
+                }
+            }
+        }
 
         let context = StrategyContext {
             timestamp,
@@ -655,12 +908,11 @@ async fn run_with_input(
             iv_surface: iv_surface_for_tick,
             futures_curve: None,
             funding_rates: None,
-            // portfolio_greeks IS real -- get_portfolio_greeks() aggregates
-            // whatever positions already have `.greeks` populated via
-            // apply_derivative_fill/update_position_greeks (Phase 1). It's
-            // simply empty/zero until update_position_greeks is actually
-            // called with a real (spot, vol) pair, which needs the same
-            // underlying-spot data the iv_surface gap above describes.
+            // portfolio_greeks aggregates whatever positions already have
+            // `.greeks` populated -- real per-tick Greeks (2026-09-02) once
+            // `update_position_greeks` was called just above for this tick
+            // (needs `config.underlying_series` to be set); otherwise still
+            // empty/zero exactly as before that wiring existed.
             portfolio_greeks: Some(portfolio.get_portfolio_greeks()),
             tick_number: tick_idx as u64,
             elapsed_seconds: 0.0,
@@ -672,7 +924,7 @@ async fn run_with_input(
         // -- Generate signals via executor (Tier 0–3) with stable region optimization --
         let signals = if let Some(ref sigs) = precomputed_signals {
             // Bulk path: convert precomputed i8 → Signal (no Python call this tick).
-            last_signals = i8_to_signals(sigs[tick_idx], current_price);
+            last_signals = i8_to_signals(sigs[tick_idx], current_price, tick_idx, config.option_instrument.as_ref(), config.option_spread.as_deref());
             &last_signals
         } else if stable_detector.should_process(current_price) {
             // Price moved significantly or max skip reached — call Python strategy
@@ -742,62 +994,129 @@ async fn run_with_input(
         // through the trigger within a single bar -- mirrors how this
         // engine's stop-loss/take-profit logic already uses intrabar
         // extremes rather than just the close. No-op at leverage=1.0
-        // (`margin::is_liquidated` always returns false) and for option
-        // positions (leverage doesn't apply to them -- see
-        // `portfoliomanager::margin`'s module docs).
-        if leverage > 1.0 {
+        // (`margin::is_liquidated` always returns false).
+        //
+        // Exemption scope (2026-09-02, narrowed from "any derivative"):
+        // ONLY options are exempt here, long or short -- `is_liquidated`
+        // models a leveraged-futures-style margin call (a fixed % adverse
+        // move against `entry_price`, scaled by `leverage`/
+        // `maintenance_margin_ratio`), which doesn't correspond to how a
+        // real broker's option margin requirement actually works (a
+        // function of the option's own current value plus a percentage of
+        // the underlying -- this platform has no such model, and applying
+        // the leveraged-futures formula to an option's PREMIUM would
+        // produce an economically meaningless trigger price unrelated to
+        // real risk). A long option's max loss is bounded by the premium
+        // paid regardless, so no circuit breaker is needed there either
+        // way. A short/written option's loss is genuinely unbounded and
+        // DOES need one -- that's now the account-level `risk_manager`
+        // drawdown gate (`equity_at`/`get_current_drawdown`, both fixed to
+        // correctly reflect option P&L without an artificial 100% cap
+        // earlier this session), not this per-position intrabar check.
+        // Futures/perps were PREVIOUSLY also swept into this exemption via
+        // the old blanket `instrument.is_some()` condition -- that was a
+        // real bug: unlike options, futures/perps DO use the exact
+        // leveraged-margin accounting `is_liquidated` models (real
+        // `margin_posted`, same `entry_price`/`leverage` semantics as a
+        // plain leveraged spot position), so they're no longer exempt.
+        // Also runs at 1x whenever a SHORT is open: a 1x short's posted
+        // margin is exhausted once price doubles against it, and
+        // `margin::liquidation_price` now yields that level (previously
+        // INFINITY, letting unleveraged shorts lose several hundred percent
+        // of capital). 1x longs still never trigger (level 0.0).
+        let has_open_short = portfolio.positions.iter()
+            .any(|p| p.close_time.is_none() && p.side == PositionSide::Short);
+        if leverage > 1.0 || has_open_short {
             let ohlc = extract_candle_ohlcv(data);
-            let triggered = portfolio.positions.iter().any(|p| {
-                if p.close_time.is_some() || p.instrument.is_some() {
-                    return false;
-                }
-                let intrabar_extreme = match (p.side, ohlc) {
-                    (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
-                    (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
-                    (_, None) => current_price,
-                };
-                portfoliomanager::margin::is_liquidated(
-                    intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
-                )
-            });
-            if triggered {
-                let equity = portfolio.equity_at(current_price);
-                let margin_used = portfolio.margin_used();
-                let maintenance_margin = portfoliomanager::margin::maintenance_margin(
-                    portfolio.net_position.abs() * current_price,
-                    maintenance_margin_ratio,
-                );
-                if matches!(
-                    riskmanager::check_margin(equity, margin_used, maintenance_margin),
-                    riskmanager::RiskAction::CloseAllPositions(_)
-                ) {
-                    let liquidation_side = if portfolio.net_position > 0.0 {
-                        portfoliomanager::PositionSide::Long
-                    } else {
-                        portfoliomanager::PositionSide::Short
+            // Two independent triggers, either of which liquidates:
+            //  1. Per-position isolated-margin level breached intrabar
+            //     (`is_liquidated`). `breached_level` is the FIRST level
+            //     price would have hit this bar -- the highest for longs,
+            //     the lowest for shorts -- and is where the fill books.
+            //  2. Account-level margin call (`check_margin`: equity at or
+            //     below maintenance margin).
+            // These were previously ANDed. At high leverage that made (1)
+            // unreachable in practice -- the level breach fired but the
+            // account check (maintenance margin is 0.5% of notional) only
+            // confirmed once equity was already near zero, so a 100x
+            // position rode a daily bar straight through zero and booked a
+            // loss several times its posted margin. A liquidation exists
+            // precisely to cap the loss at the margin; see
+            // `liquidation_fill_price` for the fill.
+            let breached_level: Option<(f64, portfoliomanager::PositionSide)> = portfolio.positions.iter()
+                .filter(|p| !is_exempt_from_leverage_liquidation_check(p))
+                .filter_map(|p| {
+                    let intrabar_extreme = match (p.side, ohlc) {
+                        (portfoliomanager::PositionSide::Long, Some((_, _, low, _))) => low,
+                        (portfoliomanager::PositionSide::Short, Some((_, high, _, _))) => high,
+                        (_, None) => current_price,
                     };
-                    let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
-                        current_price, liquidation_side, liquidation_penalty_bps,
-                    );
-                    log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, liq_exit_price);
-                    close_all_positions(
-                        &mut portfolio,
-                        liq_exit_price,
-                        &mut total_commission,
-                        taker_fee,
-                        &mut num_trades,
-                        &mut trade_returns,
-                        &mut trade_maes,
-                        &mut trade_log,
-                        &mut open_positions,
-                        max_trade_log_size,
-                        timestamp,
-                        slippage_bps,
-                        ohlc,
-                        synthetic_book_cfg.as_ref(),
-                        "margin_call_liquidation",
-                    );
-                }
+                    portfoliomanager::margin::is_liquidated(
+                        intrabar_extreme, p.entry_price, p.side, leverage, maintenance_margin_ratio,
+                    ).then(|| (
+                        portfoliomanager::margin::liquidation_price(p.entry_price, p.side, leverage, maintenance_margin_ratio),
+                        p.side,
+                    ))
+                })
+                .fold(None, |best, (level, side)| match best {
+                    None => Some((level, side)),
+                    Some((best_level, best_side)) => {
+                        let first_hit = match side {
+                            portfoliomanager::PositionSide::Long => level > best_level,
+                            portfoliomanager::PositionSide::Short => level < best_level,
+                        };
+                        Some(if first_hit { (level, side) } else { (best_level, best_side) })
+                    }
+                });
+            let equity = portfolio.equity_at(current_price);
+            let margin_used = portfolio.margin_used();
+            let maintenance_margin = portfoliomanager::margin::maintenance_margin(
+                portfolio.net_position.abs() * current_price,
+                maintenance_margin_ratio,
+            );
+            let account_margin_call = matches!(
+                riskmanager::check_margin(equity, margin_used, maintenance_margin),
+                riskmanager::RiskAction::CloseAllPositions(_)
+            );
+            if breached_level.is_some() || account_margin_call {
+                let liquidation_side = if portfolio.net_position > 0.0 {
+                    portfoliomanager::PositionSide::Long
+                } else {
+                    portfoliomanager::PositionSide::Short
+                };
+                let fill_basis = match breached_level {
+                    Some((level, _)) => liquidation_fill_price(level, ohlc.map(|(_, high, low, _)| (high, low)), current_price),
+                    None => current_price,
+                };
+                let liq_exit_price = portfoliomanager::margin::apply_liquidation_penalty(
+                    fill_basis, liquidation_side, liquidation_penalty_bps,
+                );
+                log_warn!(BACKTEST_LOGGER, "Margin call at tick {}: equity={:.2} margin_used={:.2} maintenance_margin={:.2} level_breached={:?} account_call={} -- liquidating at {:.4}", tick_idx, equity, margin_used, maintenance_margin, breached_level.map(|(l, _)| l), account_margin_call, liq_exit_price);
+                close_all_positions(
+                    &mut portfolio,
+                    liq_exit_price,
+                    &mut total_commission,
+                    taker_fee,
+                    &mut num_trades,
+                    &mut trade_returns,
+                    &mut trade_maes,
+                    &mut trade_log,
+                    &mut open_lot_meta,
+                    max_trade_log_size,
+                    timestamp,
+                    slippage_bps,
+                    // NOT `ohlc`: with a bar and a synthetic-book config,
+                    // `execute_taker_fill` rebuilds the fill from a book
+                    // anchored at the bar's CLOSE and ignores the price it
+                    // was given. A liquidation is an intrabar event at a
+                    // known level -- on a bar that breached the level and
+                    // then rallied, the close-anchored fill booked the
+                    // "liquidation" as a PROFIT (confirmed live). Passing
+                    // no bar makes the fill honor `liq_exit_price`.
+                    None,
+                    synthetic_book_cfg.as_ref(),
+                    "margin_call_liquidation",
+                );
             }
         }
 
@@ -807,6 +1126,9 @@ async fn run_with_input(
                 let eq = portfolio.equity_at(current_price);
                 equity_curve.push(eq);
                 equity_curve_timestamps.push(timestamp.timestamp_millis());
+                if let Some(t) = per_bar_weights.as_mut() {
+                    t.sample(&portfolio, current_price, eq, timestamp.timestamp_millis());
+                }
             }
             continue;
         }
@@ -984,7 +1306,7 @@ async fn run_with_input(
                             &mut trade_returns,
                             &mut trade_maes,
                             &mut trade_log,
-                            &mut open_positions,
+                            &mut open_lot_meta,
                             &mut next_trade_id,
                             max_trade_log_size,
                             timestamp,
@@ -1024,7 +1346,16 @@ async fn run_with_input(
                             break;
                         }
 
-                        let leg_price = leg.limit_price.unwrap_or(sig_price);
+                        // A real explicit limit_price always wins. Otherwise,
+                        // for a TAKER fill, this leg's own price (looked up
+                        // from config.option_spread by instrument symbol at
+                        // this exact tick_idx) is the correct fill price --
+                        // sig_price is the PRIMARY series' own price and is
+                        // only correct for whichever leg happens to BE the
+                        // primary series; every other leg needs its own.
+                        let leg_price = leg.limit_price.unwrap_or_else(|| {
+                            spread_leg_price_at(config.option_spread.as_deref(), leg_instrument.as_ref(), tick_idx, sig_price)
+                        });
                         let is_limit_leg = leg.limit_price.is_some() || signal.is_limit;
 
                         if let Some(ref rm) = risk_manager {
@@ -1073,7 +1404,7 @@ async fn run_with_input(
                         } else {
                             execute_taker_fill(
                                 &dir_signal,
-                                current_price,
+                                leg_price,
                                 leg_qty,
                                 &mut portfolio,
                                 &mut total_commission,
@@ -1082,7 +1413,7 @@ async fn run_with_input(
                                 &mut trade_returns,
                                 &mut trade_maes,
                                 &mut trade_log,
-                                &mut open_positions,
+                                &mut open_lot_meta,
                                 &mut next_trade_id,
                                 max_trade_log_size,
                                 timestamp,
@@ -1106,7 +1437,7 @@ async fn run_with_input(
                         &mut trade_returns,
                         &mut trade_maes,
                         &mut trade_log,
-                        &mut open_positions,
+                        &mut open_lot_meta,
                         max_trade_log_size,
                         timestamp,
                         slippage_bps,
@@ -1145,7 +1476,7 @@ async fn run_with_input(
                             &mut trade_returns,
                             &mut trade_maes,
                             &mut trade_log,
-                            &mut open_positions,
+                            &mut open_lot_meta,
                             &mut next_trade_id,
                             max_trade_log_size,
                             timestamp,
@@ -1251,7 +1582,7 @@ async fn run_with_input(
                 &mut trade_returns,
                 &mut trade_maes,
                 &mut trade_log,
-                &mut open_positions,
+                &mut open_lot_meta,
                 &mut dummy_id,
                 max_trade_log_size,
                 timestamp,
@@ -1269,6 +1600,9 @@ async fn run_with_input(
         if tick_idx % equity_sample_interval == 0 || tick_idx == total_ticks - 1 {
             equity_curve.push(total_value);
             equity_curve_timestamps.push(timestamp.timestamp_millis());
+            if let Some(t) = per_bar_weights.as_mut() {
+                t.sample(&portfolio, current_price, total_value, timestamp.timestamp_millis());
+            }
         }
 
         // -- Progress callback --
@@ -1283,45 +1617,11 @@ async fn run_with_input(
     let final_equity = equity_curve.last().copied().unwrap_or(initial_capital);
     let total_pnl = final_equity - initial_capital;
 
-    // Close out remaining open positions as "still open" trade records
-    for pos in open_positions.drain(..) {
-        let should_log = match max_trade_log_size {
-            Some(max) => trade_log.len() < max,
-            None => true,
-        };
-        if should_log {
-            // Compute unrealized P&L at final price
-            let unrealized_pnl = if pos.side == "long" {
-                (last_price - pos.entry_fill_price) * pos.quantity - pos.entry_commission
-            } else {
-                (pos.entry_fill_price - last_price) * pos.quantity - pos.entry_commission
-            };
-            let unrealized_pct = unrealized_pnl / (pos.entry_fill_price * pos.quantity);
-            trade_log.push(TradeRecord {
-                trade_id: pos.trade_id,
-                side: pos.side,
-                entry_signal_price: pos.entry_signal_price,
-                entry_fill_price: pos.entry_fill_price,
-                exit_signal_price: None,
-                exit_fill_price: None,
-                quantity: pos.quantity,
-                pnl: Some(unrealized_pnl),
-                pnl_pct: Some(unrealized_pct),
-                commission: pos.entry_commission,
-                slippage_cost: pos.entry_slippage,
-                entry_time: pos.entry_time,
-                exit_time: None,
-                duration_secs: None,
-                entry_liquidity: pos.entry_liquidity,
-                exit_liquidity: None,
-                entry_reason: pos.entry_reason,
-                exit_reason: None,
-                mae: Some(pos.worst_unrealized),
-                mfe: Some(pos.best_unrealized),
-                legs: Vec::new(),
-            });
-        }
-    }
+    // Close out remaining open positions as "still open" trade records,
+    // sourced from the portfolio's own real ledger (correct side/entry
+    // price/quantity/mark-to-market unrealized P&L) instead of the old
+    // shadow ledger, which hardcoded every position's side as "long".
+    flush_open_positions_to_trade_log(&portfolio, &open_lot_meta, &mut trade_log, max_trade_log_size);
 
     log_info!(BACKTEST_LOGGER, "Python directional simulation complete: {} trades, PnL=${:.2}, equity=${:.2}", num_trades, total_pnl, final_equity);
     log_info!(BACKTEST_LOGGER, "Signal Summary ({} ticks): Buy={} Sell={} Close={} Hold={} ZeroQty={} Errors={} Trades={}", total_ticks, diag_buy_signals, diag_sell_signals, diag_close_signals, diag_hold_signals, diag_zero_qty_skips, diag_error_ticks, num_trades);
@@ -1381,6 +1681,9 @@ async fn run_with_input(
             captured_prices_for_features,
             captured_timestamps_for_features,
             volume_constrained_fills,
+            config.option_instrument.as_ref(),
+            config.option_spread.as_deref(),
+            per_bar_weights.map(PerBarWeightTracker::finish),
         ),
         total_commission,
         pending_limits_at_end: pending_limits.len(),
@@ -1426,16 +1729,25 @@ struct PendingLimit {
     instrument: Option<DerivativeMetadata>,
 }
 
-/// An open position being tracked for round-trip trade log.
-struct OpenPosition {
+/// Diagnostic/cosmetic metadata tracked per currently-open (symbol, side)
+/// position. Used only to enrich `TradeRecord`'s display fields (entry
+/// signal price, cumulative slippage/commission not yet attributed to a
+/// closed trade, MAE/MFE, entry reason/liquidity, trade_id). Deliberately
+/// carries NOTHING that participates in P&L: entry price, executed
+/// quantity, and realized P&L all come straight from `PortfolioState` via
+/// `FillOutcome`/`Position`, so this table drifting can never reproduce the
+/// old shadow-ledger P&L bug (2026-09-06: a real backtest's old, separate
+/// `OpenPosition` shadow ledger summed to +$23,066.88 in trade_log.pnl while
+/// the real portfolio-driven equity never exceeded $16,759 out of $10,000
+/// starting capital) -- at worst a cosmetic field goes stale.
+struct EntryMetadata {
     trade_id: usize,
-    side: String,
     entry_signal_price: f64,
-    entry_fill_price: f64,
-    quantity: f64,
+    /// Entry commission/slippage not yet attributed to a closed trade --
+    /// decremented proportionally as partial exits consume it, so a
+    /// multi-step exit's `TradeRecord`s sum to the lot's true total.
     entry_commission: f64,
     entry_slippage: f64,
-    entry_time: DateTime<Utc>,
     entry_liquidity: String,
     entry_reason: String,
     /// Tracks worst unrealized loss during this position (fraction).
@@ -1482,7 +1794,7 @@ fn extract_price_volume_ts(data: &MarketData) -> (f64, f64, DateTime<Utc>) {
 /// real candle (trades / generic ticks without OHLC columns) the bar
 /// degenerates to the tick price — open=high=low=close=price — so close-bar
 /// behavior is preserved while candle datasets surface true OHLC.
-fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
+pub(crate) fn extract_ohlcv_ts(data: &MarketData) -> (f64, f64, f64, f64, f64, DateTime<Utc>) {
     match data {
         MarketData::Trade(t) => (
             t.price, t.price, t.price, t.price,
@@ -1585,14 +1897,115 @@ fn resolve_position_size_pct(config: &PythonSimConfig) -> f64 {
 /// Convert a bulk-signal i8 code to a `Vec<Signal>`.
 ///
 /// Signal encoding: 1=BUY, -1=SELL, 0=HOLD, 2=CLOSE
-fn i8_to_signals(code: i8, price: f64) -> Vec<Signal> {
+///
+/// `option_spread`, when set (and non-empty), takes precedence over
+/// `option_instrument`: BUY(1) reinterprets as `SignalType::OptionSpread`
+/// entering every leg AS CONFIGURED (a leg with positive `ratio` opens long
+/// via `BuyOption`, negative opens short via `SellOption`), and SELL(-1) as
+/// the MIRROR -- every leg's direction and ratio sign negated, so the same
+/// spread closes (or, for a leg `apply_derivative_fill` finds no matching
+/// open position for, opens the inverse) exactly the way a plain SELL
+/// closes a plain BUY. Each leg's fill price comes from ITS OWN `prices[
+/// tick_idx]`, not the shared `price` parameter -- see `OptionSpreadLeg`'s
+/// doc comment for why every leg needs its own aligned series. Falls back
+/// to `price` (with a loud warning) if a leg's series is shorter than
+/// `tick_idx` requires -- callers are responsible for aligning every leg's
+/// series to the primary market_data length; this is a defensive
+/// fallback for a caller bug, not expected in practice.
+///
+/// `option_instrument`, when set and `option_spread` is not, reinterprets
+/// BUY(1)/SELL(-1) as `SignalType::BuyOption`/`SellOption` on that single
+/// contract instead of plain spot `Buy`/`Sell` -- see `PythonSimConfig.
+/// option_instrument`'s doc comment for the full rationale.
+///
+/// CLOSE(2) is deliberately unchanged in every case: `close_all_positions`
+/// already closes each open position (single-leg or spread-leg alike)
+/// using its own recorded instrument, not a signal-level one.
+fn i8_to_signals(
+    code: i8,
+    price: f64,
+    tick_idx: usize,
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+) -> Vec<Signal> {
     let reason = SignalReason::TechnicalAnalysis("vectorized".into());
+
+    let spread_leg_price = |leg: &OptionSpreadLeg| -> f64 {
+        leg.prices.get(tick_idx).copied().unwrap_or_else(|| {
+            log_warn!(
+                BACKTEST_LOGGER,
+                "OptionSpreadLeg '{}' has no price at tick {} (series len {}) -- falling back to the primary series' price, which is WRONG for this contract; the caller must align every leg's series to market_data's length",
+                leg.instrument.symbol, tick_idx, leg.prices.len()
+            );
+            price
+        })
+    };
+    let build_spread_signal = |legs: &[OptionSpreadLeg], entering: bool| -> Signal {
+        let spread_legs: Vec<SpreadLeg> = legs.iter().map(|leg| {
+            let leg_price = spread_leg_price(leg);
+            let opens_long = if entering { leg.ratio > 0 } else { leg.ratio < 0 };
+            let effective_ratio = if entering { leg.ratio } else { -leg.ratio };
+            let signal_type = if opens_long {
+                SignalType::BuyOption { instrument: leg.instrument.clone(), premium: Some(leg_price) }
+            } else {
+                SignalType::SellOption { instrument: leg.instrument.clone(), premium: Some(leg_price) }
+            };
+            SpreadLeg { signal_type, ratio: effective_ratio, limit_price: None }
+        }).collect();
+        Signal::new("bulk", SignalType::OptionSpread { legs: spread_legs }, SignalStrength::Medium, reason.clone())
+    };
+
     match code {
-        1  => vec![Signal::buy("bulk", SignalStrength::Medium, reason).with_price(price)],
-        -1 => vec![Signal::sell("bulk", SignalStrength::Medium, reason).with_price(price)],
+        1 => {
+            if let Some(legs) = option_spread.filter(|l| !l.is_empty()) {
+                return vec![build_spread_signal(legs, true).with_price(price)];
+            }
+            vec![match option_instrument {
+                Some(instr) => Signal::new("bulk", SignalType::BuyOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+                None => Signal::buy("bulk", SignalStrength::Medium, reason),
+            }.with_price(price)]
+        }
+        -1 => {
+            if let Some(legs) = option_spread.filter(|l| !l.is_empty()) {
+                return vec![build_spread_signal(legs, false).with_price(price)];
+            }
+            vec![match option_instrument {
+                Some(instr) => Signal::new("bulk", SignalType::SellOption { instrument: instr.clone(), premium: None }, SignalStrength::Medium, reason),
+                None => Signal::sell("bulk", SignalStrength::Medium, reason),
+            }.with_price(price)]
+        }
         2  => vec![Signal::close("bulk", SignalStrength::Medium, reason).with_price(price)],
         _  => Vec::new(), // HOLD or any unknown code
     }
+}
+
+/// Median spacing between consecutive candles, in minutes. Median rather than
+/// mean so weekend/holiday gaps (FX, equities) don't stretch a daily series'
+/// estimate. `None` when the input has fewer than two candles (tick data
+/// never builds a synthetic book, see `extract_candle_ohlcv`). Samples at
+/// most the first 1,000 gaps -- the spacing is uniform by construction, and
+/// this runs once per simulation.
+fn median_candle_spacing_minutes(input: &MarketDataInput<'_>) -> Option<f64> {
+    let mut prev: Option<DateTime<Utc>> = None;
+    let mut gaps: Vec<f64> = Vec::new();
+    for data in input.iter() {
+        let MarketData::Candle(c) = &*data else { continue };
+        if let Some(p) = prev {
+            let minutes = (c.timestamp - p).num_seconds() as f64 / 60.0;
+            if minutes > 0.0 {
+                gaps.push(minutes);
+            }
+        }
+        prev = Some(c.timestamp);
+        if gaps.len() >= 1_000 {
+            break;
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    Some(gaps[gaps.len() / 2])
 }
 
 /// Extract candle OHLCV as (close, high, low, volume) if the data is a candle.
@@ -1646,6 +2059,61 @@ fn extract_instrument(signal_type: &SignalType) -> Option<DerivativeMetadata> {
     }
 }
 
+/// Look up an `OptionSpread` leg's own price at `tick_idx`, matched against
+/// `option_spread` by instrument symbol. Falls back to `fallback` (with a
+/// loud warning) when `option_spread` is `None`, the symbol isn't found, or
+/// the matched leg's series doesn't reach `tick_idx` -- each of these means
+/// this fill is either not actually part of a configured spread (a plain
+/// single-leg BuyOption/SellOption reusing the same taker-fill machinery,
+/// where `fallback` -- `sig_price` at the call site -- is already correct)
+/// or a genuine caller alignment bug, never something to silently mis-price
+/// without at least logging it.
+fn spread_leg_price_at(
+    option_spread: Option<&[OptionSpreadLeg]>,
+    instrument: Option<&DerivativeMetadata>,
+    tick_idx: usize,
+    fallback: f64,
+) -> f64 {
+    let (Some(legs), Some(instr)) = (option_spread, instrument) else {
+        return fallback;
+    };
+    match legs.iter().find(|l| l.instrument.symbol == instr.symbol) {
+        Some(leg) => leg.prices.get(tick_idx).copied().unwrap_or_else(|| {
+            log_warn!(
+                BACKTEST_LOGGER,
+                "OptionSpreadLeg '{}' has no price at tick {} (series len {}) -- falling back to {}, which is WRONG for this contract",
+                instr.symbol, tick_idx, leg.prices.len(), fallback
+            );
+            fallback
+        }),
+        None => fallback,
+    }
+}
+
+/// Commission for one fill. An option instrument (`is_option()`) uses the
+/// real per-contract Alpaca fee schedule (`config::OptionsFeeConfig`) --
+/// flat regulatory pass-throughs, not a percentage of premium -- rather
+/// than `generic_fee_rate` (this platform's only other broker integration
+/// for the same underlying asset class; see `OptionsFeeConfig::alpaca`'s
+/// doc comment for why). Any other instrument (a future, say) still applies
+/// `generic_fee_rate` but against the correctly-scaled notional (`price *
+/// qty * contract_multiplier`) -- fixes a second, compounding bug this fee
+/// model shared with options: `fill_value` was previously computed as
+/// `price * qty` with no multiplier at all, understating notional by
+/// exactly the multiplier factor for every derivative instrument, not just
+/// options. A plain (non-derivative) fill keeps the pre-existing `price *
+/// qty * generic_fee_rate` behavior exactly, since its implicit multiplier
+/// is 1.
+fn compute_commission(price: f64, qty: f64, is_buy: bool, instrument: Option<&DerivativeMetadata>, generic_fee_rate: f64) -> f64 {
+    match instrument {
+        Some(instr) if instr.instrument_kind.is_option() => {
+            config::OptionsFeeConfig::alpaca().commission_for_fill(price, qty, instr.contract_multiplier, is_buy)
+        }
+        Some(instr) => price * qty * instr.contract_multiplier * generic_fee_rate,
+        None => price * qty * generic_fee_rate,
+    }
+}
+
 /// Execute a taker (market) fill immediately, applying slippage.
 /// Tracks round-trip trades: Buy/ScaleIn opens a position, Sell/ScaleOut closes it.
 fn execute_taker_fill(
@@ -1659,7 +2127,7 @@ fn execute_taker_fill(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     next_trade_id: &mut usize,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
@@ -1709,25 +2177,26 @@ fn execute_taker_fill(
     // `apply_derivative_fill` (multiplier-aware, correctly opens/covers a
     // short rather than assuming every Ask-side fill closes a long) instead
     // of the plain spot path.
-    let executed_qty = match instrument {
-        Some(instr) => portfolio.apply_derivative_fill(&fill, instr),
-        None => portfolio.apply_fills_executed(&[fill]),
+    let outcome = match instrument {
+        Some(instr) => portfolio.apply_derivative_fill_with_outcome(&fill, instr),
+        None => portfolio.apply_fill_executed_with_outcome(&fill),
     };
-    let executed_qty = match executed_qty {
-        Ok(q) => q,
+    let outcome = match outcome {
+        Ok(o) => o,
         Err(e) => {
             log_warn!(BACKTEST_LOGGER, "Taker fill error: {}", e);
-            0.0
+            return;
         }
     };
-    if executed_qty < 1e-10 {
+    if outcome.executed_quantity < 1e-10 {
         // Nothing executed — no trade, no fees.
         return;
     }
-    let fill_qty = executed_qty;
+    let fill_qty = outcome.executed_quantity;
 
     let fill_value = adjusted_price * fill_qty;
-    let commission = fill_value * taker_fee;
+    let is_buy = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
+    let commission = compute_commission(adjusted_price, fill_qty, is_buy, instrument, taker_fee);
     *total_commission += commission;
     *num_trades += 1;
     portfolio.fees_paid += commission;
@@ -1746,17 +2215,15 @@ fn execute_taker_fill(
     };
     trade_returns.push(pnl_pct);
 
-    let is_entry = matches!(signal_type, SignalType::Buy | SignalType::ScaleIn);
-    let is_exit = matches!(signal_type, SignalType::Sell | SignalType::ScaleOut);
-
-    // MAE: for exits, convert the round-trip's fractional MAE to dollars;
-    // for entries, no completed trade yet → 0.
-    let mae_dollars = if is_exit && !open_positions.is_empty() {
-        let pos = &open_positions[open_positions.len() - 1];
-        pos.worst_unrealized.abs() * pos.entry_fill_price * pos.quantity
-    } else {
-        0.0
-    };
+    // MAE: for a fill that closes/reduces a position, convert the round-trip's
+    // fractional MAE to dollars; for an entry/scale-in, no completed trade
+    // yet → 0. Driven by `outcome.closed_side` -- the portfolio's own real
+    // classification -- not a signal-direction guess, which fixes shorts
+    // being silently dropped/misclassified by the old shadow ledger.
+    let mae_dollars = outcome.closed_side
+        .and_then(|side| open_lot_meta.get(&(outcome.symbol.clone(), side)))
+        .map(|meta| meta.worst_unrealized.abs() * outcome.closed_entry_price.unwrap_or(0.0) * fill_qty)
+        .unwrap_or(0.0);
     trade_maes.push(mae_dollars);
     let slippage_cost = (adjusted_price - fill_price).abs() * fill_qty;
 
@@ -1765,65 +2232,151 @@ fn execute_taker_fill(
         None => true,
     };
 
-    if is_exit && !open_positions.is_empty() {
-        // Close the oldest matching open position (FIFO)
-        if let Some(pos) = open_positions.pop() {
-            if should_log {
-                let exit_slippage = slippage_cost;
-                let raw_pnl = if pos.side == "long" {
-                    (adjusted_price - pos.entry_fill_price) * pos.quantity
-                } else {
-                    (pos.entry_fill_price - adjusted_price) * pos.quantity
-                };
-                let total_comm = pos.entry_commission + commission;
-                let net_pnl = raw_pnl - total_comm;
-                let net_pnl_pct = net_pnl / (pos.entry_fill_price * pos.quantity);
-                let duration = (timestamp - pos.entry_time).num_seconds();
+    if let Some(closed_side) = outcome.closed_side {
+        // This fill closed or partially closed an existing position --
+        // build the TradeRecord from the portfolio's own real entry price,
+        // real executed quantity, and real realized P&L (never a caller-side
+        // guess), pro-rating the metadata map's remaining entry commission/
+        // slippage by the fraction of the lot this fill actually closed so a
+        // multi-step exit's records sum to the lot's true total.
+        let key = (outcome.symbol.clone(), closed_side);
+        let closed_entry_price = outcome.closed_entry_price.unwrap_or(adjusted_price);
+        let closed_open_time = outcome.closed_open_time.unwrap_or(timestamp);
+        let realized_pnl = outcome.realized_pnl.unwrap_or(0.0);
 
-                trade_log.push(TradeRecord {
-                    trade_id: pos.trade_id,
-                    side: pos.side,
-                    entry_signal_price: pos.entry_signal_price,
-                    entry_fill_price: pos.entry_fill_price,
-                    exit_signal_price: Some(fill_price),
-                    exit_fill_price: Some(adjusted_price),
-                    quantity: pos.quantity,
-                    pnl: Some(net_pnl),
-                    pnl_pct: Some(net_pnl_pct),
-                    commission: total_comm,
-                    slippage_cost: pos.entry_slippage + exit_slippage,
-                    entry_time: pos.entry_time,
-                    exit_time: Some(timestamp),
-                    duration_secs: Some(duration),
-                    entry_liquidity: pos.entry_liquidity,
-                    exit_liquidity: Some("taker".to_string()),
-                    entry_reason: pos.entry_reason,
-                    exit_reason: Some(signal_reason.to_string()),
-                    mae: Some(pos.worst_unrealized),
-                    mfe: Some(pos.best_unrealized),
-                    legs: Vec::new(),
+        if should_log {
+            let side_str = match closed_side { PositionSide::Long => "long", PositionSide::Short => "short" };
+            let qty_before = outcome.remaining_open_quantity + fill_qty;
+            let frac = if qty_before > 0.0 { (fill_qty / qty_before).min(1.0) } else { 1.0 };
+            let (attributed_commission, attributed_slippage, entry_signal_price, entry_liquidity, entry_reason, trade_id, worst_unrealized, best_unrealized) =
+                if let Some(meta) = open_lot_meta.get_mut(&key) {
+                    let ec = meta.entry_commission * frac;
+                    let es = meta.entry_slippage * frac;
+                    meta.entry_commission -= ec;
+                    meta.entry_slippage -= es;
+                    (ec, es, meta.entry_signal_price, meta.entry_liquidity.clone(), meta.entry_reason.clone(), meta.trade_id, meta.worst_unrealized, meta.best_unrealized)
+                } else {
+                    (0.0, 0.0, closed_entry_price, "unknown".to_string(), "unknown".to_string(), 0, 0.0, 0.0)
+                };
+            let total_comm = attributed_commission + commission;
+            let net_pnl = realized_pnl - total_comm;
+            let denom = closed_entry_price * fill_qty;
+            let net_pnl_pct = if denom != 0.0 { net_pnl / denom } else { 0.0 };
+            let duration = (timestamp - closed_open_time).num_seconds();
+
+            trade_log.push(TradeRecord {
+                trade_id,
+                side: side_str.to_string(),
+                entry_signal_price,
+                entry_fill_price: closed_entry_price,
+                exit_signal_price: Some(fill_price),
+                exit_fill_price: Some(adjusted_price),
+                quantity: fill_qty,
+                pnl: Some(net_pnl),
+                pnl_pct: Some(net_pnl_pct),
+                commission: total_comm,
+                slippage_cost: attributed_slippage + slippage_cost,
+                entry_time: closed_open_time,
+                exit_time: Some(timestamp),
+                duration_secs: Some(duration),
+                entry_liquidity,
+                exit_liquidity: Some("taker".to_string()),
+                entry_reason,
+                exit_reason: Some(signal_reason.to_string()),
+                mae: Some(worst_unrealized),
+                mfe: Some(best_unrealized),
+                legs: Vec::new(),
+            });
+        }
+        if outcome.position_fully_closed {
+            open_lot_meta.remove(&key);
+        }
+    } else {
+        // This fill opened a new position or scaled into an existing one.
+        // Side comes from the ACTUAL book side the fill executed on (what
+        // the portfolio itself used to decide open-vs-close), not the
+        // signal's Buy/Sell label -- a flat account issuing a Sell opens a
+        // real short here, rather than being silently dropped.
+        let opened_side = if fill.side == BookSide::Bid { PositionSide::Long } else { PositionSide::Short };
+        let key = (outcome.symbol.clone(), opened_side);
+        match open_lot_meta.get_mut(&key) {
+            Some(meta) => {
+                meta.entry_commission += commission;
+                meta.entry_slippage += slippage_cost;
+            }
+            None => {
+                open_lot_meta.insert(key, EntryMetadata {
+                    trade_id: *next_trade_id,
+                    entry_signal_price: fill_price,
+                    entry_commission: commission,
+                    entry_slippage: slippage_cost,
+                    entry_liquidity: "taker".to_string(),
+                    entry_reason: signal_reason.to_string(),
+                    worst_unrealized: 0.0,
+                    best_unrealized: 0.0,
                 });
+                *next_trade_id += 1;
             }
         }
-    } else if is_entry {
-        // Open a new position for round-trip tracking
-        open_positions.push(OpenPosition {
-            trade_id: *next_trade_id,
-            side: "long".to_string(),
-            entry_signal_price: fill_price,
-            entry_fill_price: adjusted_price,
-            quantity: fill_qty,
-            entry_commission: commission,
-            entry_slippage: slippage_cost,
-            entry_time: timestamp,
-            entry_liquidity: "taker".to_string(),
-            entry_reason: signal_reason.to_string(),
-            worst_unrealized: 0.0,
-            best_unrealized: 0.0,
-        });
-        *next_trade_id += 1;
     }
 }
+
+/// Build synthetic still-open `TradeRecord`s for every open position in
+/// `portfolio` at end-of-run, sourcing side/entry-price/quantity/unrealized
+/// P&L from the portfolio's own ledger (correct for shorts) instead of the
+/// old shadow `open_positions` vec (which hardcoded `side: "long"` at every
+/// push site). Extracted to its own function so it's unit-testable directly.
+fn flush_open_positions_to_trade_log(
+    portfolio: &PortfolioState,
+    open_lot_meta: &HashMap<(String, PositionSide), EntryMetadata>,
+    trade_log: &mut Vec<TradeRecord>,
+    max_trade_log_size: Option<usize>,
+) {
+    for position in portfolio.positions.iter().filter(|p| p.close_time.is_none()) {
+        let should_log = match max_trade_log_size {
+            Some(max) => trade_log.len() < max,
+            None => true,
+        };
+        if !should_log {
+            continue;
+        }
+        let side_str = match position.side { PositionSide::Long => "long", PositionSide::Short => "short" };
+        let meta = open_lot_meta.get(&(position.symbol.clone(), position.side));
+        let entry_commission = meta.map(|m| m.entry_commission).unwrap_or(0.0);
+        // position.unrealized_pnl is already correctly mark-to-market as of
+        // the last portfolio.update_unrealized_pnl(current_price) call in the
+        // main loop (real per-side formula) -- net out entry commission the
+        // same way a closed trade's net_pnl does, so this record participates
+        // correctly in the pnl-reconciliation invariant.
+        let unrealized_pnl = position.unrealized_pnl - entry_commission;
+        let denom = position.entry_price * position.quantity;
+        let unrealized_pct = if denom != 0.0 { unrealized_pnl / denom } else { 0.0 };
+        trade_log.push(TradeRecord {
+            trade_id: meta.map(|m| m.trade_id).unwrap_or(0),
+            side: side_str.to_string(),
+            entry_signal_price: meta.map(|m| m.entry_signal_price).unwrap_or(position.entry_price),
+            entry_fill_price: position.entry_price,
+            exit_signal_price: None,
+            exit_fill_price: None,
+            quantity: position.quantity,
+            pnl: Some(unrealized_pnl),
+            pnl_pct: Some(unrealized_pct),
+            commission: entry_commission,
+            slippage_cost: meta.map(|m| m.entry_slippage).unwrap_or(0.0),
+            entry_time: position.open_time,
+            exit_time: None,
+            duration_secs: None,
+            entry_liquidity: meta.map(|m| m.entry_liquidity.clone()).unwrap_or_else(|| "unknown".to_string()),
+            exit_liquidity: None,
+            entry_reason: meta.map(|m| m.entry_reason.clone()).unwrap_or_else(|| "unknown".to_string()),
+            exit_reason: None,
+            mae: Some(meta.map(|m| m.worst_unrealized).unwrap_or(0.0)),
+            mfe: Some(meta.map(|m| m.best_unrealized).unwrap_or(0.0)),
+            legs: Vec::new(),
+        });
+    }
+}
+
 fn fill_pending_limits(
     pending: &mut Vec<PendingLimit>,
     current_price: f64,
@@ -1834,7 +2387,7 @@ fn fill_pending_limits(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     next_trade_id: &mut usize,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
@@ -1909,22 +2462,22 @@ fn fill_pending_limits(
             // See `execute_taker_fill`'s matching comment: an order carrying
             // `instrument` came from a BuyOption/SellOption/etc. signal and
             // must go through `apply_derivative_fill`, not the plain spot path.
-            let executed_qty = match order.instrument.as_ref() {
-                Some(instr) => portfolio.apply_derivative_fill(&fill, instr),
-                None => portfolio.apply_fills_executed(&[fill]),
+            let outcome = match order.instrument.as_ref() {
+                Some(instr) => portfolio.apply_derivative_fill_with_outcome(&fill, instr),
+                None => portfolio.apply_fill_executed_with_outcome(&fill),
             };
-            let executed_qty = match executed_qty {
-                Ok(q) => q,
+            let outcome = match outcome {
+                Ok(o) => o,
                 Err(e) => {
                     log_warn!(BACKTEST_LOGGER, "Maker fill error: {}", e);
-                    0.0
+                    FillOutcome::zero(String::new())
                 }
             };
 
-            if executed_qty >= 1e-10 {
-                let exec_fill_qty = executed_qty;
-                let fill_value = order.price * exec_fill_qty;
-                let commission = fill_value * maker_fee;
+            if outcome.executed_quantity >= 1e-10 {
+                let exec_fill_qty = outcome.executed_quantity;
+                let is_buy = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
+                let commission = compute_commission(order.price, exec_fill_qty, is_buy, order.instrument.as_ref(), maker_fee);
                 *total_commission += commission;
                 *num_trades += 1;
                 portfolio.fees_paid += commission;
@@ -1932,17 +2485,13 @@ fn fill_pending_limits(
 
                 trade_returns.push(0.0); // Actual P&L tracked via portfolio
 
-                // Round-trip tracking for maker fills
-                let is_entry = matches!(order.signal_type, SignalType::Buy | SignalType::ScaleIn);
-                let is_exit = matches!(order.signal_type, SignalType::Sell | SignalType::ScaleOut);
-
-                // MAE for maker fills
-                let mae_dollars = if is_exit && !open_positions.is_empty() {
-                    let pos = &open_positions[open_positions.len() - 1];
-                    pos.worst_unrealized.abs() * pos.entry_fill_price * pos.quantity
-                } else {
-                    0.0
-                };
+                // MAE for maker fills -- driven by the portfolio's own real
+                // closed_side, not a signal-direction guess (see
+                // execute_taker_fill's matching comment).
+                let mae_dollars = outcome.closed_side
+                    .and_then(|side| open_lot_meta.get(&(outcome.symbol.clone(), side)))
+                    .map(|meta| meta.worst_unrealized.abs() * outcome.closed_entry_price.unwrap_or(0.0) * exec_fill_qty)
+                    .unwrap_or(0.0);
                 trade_maes.push(mae_dollars);
 
                 let should_log = match max_trade_log_size {
@@ -1950,60 +2499,80 @@ fn fill_pending_limits(
                     None => true,
                 };
 
-                if is_exit && !open_positions.is_empty() {
-                    if let Some(pos) = open_positions.pop() {
-                        if should_log {
-                            let raw_pnl = if pos.side == "long" {
-                                (order.price - pos.entry_fill_price) * pos.quantity
-                            } else {
-                                (pos.entry_fill_price - order.price) * pos.quantity
-                            };
-                            let total_comm = pos.entry_commission + commission;
-                            let net_pnl = raw_pnl - total_comm;
-                            let net_pnl_pct = net_pnl / (pos.entry_fill_price * pos.quantity);
-                            let duration = (timestamp - pos.entry_time).num_seconds();
+                if let Some(closed_side) = outcome.closed_side {
+                    let key = (outcome.symbol.clone(), closed_side);
+                    let closed_entry_price = outcome.closed_entry_price.unwrap_or(order.price);
+                    let closed_open_time = outcome.closed_open_time.unwrap_or(timestamp);
+                    let realized_pnl = outcome.realized_pnl.unwrap_or(0.0);
 
-                            trade_log.push(TradeRecord {
-                                trade_id: pos.trade_id,
-                                side: pos.side,
-                                entry_signal_price: pos.entry_signal_price,
-                                entry_fill_price: pos.entry_fill_price,
-                                exit_signal_price: Some(order.price),
-                                exit_fill_price: Some(order.price),
-                                quantity: pos.quantity,
-                                pnl: Some(net_pnl),
-                                pnl_pct: Some(net_pnl_pct),
-                                commission: total_comm,
-                                slippage_cost: pos.entry_slippage,
-                                entry_time: pos.entry_time,
-                                exit_time: Some(timestamp),
-                                duration_secs: Some(duration),
-                                entry_liquidity: pos.entry_liquidity,
-                                exit_liquidity: Some("maker".to_string()),
-                                entry_reason: pos.entry_reason,
-                                exit_reason: Some(order.reason.clone()),
-                                mae: Some(pos.worst_unrealized),
-                                mfe: Some(pos.best_unrealized),
-                                legs: Vec::new(),
+                    if should_log {
+                        let side_str = match closed_side { PositionSide::Long => "long", PositionSide::Short => "short" };
+                        let qty_before = outcome.remaining_open_quantity + exec_fill_qty;
+                        let frac = if qty_before > 0.0 { (exec_fill_qty / qty_before).min(1.0) } else { 1.0 };
+                        let (attributed_commission, attributed_slippage, entry_signal_price, entry_liquidity, entry_reason, trade_id, worst_unrealized, best_unrealized) =
+                            if let Some(meta) = open_lot_meta.get_mut(&key) {
+                                let ec = meta.entry_commission * frac;
+                                let es = meta.entry_slippage * frac;
+                                meta.entry_commission -= ec;
+                                meta.entry_slippage -= es;
+                                (ec, es, meta.entry_signal_price, meta.entry_liquidity.clone(), meta.entry_reason.clone(), meta.trade_id, meta.worst_unrealized, meta.best_unrealized)
+                            } else {
+                                (0.0, 0.0, closed_entry_price, "unknown".to_string(), "unknown".to_string(), 0, 0.0, 0.0)
+                            };
+                        let total_comm = attributed_commission + commission;
+                        let net_pnl = realized_pnl - total_comm;
+                        let denom = closed_entry_price * exec_fill_qty;
+                        let net_pnl_pct = if denom != 0.0 { net_pnl / denom } else { 0.0 };
+                        let duration = (timestamp - closed_open_time).num_seconds();
+
+                        trade_log.push(TradeRecord {
+                            trade_id,
+                            side: side_str.to_string(),
+                            entry_signal_price,
+                            entry_fill_price: closed_entry_price,
+                            exit_signal_price: Some(order.price),
+                            exit_fill_price: Some(order.price),
+                            quantity: exec_fill_qty,
+                            pnl: Some(net_pnl),
+                            pnl_pct: Some(net_pnl_pct),
+                            commission: total_comm,
+                            slippage_cost: attributed_slippage,
+                            entry_time: closed_open_time,
+                            exit_time: Some(timestamp),
+                            duration_secs: Some(duration),
+                            entry_liquidity,
+                            exit_liquidity: Some("maker".to_string()),
+                            entry_reason,
+                            exit_reason: Some(order.reason.clone()),
+                            mae: Some(worst_unrealized),
+                            mfe: Some(best_unrealized),
+                            legs: Vec::new(),
+                        });
+                    }
+                    if outcome.position_fully_closed {
+                        open_lot_meta.remove(&key);
+                    }
+                } else {
+                    let opened_side = if fill.side == BookSide::Bid { PositionSide::Long } else { PositionSide::Short };
+                    let key = (outcome.symbol.clone(), opened_side);
+                    match open_lot_meta.get_mut(&key) {
+                        Some(meta) => {
+                            meta.entry_commission += commission;
+                        }
+                        None => {
+                            open_lot_meta.insert(key, EntryMetadata {
+                                trade_id: *next_trade_id,
+                                entry_signal_price: order.price,
+                                entry_commission: commission,
+                                entry_slippage: 0.0,
+                                entry_liquidity: "maker".to_string(),
+                                entry_reason: order.reason.clone(),
+                                worst_unrealized: 0.0,
+                                best_unrealized: 0.0,
                             });
+                            *next_trade_id += 1;
                         }
                     }
-                } else if is_entry {
-                    open_positions.push(OpenPosition {
-                        trade_id: *next_trade_id,
-                        side: "long".to_string(),
-                        entry_signal_price: order.price,
-                        entry_fill_price: order.price,
-                        quantity: exec_fill_qty,
-                        entry_commission: commission,
-                        entry_slippage: 0.0,
-                        entry_time: order.placed_at,
-                        entry_liquidity: "maker".to_string(),
-                        entry_reason: order.reason.clone(),
-                        worst_unrealized: 0.0,
-                        best_unrealized: 0.0,
-                    });
-                    *next_trade_id += 1;
                 }
             }
             filled_count += 1;
@@ -2035,7 +2604,7 @@ fn close_all_positions(
     trade_returns: &mut Vec<f64>,
     trade_maes: &mut Vec<f64>,
     trade_log: &mut Vec<TradeRecord>,
-    open_positions: &mut Vec<OpenPosition>,
+    open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
     max_trade_log_size: Option<usize>,
     timestamp: DateTime<Utc>,
     slippage_bps: f64,
@@ -2069,7 +2638,7 @@ fn close_all_positions(
             trade_returns,
             trade_maes,
             trade_log,
-            open_positions,
+            open_lot_meta,
             &mut dummy_id,
             max_trade_log_size,
             timestamp,
@@ -2173,6 +2742,9 @@ fn build_backtest_result(
     captured_prices_for_features: Vec<f64>,
     captured_timestamps_for_features: Vec<i64>,
     volume_constrained_fills: usize,
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+    per_bar_weights: Option<PerBarWeights>,
 ) -> BacktestResult {
     // Use actual round-trip percentage returns from trade_log instead of per-fill
     // pseudo-returns in trade_returns (which are just cash flow proportions, not real P&L).
@@ -2315,7 +2887,10 @@ fn build_backtest_result(
 
     let median_trade_return = if !actual_returns.is_empty() {
         let mut sorted = actual_returns.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // total_cmp, not partial_cmp().unwrap_or(Equal) -- see the
+        // 2026-09-16 production-incident writeup (BacktestingEngine's
+        // meta_portfolio_service.rs::top_survivors_by_marginal_contribution).
+        sorted.sort_by(f64::total_cmp);
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 0 {
             Some((sorted[mid - 1] + sorted[mid]) / 2.0)
@@ -2488,7 +3063,59 @@ fn build_backtest_result(
         } else {
             None
         },
+        option_summary: build_option_summary(option_instrument, option_spread, portfolio),
+        per_bar_weights,
         ..Default::default()
+    }
+}
+
+/// The run's data symbol (column 0 of the per-bar weight export): the sim-ticks symbol, or the first candle's or
+/// trade's symbol of a slice. `None` when the slice carries no symbol at all.
+fn input_symbol(input: &MarketDataInput<'_>) -> Option<String> {
+    match input {
+        MarketDataInput::SimTicks { symbol, .. } => Some(symbol.to_string()),
+        MarketDataInput::Slice(s) => s.iter().find_map(|d| match d {
+            MarketData::Candle(c) => Some(c.symbol.to_string()),
+            MarketData::Trade(t) => Some(t.symbol.to_string()),
+            _ => None,
+        }),
+    }
+}
+
+/// Build the `BacktestResult.option_summary` field: contract identity for
+/// every leg this run traded (single instrument or spread), plus the
+/// portfolio's final aggregated Greeks snapshot. `None` when this run
+/// wasn't an options run at all (neither `option_instrument` nor
+/// `option_spread` set) -- unchanged, existing behavior.
+fn build_option_summary(
+    option_instrument: Option<&DerivativeMetadata>,
+    option_spread: Option<&[OptionSpreadLeg]>,
+    portfolio: &PortfolioState,
+) -> Option<crate::types::OptionResultSummary> {
+    let contracts: Vec<crate::types::OptionContractInfo> = if let Some(legs) = option_spread {
+        legs.iter().map(|leg| option_contract_info(&leg.instrument, leg.ratio)).collect()
+    } else {
+        vec![option_contract_info(option_instrument?, 1)]
+    };
+    let greeks = portfolio.get_portfolio_greeks();
+    let final_greeks = if greeks == derivatives::Greeks::default() { None } else { Some(greeks) };
+    Some(crate::types::OptionResultSummary { contracts, final_greeks })
+}
+
+fn option_contract_info(instrument: &DerivativeMetadata, ratio: i32) -> crate::types::OptionContractInfo {
+    let contract_type = match instrument.instrument_kind {
+        derivatives::InstrumentKind::Call { .. } => "call",
+        derivatives::InstrumentKind::Put { .. } => "put",
+        _ => "other",
+    }.to_string();
+    crate::types::OptionContractInfo {
+        symbol: instrument.symbol.clone(),
+        underlying: instrument.underlying.clone(),
+        strike: instrument.instrument_kind.strike(),
+        expiry: instrument.instrument_kind.expiry(),
+        contract_type,
+        contract_multiplier: instrument.contract_multiplier,
+        ratio,
     }
 }
 
@@ -2511,6 +3138,39 @@ fn compute_max_drawdown(equity: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn weekday_daily_candles(n_days: i64) -> Vec<MarketData> {
+        use chrono::{Datelike, TimeZone};
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(); // a Monday
+        (0..n_days)
+            .map(|d| start + Duration::days(d))
+            .filter(|t| t.weekday().num_days_from_monday() < 5)
+            .map(|t| MarketData::Candle(dataloader::Candle {
+                timestamp: t,
+                symbol: "EUR-CHF".into(),
+                exchange: "oanda".into(),
+                open: 0.95, high: 0.952, low: 0.948, close: 0.95,
+                volume: 150_000.0,
+                trade_count: 0,
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn candle_spacing_is_one_day_for_a_weekday_only_daily_series() {
+        // Weekend gaps (3 days, every 5th gap) must not stretch the estimate:
+        // the synthetic book scales its spread by this, see
+        // SyntheticBookConfig::bar_minutes.
+        let candles = weekday_daily_candles(60);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&candles)), Some(1440.0));
+    }
+
+    #[test]
+    fn candle_spacing_is_none_without_two_candles() {
+        let one = weekday_daily_candles(1);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&one)), None);
+        assert_eq!(median_candle_spacing_minutes(&MarketDataInput::Slice(&[])), None);
+    }
 
     fn mk_trade(pnl: Option<f64>, exit_time: Option<DateTime<Utc>>) -> TradeRecord {
         TradeRecord {
@@ -2536,6 +3196,154 @@ mod tests {
             mfe: None,
             legs: Vec::new(),
         }
+    }
+
+    // ================================================================
+    // Regression tests for the 2026-09-06 shadow-ledger bug: python_simulation.rs
+    // used to maintain its OWN local `open_positions: Vec<OpenPosition>` ledger
+    // to build `trade_log`, completely independent of `PortfolioState`'s own
+    // authoritative ledger that actually drives `balance`/the equity curve.
+    // Confirmed in production: one real backtest's shadow-ledger trade_log
+    // summed to +$23,066.88 while the real portfolio-driven equity never
+    // exceeded $16,759 out of $10,000 starting capital. Fixed by deriving
+    // TradeRecords directly from PortfolioState's own FillOutcome/Position
+    // data instead of a parallel shadow ledger.
+    // ================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        portfolio: &mut PortfolioState,
+        total_commission: &mut f64,
+        num_trades: &mut usize,
+        trade_returns: &mut Vec<f64>,
+        trade_maes: &mut Vec<f64>,
+        trade_log: &mut Vec<TradeRecord>,
+        open_lot_meta: &mut HashMap<(String, PositionSide), EntryMetadata>,
+        next_trade_id: &mut usize,
+        signal: SignalType,
+        price: f64,
+        qty: f64,
+        timestamp: DateTime<Utc>,
+    ) {
+        execute_taker_fill(
+            &signal, price, qty, portfolio, total_commission, 0.001,
+            num_trades, trade_returns, trade_maes, trade_log,
+            open_lot_meta, next_trade_id, None, timestamp, 0.0, None, None,
+            "test", None,
+        );
+    }
+
+    #[test]
+    fn execute_taker_fill_trade_log_reconciles_with_equity_for_scale_in_partial_exit_and_short() {
+        let mut portfolio = PortfolioState::with_balance(10_000.0);
+        let mut total_commission = 0.0_f64;
+        let mut num_trades = 0usize;
+        let mut trade_returns = Vec::new();
+        let mut trade_maes = Vec::new();
+        let mut trade_log: Vec<TradeRecord> = Vec::new();
+        let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
+        let mut next_trade_id = 1usize;
+        let now = chrono::Utc::now();
+
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 100.0, 10.0, now);   // open long 10 @ 100
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 110.0, 5.0, now);    // scale-in: blended entry = 103.3333...
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 120.0, 6.0, now);   // partial exit: 6 of 15
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 90.0, 9.0, now);    // full exit of remainder: now flat
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 95.0, 4.0, now);    // flat -> opens a short
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Buy, 80.0, 4.0, now);     // covers the short: now flat
+
+        // Bug #1 regression: shorts must not be dropped/misclassified as longs.
+        let closed: Vec<_> = trade_log.iter().filter(|t| t.exit_time.is_some()).collect();
+        assert_eq!(closed.len(), 3, "expected 3 closed round-trip records, got {} records", closed.len());
+        assert_eq!(closed[0].side, "long");
+        assert_eq!(closed[1].side, "long");
+        assert_eq!(closed[2].side, "short");
+
+        // Bug #3 regression: partial exit must use the ACTUAL executed quantity,
+        // not the original scaled-in lot's full quantity.
+        assert!((closed[0].quantity - 6.0).abs() < 1e-6);
+        assert!((closed[1].quantity - 9.0).abs() < 1e-6);
+        assert!((closed[2].quantity - 4.0).abs() < 1e-6);
+
+        // Bug #2 regression: both long exits must be priced off the BLENDED
+        // (weighted-average) entry, not a discrete per-lot entry price.
+        let blended = (10.0 * 100.0 + 5.0 * 110.0) / 15.0;
+        assert!((closed[0].entry_fill_price - blended).abs() < 1e-6);
+        assert!((closed[1].entry_fill_price - blended).abs() < 1e-6);
+
+        // Both long-exit records share one trade_id (same round trip, split
+        // across 2 partial exits); the short is a distinct round trip.
+        assert_eq!(closed[0].trade_id, closed[1].trade_id);
+        assert_ne!(closed[0].trade_id, closed[2].trade_id);
+
+        // No open positions remain -- the key invariant.
+        assert!(portfolio.positions.iter().all(|p| p.close_time.is_some()));
+        assert!(open_lot_meta.is_empty());
+
+        // THE reconciliation invariant that would have caught the original bug:
+        // sum(closed trade_log pnl) + sum(open unrealized pnl) == final equity - initial capital.
+        portfolio.update_unrealized_pnl(80.0);
+        let final_equity = portfolio.get_total_value();
+        let initial_capital = 10_000.0;
+        let closed_pnl_sum: f64 = trade_log.iter().filter(|t| t.exit_time.is_some()).filter_map(|t| t.pnl).sum();
+        let open_unrealized_sum: f64 = trade_log.iter().filter(|t| t.exit_time.is_none()).filter_map(|t| t.pnl).sum();
+        let gap = (closed_pnl_sum + open_unrealized_sum) - (final_equity - initial_capital);
+        assert!(gap.abs() < 1e-6, "trade_log/equity reconciliation gap: {}", gap);
+    }
+
+    #[test]
+    fn flush_open_positions_uses_real_portfolio_side_not_hardcoded_long() {
+        let mut portfolio = PortfolioState::with_balance(10_000.0);
+        let mut total_commission = 0.0_f64;
+        let mut num_trades = 0usize;
+        let mut trade_returns = Vec::new();
+        let mut trade_maes = Vec::new();
+        let mut trade_log: Vec<TradeRecord> = Vec::new();
+        let mut open_lot_meta: HashMap<(String, PositionSide), EntryMetadata> = HashMap::new();
+        let mut next_trade_id = 1usize;
+        let now = chrono::Utc::now();
+
+        fill(&mut portfolio, &mut total_commission, &mut num_trades, &mut trade_returns, &mut trade_maes, &mut trade_log, &mut open_lot_meta, &mut next_trade_id, SignalType::Sell, 100.0, 5.0, now); // flat -> opens a short; never closed
+
+        portfolio.update_unrealized_pnl(90.0); // short gains: (100-90)*5 = 50
+
+        flush_open_positions_to_trade_log(&portfolio, &open_lot_meta, &mut trade_log, None);
+
+        assert_eq!(trade_log.len(), 1);
+        assert_eq!(trade_log[0].side, "short", "old code hardcoded \"long\" here even for a short");
+        assert!(trade_log[0].exit_time.is_none());
+        let expected_pnl = 50.0 - trade_log[0].commission; // netted of entry commission, consistent with closed trades
+        assert!((trade_log[0].pnl.unwrap() - expected_pnl).abs() < 1e-6);
+    }
+
+    #[test]
+    fn find_asof_value_returns_last_value_at_or_before_tick() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0), (3_000, 30.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        assert_eq!(find_asof_value(&series, &ts(2_500)), Some(20.0));
+        assert_eq!(find_asof_value(&series, &ts(2_000)), Some(20.0)); // exact match is at-or-before
+    }
+
+    #[test]
+    fn find_asof_value_never_returns_a_future_value() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        // Every point is still in the future relative to this tick -- must be
+        // None, not the earliest point (that would be lookahead bias).
+        assert_eq!(find_asof_value(&series, &ts(500)), None);
+    }
+
+    #[test]
+    fn find_asof_value_empty_series_is_none() {
+        let ts = chrono::Utc::now();
+        assert_eq!(find_asof_value(&[], &ts), None);
+    }
+
+    #[test]
+    fn find_asof_value_after_last_point_returns_last_value() {
+        let series = vec![(1_000_i64, 10.0), (2_000, 20.0)];
+        let ts = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap();
+        assert_eq!(find_asof_value(&series, &ts(999_999)), Some(20.0));
     }
 
     #[test]
@@ -2770,6 +3578,9 @@ mod tests {
             orderbook_snapshots: None,
             historical_iv_surfaces: None,
             multi_venue_data: None,
+            option_instrument: None,
+            option_spread: None,
+            underlying_series: None,
         };
         assert_eq!(config.python_source, "class MyStrat: pass");
         assert_eq!(config.max_trade_log_size, Some(500));
@@ -2790,6 +3601,9 @@ mod tests {
             orderbook_snapshots: None,
             historical_iv_surfaces: None,
             multi_venue_data: None,
+            option_instrument: None,
+            option_spread: None,
+            underlying_series: None,
         };
         assert!(config.max_trade_log_size.is_none());
     }
@@ -2802,12 +3616,410 @@ mod tests {
             "SPY",
             derivatives::InstrumentKind::Call {
                 strike: 450.0,
-                expiry: chrono::Utc::now() + chrono::Duration::days(30),
+                // Fixed, not `Utc::now() + ...`: several tests build this
+                // twice (once via a shared fixture helper, once directly for
+                // an equality assertion) and compare the two `DerivativeMetadata`
+                // values for exact equality -- a `Utc::now()`-based expiry
+                // makes the two calls' timestamps differ by whatever wall-clock
+                // time elapsed between them (even a few microseconds), which
+                // fails `PartialEq` on the embedded `DateTime<Utc>`. Confirmed
+                // as a real, live flake once these `python`-feature tests were
+                // actually run (not just compile-checked) for the first time,
+                // 2026-09-02.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
             },
             100.0,
             "USD",
             "test",
         )
+    }
+
+    // -- BacktestResult.option_summary (build_option_summary / option_contract_info) --
+
+    #[test]
+    fn build_option_summary_is_none_for_a_non_option_run() {
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        assert!(build_option_summary(None, None, &portfolio).is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_the_single_leg_contract_identity() {
+        let instrument = test_call_instrument();
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(Some(&instrument), None, &portfolio)
+            .expect("a single-leg option run should produce a summary");
+        assert_eq!(summary.contracts.len(), 1);
+        let contract = &summary.contracts[0];
+        assert_eq!(contract.symbol, "O:SPY-TEST-C");
+        assert_eq!(contract.underlying, "SPY");
+        assert_eq!(contract.strike, Some(450.0));
+        assert_eq!(contract.contract_type, "call");
+        assert_eq!(contract.contract_multiplier, 100.0);
+        assert_eq!(contract.ratio, 1);
+        // No Greeks were ever computed for this portfolio (no fill, no
+        // update_position_greeks call) -- must stay None, not a spurious
+        // all-zero Greeks value.
+        assert!(summary.final_greeks.is_none());
+    }
+
+    #[test]
+    fn build_option_summary_reports_both_legs_of_a_spread_with_their_own_ratios() {
+        let call = test_call_instrument();
+        let put = test_put_instrument();
+        let legs = vec![
+            OptionSpreadLeg { instrument: call, ratio: 1, prices: vec![5.0] },
+            OptionSpreadLeg { instrument: put, ratio: -1, prices: vec![2.0] },
+        ];
+        let portfolio = PortfolioState::with_balance(100_000.0);
+        let summary = build_option_summary(None, Some(&legs), &portfolio)
+            .expect("a spread run should produce a summary");
+        assert_eq!(summary.contracts.len(), 2);
+        assert_eq!(summary.contracts[0].contract_type, "call");
+        assert_eq!(summary.contracts[0].ratio, 1);
+        assert_eq!(summary.contracts[1].contract_type, "put");
+        assert_eq!(summary.contracts[1].ratio, -1);
+    }
+
+    #[test]
+    fn build_option_summary_prefers_a_nonzero_final_greeks_snapshot_when_available() {
+        let instrument = test_call_instrument();
+        let mut portfolio = PortfolioState::with_balance(100_000.0);
+        let fill = orderbook::Fill {
+            order_id: std::sync::Arc::from("test"),
+            side: orderbook::BookSide::Bid,
+            price: 5.0,
+            base_price: None,
+            quantity: 1.0,
+            liquidity_type: orderbook::LiquidityType::Taker,
+            fee_rate: 0.0,
+            fee_amount: 0.0,
+            slippage_bps: None,
+            timestamp: chrono::Utc::now(),
+        };
+        portfolio.apply_derivative_fill(&fill, &instrument).unwrap();
+        portfolio.update_position_greeks(&instrument.symbol, 460.0, 0.02, 0.30, chrono::Utc::now());
+
+        let summary = build_option_summary(Some(&instrument), None, &portfolio).unwrap();
+        let greeks = summary.final_greeks.expect("a marked option position should produce real Greeks");
+        assert_ne!(greeks, derivatives::Greeks::default());
+    }
+
+    #[test]
+    fn i8_to_signals_wraps_buy_and_sell_as_options_when_instrument_is_set() {
+        let instrument = test_call_instrument();
+        let buy_signals = i8_to_signals(1, 5.0, 0, Some(&instrument), None);
+        assert_eq!(buy_signals.len(), 1);
+        match &buy_signals[0].signal_type {
+            SignalType::BuyOption { instrument: instr, premium } => {
+                assert_eq!(instr, &instrument);
+                assert!(premium.is_none(), "premium is filled in from the fill price downstream, not set here");
+            }
+            other => panic!("expected BuyOption, got {other:?}"),
+        }
+
+        let sell_signals = i8_to_signals(-1, 5.0, 0, Some(&instrument), None);
+        assert_eq!(sell_signals.len(), 1);
+        match &sell_signals[0].signal_type {
+            SignalType::SellOption { instrument: instr, .. } => assert_eq!(instr, &instrument),
+            other => panic!("expected SellOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_stays_plain_buy_sell_without_an_instrument() {
+        let buy_signals = i8_to_signals(1, 100.0, 0, None, None);
+        assert_eq!(buy_signals.len(), 1);
+        assert_eq!(buy_signals[0].signal_type, SignalType::Buy);
+
+        let sell_signals = i8_to_signals(-1, 100.0, 0, None, None);
+        assert_eq!(sell_signals.len(), 1);
+        assert_eq!(sell_signals[0].signal_type, SignalType::Sell);
+    }
+
+    #[test]
+    fn i8_to_signals_close_is_unaffected_by_option_instrument() {
+        // CLOSE needs no option-aware wrapping: close_all_positions already
+        // closes each open position using its OWN recorded instrument, not
+        // a signal-level one -- see PythonSimConfig.option_instrument's doc
+        // comment.
+        let instrument = test_call_instrument();
+        let with_instrument = i8_to_signals(2, 5.0, 0, Some(&instrument), None);
+        let without_instrument = i8_to_signals(2, 5.0, 0, None, None);
+        assert_eq!(with_instrument.len(), 1);
+        assert_eq!(without_instrument.len(), 1);
+        assert_eq!(with_instrument[0].signal_type, SignalType::Close);
+        assert_eq!(without_instrument[0].signal_type, SignalType::Close);
+    }
+
+    #[test]
+    fn i8_to_signals_hold_and_unknown_codes_produce_nothing_regardless_of_instrument() {
+        let instrument = test_call_instrument();
+        assert!(i8_to_signals(0, 5.0, 0, Some(&instrument), None).is_empty());
+        assert!(i8_to_signals(99, 5.0, 0, Some(&instrument), None).is_empty());
+    }
+
+    // ---- i8_to_signals: OptionSpread construction ----
+
+    fn test_put_instrument() -> DerivativeMetadata {
+        DerivativeMetadata::new(
+            "O:SPY-TEST-P",
+            "SPY",
+            derivatives::InstrumentKind::Put {
+                strike: 460.0,
+                // Fixed for the same reason as test_call_instrument's expiry.
+                expiry: chrono::DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z").unwrap().to_utc(),
+            },
+            100.0,
+            "USD",
+            "test",
+        )
+    }
+
+    fn test_position(side: portfoliomanager::PositionSide, instrument: Option<DerivativeMetadata>, closed: bool) -> portfoliomanager::Position {
+        let now = chrono::Utc::now();
+        portfoliomanager::Position {
+            symbol: instrument.as_ref().map(|i| i.symbol.clone()).unwrap_or_else(|| "TEST".to_string()),
+            side,
+            quantity: 1.0,
+            entry_price: 100.0,
+            mark_price: None,
+            realized_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            open_time: now,
+            close_time: if closed { Some(now) } else { None },
+            instrument,
+            greeks: None,
+            margin_posted: 0.0,
+        }
+    }
+
+    // -- liquidation fill price (liquidation_fill_price) --
+
+    #[test]
+    fn liquidation_fill_price_fills_at_the_level_when_the_bar_traded_through_it() {
+        // Long at 100 @ 100x: level 99.5; bar low 98, high 101 -> fill at 99.5,
+        // not at wherever the bar closed.
+        assert_eq!(liquidation_fill_price(99.5, Some((101.0, 98.0)), 98.2), 99.5);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_high_when_the_bar_gapped_below_a_long_level() {
+        // The whole bar traded below the level: best available fill is the
+        // bar's high, never a price above what actually traded.
+        assert_eq!(liquidation_fill_price(99.5, Some((97.0, 95.0)), 96.0), 97.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_clamps_to_the_bar_low_when_the_bar_gapped_above_a_short_level() {
+        // Short level 100.5; whole bar traded above it -> fill at the bar low.
+        assert_eq!(liquidation_fill_price(100.5, Some((104.0, 102.0)), 103.0), 102.0);
+    }
+
+    #[test]
+    fn liquidation_fill_price_falls_back_to_the_current_price_without_ohlc() {
+        assert_eq!(liquidation_fill_price(99.5, None, 98.2), 98.2);
+        // Malformed bar (low > high) is treated like no OHLC rather than panicking.
+        assert_eq!(liquidation_fill_price(99.5, Some((95.0, 97.0)), 98.2), 98.2);
+    }
+
+    // -- leverage liquidation exemption (is_exempt_from_leverage_liquidation_check) --
+
+    #[test]
+    fn liquidation_exemption_a_closed_position_is_exempt_regardless_of_instrument() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, true);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_plain_leveraged_position_is_not_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, None, false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_long_option_is_exempt() {
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_short_written_option_is_also_exempt() {
+        // Deliberate: a short option's unbounded loss potential is real, but
+        // this specific leveraged-futures-style formula still doesn't model
+        // real option margin-call mechanics for it -- see this function's
+        // doc comment for why the account-level drawdown gate is the
+        // applicable backstop instead, not this per-position check.
+        let pos = test_position(portfoliomanager::PositionSide::Short, Some(test_call_instrument()), false);
+        assert!(is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    #[test]
+    fn liquidation_exemption_a_future_position_is_not_exempt() {
+        // Regression test for the 2026-09-02 fix: futures/perps were
+        // previously (incorrectly) swept into a blanket "any derivative"
+        // exemption -- they use the exact leveraged-margin accounting this
+        // check models, so they must NOT be exempt.
+        let future = DerivativeMetadata::new(
+            "BTC-PERP", "BTC",
+            derivatives::InstrumentKind::Perpetual,
+            1.0, "USD", "test",
+        );
+        let pos = test_position(portfoliomanager::PositionSide::Long, Some(future), false);
+        assert!(!is_exempt_from_leverage_liquidation_check(&pos));
+    }
+
+    // -- greeks wiring (select_greeks_vol / annualized_underlying_realized_vol) --
+
+    #[test]
+    fn select_greeks_vol_prefers_the_real_iv_surface_when_available() {
+        let instrument = test_call_instrument();
+        let strike = instrument.instrument_kind.strike().unwrap();
+        let expiry = instrument.instrument_kind.expiry().unwrap();
+        let surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: vec![derivatives::IvPoint { strike, expiry, iv: 0.42, bid_iv: 0.41, ask_iv: 0.43 }],
+        };
+        let vol = select_greeks_vol(Some(&surface), &instrument, Some(0.99));
+        assert_eq!(vol, Some(0.42), "the real IV surface reading must win over the fallback");
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_to_realized_vol_without_a_surface() {
+        let instrument = test_call_instrument();
+        let vol = select_greeks_vol(None, &instrument, Some(0.35));
+        assert_eq!(vol, Some(0.35));
+    }
+
+    #[test]
+    fn select_greeks_vol_falls_back_when_the_surface_has_no_points() {
+        let instrument = test_call_instrument();
+        let empty_surface = derivatives::IvSurface {
+            underlying: "SPY".to_string(),
+            timestamp: chrono::Utc::now(),
+            points: Vec::new(),
+        };
+        let vol = select_greeks_vol(Some(&empty_surface), &instrument, Some(0.28));
+        assert_eq!(vol, Some(0.28));
+    }
+
+    #[test]
+    fn select_greeks_vol_returns_none_when_no_usable_source_exists() {
+        let instrument = test_call_instrument();
+        assert_eq!(select_greeks_vol(None, &instrument, None), None);
+        // A non-finite or non-positive fallback must not be treated as usable.
+        assert_eq!(select_greeks_vol(None, &instrument, Some(f64::NAN)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(-0.1)), None);
+        assert_eq!(select_greeks_vol(None, &instrument, Some(0.0)), None);
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_is_empty_for_too_short_a_series() {
+        assert!(annualized_underlying_realized_vol(&[100.0], &[0], 20).is_empty());
+        assert!(annualized_underlying_realized_vol(&[], &[], 20).is_empty());
+    }
+
+    #[test]
+    fn annualized_underlying_realized_vol_scales_by_the_real_bars_per_year_annualization() {
+        // A varying price series long enough for `lookback=3` to produce
+        // real readings.
+        let series = vec![100.0, 102.0, 99.0, 103.0, 98.0, 105.0, 97.0, 104.0, 101.0, 103.0];
+        let n = series.len();
+        // One year of daily bars -> annualization factor near `n` itself
+        // (observations_per_year_from_span(n, one_year_secs) ~= n).
+        let one_year_ms: i64 = (365.25 * 86_400.0 * 1000.0) as i64;
+        let timestamps: Vec<i64> = (0..n as i64).map(|i| i * (one_year_ms / n as i64)).collect();
+
+        let annualized = annualized_underlying_realized_vol(&series, &timestamps, 3);
+        let raw = portfoliomanager::margin::trailing_realized_vol_series(&series, 3);
+        assert_eq!(annualized.len(), raw.len());
+
+        // Every populated entry must be the raw per-bar std scaled by the
+        // SAME annualization factor (not an arbitrary/hardcoded one) --
+        // confirm the ratio is constant across every populated index.
+        let ratios: Vec<f64> = annualized.iter().zip(raw.iter())
+            .filter_map(|(a, r)| match (a, r) {
+                (Some(a), Some(r)) if *r > 0.0 => Some(a / r),
+                _ => None,
+            })
+            .collect();
+        assert!(!ratios.is_empty(), "expected at least one populated reading from this fixture");
+        let first = ratios[0];
+        for ratio in &ratios {
+            assert!((ratio - first).abs() < 1e-6, "annualization factor must be identical across ticks: {:?}", ratios);
+        }
+        assert!(first > 1.0, "annualizing ~daily bars over a year should scale vol up materially, got factor {}", first);
+    }
+
+    fn vertical_spread_legs() -> Vec<OptionSpreadLeg> {
+        vec![
+            OptionSpreadLeg { instrument: test_call_instrument(), ratio: 1, prices: vec![5.0, 5.5, 4.5] },
+            OptionSpreadLeg { instrument: test_put_instrument(), ratio: -1, prices: vec![2.0, 1.8, 2.2] },
+        ]
+    }
+
+    #[test]
+    fn i8_to_signals_buy_enters_spread_legs_as_configured() {
+        let legs = vertical_spread_legs();
+        let signals = i8_to_signals(1, 999.0, 1, None, Some(&legs));
+        assert_eq!(signals.len(), 1);
+        match &signals[0].signal_type {
+            SignalType::OptionSpread { legs: spread_legs } => {
+                assert_eq!(spread_legs.len(), 2);
+                match &spread_legs[0].signal_type {
+                    SignalType::BuyOption { instrument, premium } => {
+                        assert_eq!(instrument, &test_call_instrument());
+                        // tick_idx=1 -> this leg's own price (5.5), not the
+                        // shared `price` param (999.0) passed in.
+                        assert_eq!(*premium, Some(5.5));
+                    }
+                    other => panic!("expected BuyOption for the +1 ratio leg, got {other:?}"),
+                }
+                assert_eq!(spread_legs[0].ratio, 1);
+                match &spread_legs[1].signal_type {
+                    SignalType::SellOption { instrument, premium } => {
+                        assert_eq!(instrument, &test_put_instrument());
+                        assert_eq!(*premium, Some(1.8));
+                    }
+                    other => panic!("expected SellOption for the -1 ratio leg, got {other:?}"),
+                }
+                assert_eq!(spread_legs[1].ratio, -1);
+            }
+            other => panic!("expected OptionSpread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_sell_mirrors_every_leg_to_close_or_reverse() {
+        let legs = vertical_spread_legs();
+        let signals = i8_to_signals(-1, 999.0, 0, None, Some(&legs));
+        match &signals[0].signal_type {
+            SignalType::OptionSpread { legs: spread_legs } => {
+                // The +1 ratio leg (entered via BuyOption) must now close
+                // via SellOption with a negated ratio; the -1 ratio leg
+                // (entered via SellOption) must now close via BuyOption.
+                assert!(matches!(spread_legs[0].signal_type, SignalType::SellOption { .. }));
+                assert_eq!(spread_legs[0].ratio, -1);
+                assert!(matches!(spread_legs[1].signal_type, SignalType::BuyOption { .. }));
+                assert_eq!(spread_legs[1].ratio, 1);
+            }
+            other => panic!("expected OptionSpread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn i8_to_signals_option_spread_takes_precedence_over_option_instrument() {
+        let legs = vertical_spread_legs();
+        let single = test_call_instrument();
+        let signals = i8_to_signals(1, 999.0, 0, Some(&single), Some(&legs));
+        assert!(matches!(signals[0].signal_type, SignalType::OptionSpread { .. }));
+    }
+
+    #[test]
+    fn i8_to_signals_empty_option_spread_falls_back_to_single_leg_or_plain() {
+        let empty: Vec<OptionSpreadLeg> = Vec::new();
+        let signals = i8_to_signals(1, 100.0, 0, None, Some(&empty));
+        assert_eq!(signals[0].signal_type, SignalType::Buy);
     }
 
     #[test]
@@ -2847,5 +4059,54 @@ mod tests {
         assert_eq!(extract_instrument(&buy), Some(instrument.clone()));
         assert_eq!(extract_instrument(&sell), Some(instrument.clone()));
         assert_eq!(extract_instrument(&exercise), Some(instrument));
+    }
+
+    // ---- compute_commission: real per-contract options fees, not a % of premium ----
+
+    #[test]
+    fn compute_commission_option_buy_ignores_the_generic_percentage_fee_rate() {
+        let instrument = test_call_instrument();
+        // A generic_fee_rate of 10% would dominate a percentage-based calc
+        // (0.10 * $5 * 1 contract = $0.50) -- for an option this must be
+        // completely ignored in favor of the flat per-contract schedule.
+        let commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.10);
+        let expected = config::OptionsFeeConfig::alpaca().commission_for_fill(5.0, 1.0, 100.0, true);
+        assert!((commission - expected).abs() < 1e-9, "commission={commission}, expected={expected}");
+        assert!(commission < 0.10, "must not be anywhere near the 10% generic rate: {commission}");
+    }
+
+    #[test]
+    fn compute_commission_option_sell_includes_sec_fee_and_taf() {
+        let instrument = test_call_instrument();
+        let buy_commission = compute_commission(5.0, 1.0, true, Some(&instrument), 0.001);
+        let sell_commission = compute_commission(5.0, 1.0, false, Some(&instrument), 0.001);
+        assert!(sell_commission > buy_commission, "sell must add SEC fee + TAF on top of the both-ways fees");
+    }
+
+    #[test]
+    fn compute_commission_non_derivative_fill_uses_the_generic_rate_unscaled() {
+        // No instrument at all (a plain equity/crypto/forex fill) -- must
+        // keep the pre-existing price * qty * generic_fee_rate behavior
+        // exactly, with no multiplier applied.
+        let commission = compute_commission(100.0, 2.0, true, None, 0.001);
+        assert!((commission - 100.0 * 2.0 * 0.001).abs() < 1e-9, "commission={commission}");
+    }
+
+    #[test]
+    fn compute_commission_non_option_derivative_still_scales_by_contract_multiplier() {
+        // A future (not an option) with a real multiplier still applies the
+        // generic percentage fee, but against the correctly-scaled notional
+        // -- fixes the second bug this fee model shared with options
+        // (fill_value previously had no multiplier applied at all).
+        let future = DerivativeMetadata::new(
+            "TEST-FUT",
+            "BTC-USD",
+            derivatives::InstrumentKind::Future { expiry: chrono::Utc::now() + chrono::Duration::days(30) },
+            5.0, // e.g. a micro future's contract multiplier
+            "USD",
+            "test",
+        );
+        let commission = compute_commission(100.0, 2.0, true, Some(&future), 0.001);
+        assert!((commission - 100.0 * 2.0 * 5.0 * 0.001).abs() < 1e-9, "commission={commission}");
     }
 }

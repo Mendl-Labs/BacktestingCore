@@ -467,7 +467,7 @@ impl NativeExecutor {
                 let (max_idx, max_val) = output
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .max_by(|a, b| a.1.total_cmp(b.1))
                     .unwrap_or((0, &0.0));
 
                 let class_name = classes

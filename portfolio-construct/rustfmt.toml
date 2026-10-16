@@ -1,0 +1,3 @@
+# Crate-local formatting (the Core workspace has no rustfmt.toml; this only affects `portfolio-construct`).
+max_width = 120
+use_small_heuristics = "Max"
