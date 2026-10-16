@@ -36,8 +36,8 @@ pub use live::{
 };
 pub use mutants::Mutant;
 pub use registry::{
-    CadenceSpec, Canary, KeyRef, OverlaySpec, PanelSpec, RegisteredRule, Registry, RegistryError, RuleSpec, SignalSpec,
-    SleeveFixture, UniverseSpec, WeightingSpec, LIBRARY_RULES,
+    CadenceSpec, Canary, FixtureSetId, KeyRef, OverlaySpec, PanelSpec, RegisteredRule, Registry, RegistryError,
+    RuleSpec, SignalSpec, SleeveFixture, UniverseSpec, WeightingSpec, LIBRARY_RULES,
 };
 pub use verify::{
     analyze_columns, replicate, replicate_with, rule_facts, verify, verify_with, Claims, ReplicateError,
@@ -584,11 +584,12 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
         ),
     );
 
-    // Every registered rule, in table order; each sleeve starts flat at the bar before its window (the key ledger's
-    // convention, see `FlatUntil`).
+    // Every rule registered in THIS fixture set, in table order; each sleeve starts flat at the bar before its window
+    // (the key ledger's convention, see `FlatUntil`). The rules of other sets are not run here: each set is pinned
+    // and digested on its own.
     let registry = Registry::library();
     let mut sleeves = Vec::with_capacity(registry.len());
-    for entry in registry.iter() {
+    for entry in registry.iter_set(fx.set) {
         let sf = entry.fixture(fx)?;
         let first_trade = entry_date(sf.panel, sf.key)?;
         let (report, _) = run_sleeve(
@@ -604,7 +605,11 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
 
     // Tier IV: the mutants in the amendment's table order (`Mutant::ALL`), each against its own sleeve's key.
     let mut mutant_reports = Vec::new();
-    for m in Mutant::ALL {
+    let set_mutants: Vec<Mutant> = Mutant::ALL
+        .into_iter()
+        .filter(|m| registry.by_sleeve(m.sleeve()).is_ok_and(|e| e.set == fx.set))
+        .collect();
+    for m in set_mutants.iter().copied() {
         let key =
             registry.by_sleeve(m.sleeve()).map_err(|e| LadderError::Inconsistent(e.to_string()))?.fixture(fx)?.key;
         let run = mutants::run_mutant(fx, m)?;
@@ -658,11 +663,11 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
     }
     col.push(
         "tier4.all_mutants_caught",
-        mutant_reports.iter().all(MutantReport::caught) && mutant_reports.len() == Mutant::ALL.len(),
+        mutant_reports.iter().all(MutantReport::caught) && mutant_reports.len() == set_mutants.len(),
         format!(
             "{} of {} mutants fail certification",
             mutant_reports.iter().filter(|m| m.caught()).count(),
-            Mutant::ALL.len()
+            set_mutants.len()
         ),
     );
     if opts.check_canaries {

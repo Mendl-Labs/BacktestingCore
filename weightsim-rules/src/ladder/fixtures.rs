@@ -18,7 +18,7 @@ use reference_rules::{CRYPTO_SYMBOLS, ETF_SYMBOLS};
 use weightsim::{sha256_hex, Date, Panel, PriceSource};
 
 use super::json::{self, Json};
-use super::registry::{PanelSpec, SleeveFixture, LIBRARY_RULES};
+use super::registry::{FixtureSetId, PanelSpec, RegisteredRule, SleeveFixture, LIBRARY_RULES};
 
 /// sha256 of `MANIFEST.json` as recorded in `ANCHOR.json` and Amendment 11.
 pub const REAL_MANIFEST_SHA256: &str = "d51444c33fc2630e12315e936f79580e13dca834ca0fdbc40a242ef496bd6d90";
@@ -37,8 +37,14 @@ const REQUIRED_FILES_BASE: [&str; 3] = [F_CANDLES, F_KEY_METRICS, F_MUTANTS];
 /// rule in [`LIBRARY_RULES`], its own per-bar key and shadow file (`RegisteredRule::key`). The registry entry is the
 /// single place a sleeve's fixture file names are written down; adding a rule there is enough to extend this list.
 pub fn required_files() -> Vec<&'static str> {
+    required_files_for(FixtureSetId::Legacy)
+}
+
+/// [`required_files`] for one fixture set: the base files plus the key and shadow file of every rule registered in
+/// that set. A rule of another set contributes nothing, so a set never has to carry another set's sleeves.
+pub fn required_files_for(set: FixtureSetId) -> Vec<&'static str> {
     let mut files = REQUIRED_FILES_BASE.to_vec();
-    for rule in LIBRARY_RULES.iter() {
+    for rule in LIBRARY_RULES.iter().filter(|r| r.set == set) {
         files.push(rule.key.perbar_file);
         files.push(rule.key.shadow_file);
     }
@@ -156,12 +162,16 @@ pub struct SleeveFixtureOwned {
 /// Everything the ladder needs, verified.
 #[derive(Clone, Debug)]
 pub struct Fixtures {
+    /// Which fixture set this is (each set has its own manifest, candles file and pins; the rules of the other sets
+    /// are not part of it).
+    pub set: FixtureSetId,
     pub manifest_sha256: String,
     pub candles_sha256: String,
     /// `(path, sha256)` of every manifest entry that was verified, sorted by path.
     pub verified_files: Vec<(String, String)>,
-    pub etf_panel: Panel,
-    pub crypto_panel: Panel,
+    /// A panel is loaded only when a rule registered in this set runs on it ([`Fixtures::try_panel`]).
+    etf_panel: Option<Panel>,
+    crypto_panel: Option<Panel>,
     /// Every answer-key sleeve this set carries, by sleeve code (`S1`, `S3`, ...). Which sleeves exist here is
     /// driven entirely by [`LIBRARY_RULES`] (`load`): adding a registered rule with a new `KeyRef` is enough to add
     /// a new entry, no further edit of this module needed.
@@ -171,11 +181,31 @@ pub struct Fixtures {
 
 impl Fixtures {
     /// The pinned panel of a universe.
+    ///
+    /// Panics if this set carries no such panel (no rule of the set runs on it); use [`Fixtures::try_panel`] when the
+    /// panel may belong to another set.
     pub fn panel(&self, spec: PanelSpec) -> &Panel {
+        self.try_panel(spec).unwrap_or_else(|| {
+            panic!("fixture set {:?} carries no {:?} panel (no rule of this set runs on it)", self.set, spec)
+        })
+    }
+
+    /// The pinned panel of a universe, or `None` when no rule registered in this set runs on it.
+    pub fn try_panel(&self, spec: PanelSpec) -> Option<&Panel> {
         match spec {
-            PanelSpec::Etf => &self.etf_panel,
-            PanelSpec::Crypto => &self.crypto_panel,
+            PanelSpec::Etf => self.etf_panel.as_ref(),
+            PanelSpec::Crypto => self.crypto_panel.as_ref(),
         }
+    }
+
+    /// The five-ETF panel (`PanelSpec::Etf`). Panics if the set carries none.
+    pub fn etf_panel(&self) -> &Panel {
+        self.panel(PanelSpec::Etf)
+    }
+
+    /// The BTC/ETH panel (`PanelSpec::Crypto`). Panics if the set carries none.
+    pub fn crypto_panel(&self) -> &Panel {
+        self.panel(PanelSpec::Crypto)
     }
 
     /// Everything this set holds for one answer-key sleeve, by its code (`S1`, `S3`), or `None` for a code the set
@@ -185,7 +215,7 @@ impl Fixtures {
         let owned = self.sleeves.get(code)?;
         let spec = LIBRARY_RULES.iter().find(|r| r.key.sleeve_code == code)?.panel;
         Some(SleeveFixture {
-            panel: self.panel(spec),
+            panel: self.try_panel(spec)?,
             key: &owned.key,
             recorded: &owned.recorded,
             shadow: &owned.shadow,
@@ -223,11 +253,16 @@ impl Fixtures {
 
     /// Load from a directory with explicit pins (tests use synthetic fixture sets).
     pub fn from_dir_with_pins(dir: &Path, pins: Pins<'_>) -> Result<Fixtures, LadderError> {
+        Fixtures::from_dir_with_pins_set(dir, pins, FixtureSetId::Legacy)
+    }
+
+    /// [`Fixtures::from_dir_with_pins`] for the fixture set `set` (its own directory, manifest and pins).
+    pub fn from_dir_with_pins_set(dir: &Path, pins: Pins<'_>, set: FixtureSetId) -> Result<Fixtures, LadderError> {
         let dir = dir.to_path_buf();
         let reader = move |name: &str| -> Result<Vec<u8>, String> {
             std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
         };
-        Fixtures::load(&reader, pins)
+        Fixtures::load_set(&reader, pins, set)
     }
 
     /// Load from an in-memory table of `(relative path, bytes)`, for instance `include_bytes!` data, verifying the
@@ -235,6 +270,11 @@ impl Fixtures {
     /// system. A name that occurs twice in the table is an [`LadderError::Io`] error (a lookup must be unambiguous);
     /// a file the manifest does not list is ignored, exactly as with a directory.
     pub fn from_files(files: &[(&str, &[u8])], pins: Pins<'_>) -> Result<Fixtures, LadderError> {
+        Fixtures::from_files_set(files, pins, FixtureSetId::Legacy)
+    }
+
+    /// [`Fixtures::from_files`] for the fixture set `set`.
+    pub fn from_files_set(files: &[(&str, &[u8])], pins: Pins<'_>, set: FixtureSetId) -> Result<Fixtures, LadderError> {
         for (i, (name, _)) in files.iter().enumerate() {
             if files[..i].iter().any(|(n, _)| n == name) {
                 return Err(LadderError::Io(format!("{name}: listed twice in the in-memory file table")));
@@ -247,11 +287,22 @@ impl Fixtures {
                 .map(|(_, bytes)| bytes.to_vec())
                 .ok_or_else(|| format!("{name}: not in the in-memory file table"))
         };
-        Fixtures::load(&reader, pins)
+        Fixtures::load_set(&reader, pins, set)
     }
 
     /// Load through `read` (relative path -> bytes), verifying the trust chain first.
     pub fn load(read: Reader<'_>, pins: Pins<'_>) -> Result<Fixtures, LadderError> {
+        Fixtures::load_set(read, pins, FixtureSetId::Legacy)
+    }
+
+    /// [`Fixtures::load`] for one fixture set: only the rules registered in `set` ([`RegisteredRule::set`]) are
+    /// loaded, only their files are required, and only the panels they run on are built. A set no rule is registered
+    /// in is refused (a ladder over zero sleeves would pass vacuously).
+    pub fn load_set(read: Reader<'_>, pins: Pins<'_>, set: FixtureSetId) -> Result<Fixtures, LadderError> {
+        let rules: Vec<&RegisteredRule> = LIBRARY_RULES.iter().filter(|r| r.set == set).collect();
+        if rules.is_empty() {
+            return Err(LadderError::Inconsistent(format!("no library rule is registered in fixture set {set:?}")));
+        }
         let get = |name: &str| read(name).map_err(LadderError::Io);
 
         // 1. manifest pin
@@ -291,7 +342,7 @@ impl Fixtures {
             verified.insert(name.clone(), got);
             contents.insert(name.clone(), bytes);
         }
-        for req in required_files() {
+        for req in required_files_for(set) {
             if !verified.contains_key(req) {
                 return Err(LadderError::Pin(format!("{req} is required but not listed in {F_MANIFEST}")));
             }
@@ -304,8 +355,17 @@ impl Fixtures {
         // 3. parse (only verified bytes are parsed)
         let candles = &contents[F_CANDLES];
         let source = PriceSource::Fixture { csv: candles, expected_sha256: pins.candles_sha256 };
-        let etf_panel = source.load(&ETF_SYMBOLS).map_err(|e| parse_err("ETF panel", e))?;
-        let crypto_panel = source.load(&CRYPTO_SYMBOLS).map_err(|e| parse_err("crypto panel", e))?;
+        let runs_on = |spec: PanelSpec| rules.iter().any(|r| r.panel == spec);
+        let etf_panel = if runs_on(PanelSpec::Etf) {
+            Some(source.load(&ETF_SYMBOLS).map_err(|e| parse_err("ETF panel", e))?)
+        } else {
+            None
+        };
+        let crypto_panel = if runs_on(PanelSpec::Crypto) {
+            Some(source.load(&CRYPTO_SYMBOLS).map_err(|e| parse_err("crypto panel", e))?)
+        } else {
+            None
+        };
 
         let metrics_json =
             json::parse(&text(&contents[F_KEY_METRICS], F_KEY_METRICS)?).map_err(|e| parse_err(F_KEY_METRICS, e))?;
@@ -323,7 +383,7 @@ impl Fixtures {
         // universe (for the per-bar key's weight columns) and the two fixture file names all come from the registry
         // entry, not from a literal here.
         let mut sleeves: BTreeMap<String, SleeveFixtureOwned> = BTreeMap::new();
-        for rule in LIBRARY_RULES.iter() {
+        for rule in rules.iter().copied() {
             let code = rule.key.sleeve_code;
             let universe = (rule.factory)().universe().to_vec();
             let flips = num(&metrics_json, &[code, "flips"], F_KEY_METRICS)? as u64;
@@ -342,6 +402,7 @@ impl Fixtures {
         let expected_mutants = parse_expected_mutants(&mutants_json)?;
 
         Ok(Fixtures {
+            set,
             manifest_sha256: manifest_sha,
             candles_sha256: candles_sha,
             verified_files: verified.into_iter().collect(),

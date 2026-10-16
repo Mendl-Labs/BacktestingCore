@@ -9,11 +9,15 @@
 mod common;
 
 use weightsim::{DecisionSchedule, RebalancePolicy, WeightRule};
+use weightsim_rules::ladder::fixtures::{
+    required_files, required_files_for, Fixtures, LadderError, Pins, REAL_CANDLES_SHA256, REAL_MANIFEST_SHA256,
+};
 use weightsim_rules::ladder::mutants::{Mutant, MutantSleeve};
 use weightsim_rules::ladder::verify::LIBRARY_RULE_IDS;
 use weightsim_rules::ladder::{
-    replicate, rule_facts, run_ladder_with, CadenceSpec, LadderOptions, OverlaySpec, PanelSpec, RegisteredRule,
-    Registry, RegistryError, ReplicateError, RuleSpec, SignalSpec, UniverseSpec, WeightingSpec, LIBRARY_RULES,
+    replicate, rule_facts, run_ladder_with, CadenceSpec, FixtureSetId, LadderOptions, OverlaySpec, PanelSpec,
+    RegisteredRule, Registry, RegistryError, ReplicateError, RuleSpec, SignalSpec, UniverseSpec, WeightingSpec,
+    LIBRARY_RULES,
 };
 
 const NO_CANARIES: LadderOptions = LadderOptions { check_canaries: false };
@@ -197,4 +201,79 @@ fn the_registry_is_keyed_by_rule_spec_and_each_spec_describes_its_compiled_rule(
         Registry::from_rules(vec![LIBRARY_RULES[0], twin]).err(),
         Some(RegistryError::DuplicateSpec { spec: s1 })
     );
+}
+
+/// Amendment 14 / test T9: giving the registry fixture sets must leave the legacy set byte-identical. The pins are the
+/// literals the Engine's `certified.rs` carries (`CERTIFIED_MANIFEST_SHA256`, `CERTIFIED_CANDLES_SHA256`); the ladder
+/// digest over the synthetic legacy set is pinned above (`PRE_REGISTRY_LADDER_DIGEST`) and the real one in
+/// `tests/ladder_real.rs` / the Engine's `EXPECTED_LADDER_DIGEST`.
+#[test]
+fn the_legacy_fixture_set_is_untouched_by_fixture_sets() {
+    assert_eq!(REAL_MANIFEST_SHA256, "d51444c33fc2630e12315e936f79580e13dca834ca0fdbc40a242ef496bd6d90");
+    assert_eq!(REAL_CANDLES_SHA256, "d5cea5f25a4d0d4ecdf4f3c48ba0bd8d50f72fe208a7a6b5ace1399bb644a365");
+    assert_eq!(Pins::REAL.manifest_sha256, REAL_MANIFEST_SHA256);
+    assert_eq!(Pins::REAL.candles_sha256, REAL_CANDLES_SHA256);
+    // Both certified rules are in the legacy set, in the same order as before; the legacy file list is unchanged.
+    for e in Registry::library().iter_set(FixtureSetId::Legacy) {
+        assert_eq!(e.set, FixtureSetId::Legacy);
+    }
+    assert_eq!(Registry::library().iter_set(FixtureSetId::Legacy).count(), 2);
+    assert_eq!(required_files(), required_files_for(FixtureSetId::Legacy));
+    assert_eq!(
+        required_files(),
+        vec![
+            "ladder_candles.csv",
+            "key/key_metrics.json",
+            "key/mutants.json",
+            "key/S1_etf_trend_faber_perbar.csv",
+            "shadow_saved/shadow_S1_daily_returns.csv",
+            "key/S3_crypto_trend_100d_perbar.csv",
+            "shadow_saved/shadow_S3_daily_returns.csv",
+        ]
+    );
+    let fx = common::fixtures();
+    assert_eq!(fx.set, FixtureSetId::Legacy);
+    assert!(fx.try_panel(PanelSpec::Etf).is_some() && fx.try_panel(PanelSpec::Crypto).is_some());
+}
+
+#[test]
+fn a_rule_of_another_fixture_set_is_refused_by_a_loaded_set() {
+    let fx = common::fixtures();
+    let foreign = RegisteredRule { set: FixtureSetId::MomentumEvidence, ..LIBRARY_RULES[0] };
+    match foreign.fixture(&fx) {
+        Err(LadderError::Inconsistent(m)) => assert!(m.contains("MomentumEvidence"), "{m}"),
+        other => panic!("expected an Inconsistent error, got {:?}", other.map(|_| ())),
+    }
+    // The registry can filter by set: a foreign entry is not in the legacy listing.
+    let reg = Registry::from_rules(vec![
+        LIBRARY_RULES[0],
+        RegisteredRule { set: FixtureSetId::MomentumEvidence, ..LIBRARY_RULES[1] },
+    ])
+    .unwrap();
+    assert_eq!(reg.iter_set(FixtureSetId::Legacy).map(|r| r.id).collect::<Vec<_>>(), vec!["etf_trend_faber"]);
+    assert_eq!(
+        reg.iter_set(FixtureSetId::MomentumEvidence).map(|r| r.id).collect::<Vec<_>>(),
+        vec!["crypto_trend_100d"]
+    );
+}
+
+#[test]
+fn loading_a_fixture_set_no_rule_is_registered_in_is_refused_before_any_file_is_read() {
+    let reader = |name: &str| -> Result<Vec<u8>, String> { panic!("no file may be read, asked for {name}") };
+    let pins = Pins { manifest_sha256: "0", candles_sha256: "0" };
+    for set in FixtureSetId::ALL {
+        if Registry::library().iter_set(set).next().is_some() {
+            continue;
+        }
+        match Fixtures::load_set(&reader, pins, set) {
+            Err(LadderError::Inconsistent(m)) => assert!(m.contains("no library rule is registered"), "{m}"),
+            other => panic!("expected an Inconsistent error for {set:?}, got {:?}", other.map(|_| ())),
+        }
+    }
+}
+
+#[test]
+fn every_panel_spec_names_the_symbols_of_its_universe() {
+    assert_eq!(PanelSpec::Etf.symbols(), &reference_rules::ETF_SYMBOLS[..]);
+    assert_eq!(PanelSpec::Crypto.symbols(), &reference_rules::CRYPTO_SYMBOLS[..]);
 }

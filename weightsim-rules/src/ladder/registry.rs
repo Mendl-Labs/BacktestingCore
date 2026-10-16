@@ -76,6 +76,27 @@ pub struct RuleSpec {
     pub overlay: OverlaySpec,
 }
 
+/// Which fixture set a rule's answer key lives in. A fixture set is one directory with its own `MANIFEST.json`, candles
+/// file and pins (`fixtures::Pins`); the ladder runs, digests and pins ONE set at a time, so adding a rule to a NEW set
+/// never touches the manifest, the candles pin or the ladder digest of another set (Amendment 14: the legacy fixtures
+/// and their digests are untouched). A new family adds a variant here, its pins next to
+/// [`super::fixtures::Pins::REAL`], and its rule(s) to [`LIBRARY_RULES`] with that `set`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FixtureSetId {
+    /// `replication_ladder/` (Amendment 11): S1 `etf_trend_faber` and S3 `crypto_trend_100d`, pinned by
+    /// `Pins::REAL`. Its ladder digest is covered by the Engine's `CERTIFIED_LADDER_DIGESTS`.
+    Legacy,
+    /// `replication_ladder_momentum_evidence/` (Amendment 14): the evidence window of
+    /// `etf_cross_sectional_momentum`, pinned on its own. Reserved: no rule is registered in it yet, and
+    /// `Fixtures::load_set` refuses a set with no registered rule.
+    MomentumEvidence,
+}
+
+impl FixtureSetId {
+    /// Every fixture set, in table order.
+    pub const ALL: [FixtureSetId; 2] = [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence];
+}
+
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
 /// single candles file; a future universe adds a variant here and a panel in the loader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +105,16 @@ pub enum PanelSpec {
     Etf,
     /// BTC and ETH (`reference_rules::CRYPTO_SYMBOLS`).
     Crypto,
+}
+
+impl PanelSpec {
+    /// The symbols of the panel, in panel order.
+    pub fn symbols(self) -> &'static [&'static str] {
+        match self {
+            PanelSpec::Etf => &ETF_SYMBOLS,
+            PanelSpec::Crypto => &CRYPTO_SYMBOLS,
+        }
+    }
 }
 
 /// Where a rule's answer key lives inside a fixture set: the sleeve code (`S1`, `S3`) the ladder reports under, and
@@ -115,6 +146,8 @@ pub struct RegisteredRule {
     pub spec: RuleSpec,
     /// Builds the compiled rule, bare. The ladder applies its own `FlatUntil` entry gate at run time.
     pub factory: fn() -> Box<dyn WeightRule>,
+    /// The fixture set the rule's key, panel and mutants live in; only that set's ladder runs the rule.
+    pub set: FixtureSetId,
     pub panel: PanelSpec,
     pub key: KeyRef,
     /// The named mutants of this rule's sleeve (Tier IV), in `Mutant::ALL` order.
@@ -137,6 +170,12 @@ impl RegisteredRule {
     /// Everything a fixture set holds for this rule, checked to belong to it: the key's rule id must be this id and
     /// the panel's symbols must be the rule's universe.
     pub fn fixture<'a>(&self, fx: &'a Fixtures) -> Result<SleeveFixture<'a>, LadderError> {
+        if fx.set != self.set {
+            return Err(LadderError::Inconsistent(format!(
+                "`{}` is certified in fixture set {:?}, not in the loaded {:?} set",
+                self.id, self.set, fx.set
+            )));
+        }
         let sf = fx.sleeve(self.key.sleeve_code).ok_or_else(|| {
             LadderError::Inconsistent(format!(
                 "the fixture set has no sleeve `{}` for `{}`",
@@ -193,6 +232,7 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
             overlay: OverlaySpec::None,
         },
         factory: make_etf,
+        set: FixtureSetId::Legacy,
         panel: PanelSpec::Etf,
         key: KeyRef {
             sleeve_code: "S1",
@@ -212,6 +252,7 @@ pub const LIBRARY_RULES: [RegisteredRule; 2] = [
             overlay: OverlaySpec::None,
         },
         factory: make_crypto,
+        set: FixtureSetId::Legacy,
         panel: PanelSpec::Crypto,
         key: KeyRef {
             sleeve_code: "S3",
@@ -336,6 +377,11 @@ impl Registry {
 
     pub fn iter(&self) -> impl Iterator<Item = &RegisteredRule> {
         self.rules.iter()
+    }
+
+    /// The entries of one fixture set, in table order.
+    pub fn iter_set(&self, set: FixtureSetId) -> impl Iterator<Item = &RegisteredRule> {
+        self.rules.iter().filter(move |r| r.set == set)
     }
 
     pub fn ids(&self) -> Vec<&'static str> {
