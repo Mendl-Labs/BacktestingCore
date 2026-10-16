@@ -66,7 +66,13 @@ fn the_adapter_is_the_published_point() {
     assert_eq!(r.rebalance_policy(), RebalancePolicy::OnDecision);
     assert_eq!(r.min_history_bars(), 127);
     assert_eq!(r.execution_lag_bars(), 0);
-    assert_eq!(r.declared_parameters().get("L").map(String::as_str), Some("126"));
+    // The four parameters the library entry pins, as JSON-shaped literals (what `binding` parses back and compares).
+    let p = r.declared_parameters();
+    assert_eq!(p.len(), 4);
+    assert_eq!(p["L"], "126");
+    assert_eq!(p["schedule"], "\"daily\"");
+    assert_eq!(p["rebalance_policy"], "\"on_decision\"");
+    assert_eq!(p["max_weight_per_instrument"].parse::<f64>().unwrap(), 5.0 / 15.0);
     assert!(r.impl_version().starts_with("weightsim-rules "));
 }
 

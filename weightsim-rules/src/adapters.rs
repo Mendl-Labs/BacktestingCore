@@ -399,8 +399,17 @@ impl WeightRule for MomentumRankWeightedRule {
     fn universe(&self) -> &[&'static str] {
         self.inner.universe()
     }
+    /// The four parameters the library entry pins (Amendment 14 section 1, verbatim from the entry's template): the
+    /// reference rule's own `L`, plus the schedule, the rebalance policy and the largest weight any one instrument can
+    /// get (rank 1 of `K`: `K / (K (K + 1) / 2)`), so the entry's parameters bind with no drift in either direction.
     fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
-        self.inner.declared_parameters()
+        let k = self.inner.universe().len() as f64;
+        BTreeMap::from([
+            ("L", self.inner.lookback().to_string()),
+            ("schedule", "\"daily\"".to_string()),
+            ("rebalance_policy", "\"on_decision\"".to_string()),
+            ("max_weight_per_instrument", (k / (k * (k + 1.0) / 2.0)).to_string()),
+        ])
     }
     fn decision_schedule(&self) -> DecisionSchedule {
         self.inner.decision_schedule()
