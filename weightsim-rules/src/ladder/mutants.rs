@@ -379,7 +379,7 @@ impl WeightRule for PeekMomentum {
         MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK + 1
     }
     fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
-        let end = (h.len() + 1).min(self.full.n_bars());
+        let end = self.full.n_bars().min(h.len() + 1);
         let cols: Vec<&[f64]> = (0..self.full.n_assets()).map(|i| &self.full.closes(i)[..end]).collect();
         Ok(momentum_weights(&ETF_SYMBOLS, &cols, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK, false))
     }
