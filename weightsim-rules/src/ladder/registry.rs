@@ -21,14 +21,15 @@ use std::sync::OnceLock;
 
 use reference_rules::{
     CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
-    ETF_WEIGHT_PER_INSTRUMENT, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+    ETF_WEIGHT_PER_INSTRUMENT, LOW_VOL_QUINTILE_FRACTION, LOW_VOL_QUINTILE_LOOKBACK_DAYS, LOW_VOL_QUINTILE_SYMBOLS,
+    MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 
 use super::fixtures::{Fixtures, LadderError, RecordedMetrics, SleeveKey};
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
-use crate::adapters::{CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{CryptoTrendRule, EtfTrendRule, LowVolQuintileTiltAdapter, MomentumRankWeightedRule};
 
 /// What a rule's signal reads. The sampling of the signal is the rule's decision schedule ([`CadenceSpec::decision`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +40,10 @@ pub enum SignalSpec {
     /// Instruments are ranked by their trailing `lookback`-bar return (`close_t / close_(t-lookback) - 1`), descending,
     /// ties broken by ascending ticker; an instrument with fewer than `lookback + 1` closes is not ranked.
     TrailingReturnRank { lookback: usize },
+    /// Instruments are ranked by the POPULATION standard deviation (ddof = 0) of their trailing `lookback` simple daily
+    /// returns, ascending (lowest volatility first), ties broken by ascending ticker; an instrument with fewer than
+    /// `lookback + 1` closes is not ranked.
+    TrailingVolRank { lookback: usize },
 }
 
 /// Which instruments a rule trades.
@@ -56,6 +61,9 @@ pub enum WeightingSpec {
     /// With `K` ranked instruments, the one at rank `r` (1 = best) gets `(K + 1 - r) / (K (K + 1) / 2)` of the sleeve:
     /// strictly positive, summing to 1, no cutoff. Instruments that are not ranked get 0 and leave `K`.
     LinearRank,
+    /// The bottom `round(fraction * K)` ranked instruments (floored at 1; K = the number of ranked instruments) are held
+    /// equal-weighted, every other instrument gets 0.
+    BottomFractionEqual { fraction: f64 },
 }
 
 /// When the rule decides, and how the book is traded between decisions.
@@ -96,11 +104,15 @@ pub enum FixtureSetId {
     /// `etf_cross_sectional_momentum` (rule `momentum_rank_weighted`, sleeve `S4`), pinned on its own. Its pins are the
     /// caller's (the Engine's `certified.rs`); they are not constants of this crate.
     MomentumEvidence,
+    /// `replication_ladder_lowvol_evidence/` (Amendment 15): the evidence window of `etf_low_vol_quintile_tilt` (rule
+    /// `low_vol_quintile_tilt_20d`, sleeve `S5`), pinned on its own like [`FixtureSetId::MomentumEvidence`].
+    LowVolEvidence,
 }
 
 impl FixtureSetId {
     /// Every fixture set, in table order.
-    pub const ALL: [FixtureSetId; 2] = [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence];
+    pub const ALL: [FixtureSetId; 3] =
+        [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence, FixtureSetId::LowVolEvidence];
 }
 
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
@@ -111,6 +123,8 @@ pub enum PanelSpec {
     Etf,
     /// BTC and ETH (`reference_rules::CRYPTO_SYMBOLS`).
     Crypto,
+    /// The seven placeholder ETFs of the low-volatility tilt (`reference_rules::LOW_VOL_QUINTILE_SYMBOLS`).
+    LowVol,
 }
 
 impl PanelSpec {
@@ -119,6 +133,7 @@ impl PanelSpec {
         match self {
             PanelSpec::Etf => &ETF_SYMBOLS,
             PanelSpec::Crypto => &CRYPTO_SYMBOLS,
+            PanelSpec::LowVol => &LOW_VOL_QUINTILE_SYMBOLS,
         }
     }
 }
@@ -230,8 +245,12 @@ fn make_momentum() -> Box<dyn WeightRule> {
     Box::new(MomentumRankWeightedRule::default())
 }
 
+fn make_low_vol() -> Box<dyn WeightRule> {
+    Box::new(LowVolQuintileTiltAdapter::default())
+}
+
 /// The reviewed table. Order matters: it is the order sleeves are run and reported in, which the ladder digest covers.
-pub const LIBRARY_RULES: [RegisteredRule; 3] = [
+pub const LIBRARY_RULES: [RegisteredRule; 4] = [
     RegisteredRule {
         id: "etf_trend_faber",
         spec: RuleSpec {
@@ -311,6 +330,37 @@ pub const LIBRARY_RULES: [RegisteredRule; 3] = [
             Mutant::S4LookbackOffByOne,
             Mutant::S4HalfSizing,
             Mutant::S4EqualWeight,
+        ],
+        canaries: &[],
+    },
+    // Amendment 15: `etf_low_vol_quintile_tilt`, in its own fixture set (the evidence window), so neither the legacy
+    // nor the momentum set's manifest, candles pin or ladder digest is touched. Four of the five pre-registered T4
+    // mutants are listed: `lowvol_ddof1_not_ddof0` is PROVABLY EQUIVALENT to the rule (sample stdev = population stdev
+    // times the constant sqrt(L / (L - 1)), the same factor for every instrument, so the ranking and every weight are
+    // identical), no tier can fail it, and it is therefore NOT in this list -- see `Mutant::LOWVOL_EQUIVALENT` and the
+    // amendment-16 note in `ladder::mutants`.
+    RegisteredRule {
+        id: "low_vol_quintile_tilt_20d",
+        spec: RuleSpec {
+            signal: SignalSpec::TrailingVolRank { lookback: LOW_VOL_QUINTILE_LOOKBACK_DAYS },
+            universe: UniverseSpec::Fixed(&LOW_VOL_QUINTILE_SYMBOLS),
+            weighting: WeightingSpec::BottomFractionEqual { fraction: LOW_VOL_QUINTILE_FRACTION },
+            cadence: CadenceSpec { decision: DecisionSchedule::Daily, rebalance: RebalancePolicy::EveryBar },
+            overlay: OverlaySpec::None,
+        },
+        factory: make_low_vol,
+        set: FixtureSetId::LowVolEvidence,
+        panel: PanelSpec::LowVol,
+        key: KeyRef {
+            sleeve_code: "S5",
+            perbar_file: "key/S5_low_vol_quintile_tilt_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S5_daily_returns.csv",
+        },
+        mutants: &[
+            Mutant::S5LookaheadPeek,
+            Mutant::S5ExtraDelay,
+            Mutant::S5LookbackOffByOne,
+            Mutant::S5TopQuintileNotBottom,
         ],
         canaries: &[],
     },

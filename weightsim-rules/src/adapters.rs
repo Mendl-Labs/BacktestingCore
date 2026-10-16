@@ -23,9 +23,10 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
 use reference_rules::{
-    decide_crypto_trend_with, decide_etf_trend_with, GapPolicy, MomentumRankWeighted, MonthEndMode, Options,
-    Panel as RrPanel, PriceSeries, RankWeightedRanking, RuleError, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS,
-    CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
+    decide_crypto_trend_with, decide_etf_trend_with, low_vol_quintile_tilt::quintile_count, GapPolicy,
+    LowVolQuintileTiltRule as RrLowVolQuintileTilt, MomentumRankWeighted, MonthEndMode, Options, Panel as RrPanel,
+    PriceSeries, RankWeightedRanking, RuleError, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT,
+    ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT, LOW_VOL_QUINTILE_SYMBOLS,
     MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, HistoryView, RebalancePolicy, RefusalKind, RuleRefusal, WeightRule};
@@ -410,6 +411,58 @@ impl WeightRule for MomentumRankWeightedRule {
             ("rebalance_policy", "\"on_decision\"".to_string()),
             ("max_weight_per_instrument", (k / (k * (k + 1.0) / 2.0)).to_string()),
         ])
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        self.inner.decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.inner.rebalance_policy()
+    }
+    fn min_history_bars(&self) -> usize {
+        self.inner.min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        self.inner.target_weights(h)
+    }
+}
+
+/// `low_vol_quintile_tilt_20d` (Amendment 15, library entry `etf_low_vol_quintile_tilt`): the compiled
+/// `reference_rules::LowVolQuintileTiltRule` over the seven placeholder ETFs (DIA, EEM, EFA, GLD, IWM, SPY, TLT). Each
+/// day the bottom volatility quintile (`round(0.2 K)`, floored at 1: ONE instrument with K = 7) of the trailing
+/// 20-day population stdev of simple returns is held equal-weighted; every bar is re-traded to the target.
+///
+/// The reference rule already IS a `WeightRule`, so this adapter only stamps the adapter version on the run and adds
+/// the one parameter the library entry pins beyond the rule's own four (`max_weight_per_instrument`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LowVolQuintileTiltAdapter {
+    inner: RrLowVolQuintileTilt,
+}
+
+impl LowVolQuintileTiltAdapter {
+    pub fn new() -> Self {
+        LowVolQuintileTiltAdapter::default()
+    }
+}
+
+impl WeightRule for LowVolQuintileTiltAdapter {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn impl_version(&self) -> String {
+        ADAPTER_VERSION.to_string()
+    }
+    fn universe(&self) -> &[&'static str] {
+        self.inner.universe()
+    }
+    /// The five parameters the library entry pins (Amendment 15 section 1, verbatim from the entry's template): the
+    /// reference rule's own `lookback_days`, `quintile_fraction`, `schedule` and `rebalance_policy`, plus the largest
+    /// weight any one instrument can get (`1 / quintile_count(K)`, which is 1.0 with K = 7). Written with `{:?}` so
+    /// the JSON literal is `1.0`, a float, exactly as the entry declares it.
+    fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
+        let mut p = self.inner.declared_parameters();
+        let held = quintile_count(LOW_VOL_QUINTILE_SYMBOLS.len()) as f64;
+        p.insert("max_weight_per_instrument", format!("{:?}", 1.0 / held));
+        p
     }
     fn decision_schedule(&self) -> DecisionSchedule {
         self.inner.decision_schedule()
