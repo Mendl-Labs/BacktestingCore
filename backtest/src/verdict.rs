@@ -33,6 +33,26 @@ pub enum Verdict {
 /// Inputs the verdict logic needs. All fields optional so callers can pass
 /// partial results without pre-filtering -- mirrors `VerdictInputs` in
 /// `verdict.ts`.
+///
+/// PR6 (2026-09) removed `information_ratio`, dead on every real caller: no
+/// field anywhere in the Rust pipeline or the API response JSON ever
+/// populated the `oos_information_ratio` `verdict.ts` read it from --
+/// gui/src/lib/verdict.ts mirrors this removal, including its own
+/// downstream consumers (iterate.ts, teardownText.ts,
+/// research-interview-prompt.ts). A gate that can never fire because
+/// nothing ever populates its input is not defense-in-depth, it's a false
+/// promise of rigor.
+///
+/// `num_assets_failing_gate` was briefly considered for the same removal
+/// but is NOT dead -- `ResultsVisualization.tsx` genuinely computes it in
+/// the browser (re-running `promotionBlockReason` per portfolio asset
+/// against real `portfolio_metrics.symbol_results` data) for the Results
+/// page's own verdict display, so it stays. It IS dead specifically on
+/// BacktestingEngine's server-side Rust caller
+/// (`executor.rs::verdict_inputs_from_result` hardcodes `None`, comment:
+/// "per-asset gate data not present in SymbolResult") -- a real gap in the
+/// autonomous workflow's own stop/continue decision, left open as a
+/// follow-up rather than fixed here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerdictInputs {
     pub oos_sharpe_ratio: Option<f64>,
@@ -48,6 +68,30 @@ pub struct VerdictInputs {
     pub result_quality: Option<String>,
     pub is_statistically_significant: Option<bool>,
     pub is_overfit: Option<bool>,
+    /// True when a margin call force-closed one or more positions during the
+    /// backtest (`types::count_liquidations` > 0 on the result's trade log).
+    /// Mirrors the Rust-native GA path's existing hard-reject
+    /// (`genetic::fitness`'s `total_liquidations > 0` -> `LIQUIDATION_FITNESS`,
+    /// "beats everything, even with great metrics") -- a strategy that blew
+    /// through its maintenance margin proved its leverage was too high for
+    /// the price move it actually experienced, regardless of how good its
+    /// other metrics look. `None` when liquidation tracking isn't available
+    /// for the path that produced this result (never gates in that case,
+    /// same as every other gate here).
+    pub had_liquidation: Option<bool>,
+    /// How many pool members (assets / pairs / baskets) had at least one
+    /// margin call in their own run, and how many members the pool has.
+    /// Together they decide whether `had_liquidation` is a hard block or a
+    /// flagged risk -- see `liquidation_block_reason`. `None` when the path
+    /// doesn't report per-member counts, in which case a liquidation is
+    /// treated as pool-wide (hard block), never as tolerable.
+    pub liquidated_assets: Option<i64>,
+    pub pool_members: Option<i64>,
+    /// `Some(true)` for a holdout confirmation stage (`holdout_instruments`
+    /// / `holdout_time`): a rule already called Promising must not
+    /// margin-call on the data it is being confirmed against, so the
+    /// per-asset tolerance never applies there.
+    pub is_holdout_confirmation: Option<bool>,
 
     // --- Quant-hardening gates ---
     pub analysis_mode: Option<String>,
@@ -56,7 +100,6 @@ pub struct VerdictInputs {
     pub num_strategies_tested: Option<i64>,
     pub sharpe_std_error: Option<f64>,
     pub expected_max_sharpe_under_null: Option<f64>,
-    pub information_ratio: Option<f64>,
     pub bb_p5_total_pnl: Option<f64>,
     pub wf_consistency_score: Option<f64>,
     pub oos_num_trades: Option<i64>,
@@ -84,6 +127,16 @@ pub struct VerdictInputs {
     pub portfolio_sharpe: Option<f64>,
     pub portfolio_max_drawdown: Option<f64>,
     pub worst_asset_max_drawdown: Option<f64>,
+    /// Number of portfolio assets that would independently fail their own
+    /// promotion gate (`promotion_block_reason` re-run per asset). PR6
+    /// (2026-09) note: genuinely live on the browser side -- `verdict.ts`'s
+    /// caller in `ResultsVisualization.tsx` computes this for real from
+    /// `portfolio_metrics.symbol_results`, so this stays. It IS dead on the
+    /// server-side Rust caller specifically -- BacktestingEngine's
+    /// `executor.rs::verdict_inputs_from_result` currently hardcodes `None`
+    /// (its comment: "per-asset gate data not present in SymbolResult") --
+    /// a real gap for the autonomous workflow's own stop/continue decision,
+    /// left open as a follow-up rather than fixed here.
     pub num_assets_failing_gate: Option<i64>,
     pub pooled_deflated_sharpe_ratio: Option<f64>,
 
@@ -130,8 +183,16 @@ impl VerdictThresholds {
     pub const INSUFFICIENT_MIN_TRADES: i64 = 30;
     /// DSR threshold below which the GA likely over-fitted (Bailey et al. 2014).
     pub const PROMISING_MIN_DSR: f64 = 0.95;
-    /// Information Ratio threshold: strategy must beat the risk-free rate on OOS data.
-    pub const PROMISING_MIN_IR: f64 = 0.0;
+    /// A pooled result tolerates a margin call on at most this many members
+    /// AND at most this fraction of the pool's (equal-capital) members
+    /// before `had_liquidation` becomes a hard block instead of a flagged
+    /// risk. One idiosyncratic squeeze (ETC +115% intraday, May 2021) on one
+    /// of fifteen assets is a real, already-booked loss the pool absorbed;
+    /// margin calls across the universe are a systemic defect. Both are
+    /// deliberately small and expected to be tuned once real frequencies
+    /// are observed.
+    pub const MAX_LIQUIDATED_ASSETS: i64 = 1;
+    pub const MAX_LIQUIDATED_CAPITAL_FRACTION: f64 = 0.10;
 }
 
 /// The DSR bar actually enforced for this run: the platform's own fixed
@@ -154,6 +215,69 @@ const PORTFOLIO_WORST_ASSET_MAX_DRAWDOWN: f64 = 0.40;
 
 /// Robustness gate. Returns a short human-readable reason when a run that
 /// would otherwise be Promising must be held back to Inconclusive, or `None`
+/// Whether a margin call in this result is a hard block on Promising.
+///
+/// Single-instrument results, holdout confirmation stages, and any path
+/// that can't say WHICH members were margin-called: always a block (the
+/// rule as written blew its margin, or we can't tell how widespread it
+/// was). A pooled result with per-member counts tolerates a margin call on
+/// at most `MAX_LIQUIDATED_ASSETS` members and at most
+/// `MAX_LIQUIDATED_CAPITAL_FRACTION` of the pool: the dead-asset rule has
+/// already retired that member from the pooled series and its full loss is
+/// already in the pool's return, so a second, job-wide veto would punish
+/// one idiosyncratic squeeze twice and make every daily crypto long/short
+/// rule permanently un-promotable. A tolerated margin call is still
+/// surfaced -- see `liquidation_risk_note`. Mirrors `liquidationBlockReason`.
+pub fn liquidation_block_reason(inputs: &VerdictInputs) -> Option<String> {
+    if inputs.had_liquidation != Some(true) {
+        return None;
+    }
+    let pool = inputs.pool_members.unwrap_or(1).max(1);
+    let hit = inputs.liquidated_assets.unwrap_or(pool).max(1);
+    let holdout = inputs.is_holdout_confirmation == Some(true);
+    let tolerable = pool >= 2
+        && !holdout
+        && hit <= VerdictThresholds::MAX_LIQUIDATED_ASSETS
+        && (hit as f64 / pool as f64) <= VerdictThresholds::MAX_LIQUIDATED_CAPITAL_FRACTION;
+    if tolerable {
+        return None;
+    }
+    if holdout {
+        return Some(
+            "a margin call force-closed a position during the holdout confirmation -- a rule \
+             being confirmed must not blow its margin on the data it is confirmed against".to_string(),
+        );
+    }
+    if pool >= 2 {
+        return Some(format!(
+            "margin calls on {} of {} pool members -- too widespread to be one idiosyncratic \
+             squeeze; the rule needs a stop or smaller size before it can be promoted",
+            hit, pool
+        ));
+    }
+    Some(
+        "a margin call force-closed one or more positions during the backtest -- leverage \
+         was too high for the price move actually experienced".to_string(),
+    )
+}
+
+/// The non-blocking counterpart of `liquidation_block_reason`: the note to
+/// show (and hand to the agent) when a pooled result's margin call was
+/// tolerated. `None` when there was no margin call or when it blocks.
+pub fn liquidation_risk_note(inputs: &VerdictInputs) -> Option<String> {
+    if inputs.had_liquidation != Some(true) || liquidation_block_reason(inputs).is_some() {
+        return None;
+    }
+    let pool = inputs.pool_members.unwrap_or(1).max(1);
+    let hit = inputs.liquidated_assets.unwrap_or(1).max(1);
+    Some(format!(
+        "margin call on {} of {} pool members: that member's full loss is already in the pooled \
+         return and it was retired from the pooled series from that day. Deployable only with a \
+         stop or a size cap that survives the same move.",
+        hit, pool
+    ))
+}
+
 /// when no gate fires. Only explicitly-bad signals trigger a gate --
 /// missing/`None` fields never do. Mirrors `promotionBlockReason`.
 pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
@@ -168,6 +292,9 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
     }
     if inputs.is_statistically_significant == Some(false) {
         return Some("results are not statistically significant".to_string());
+    }
+    if let Some(reason) = liquidation_block_reason(inputs) {
+        return Some(reason);
     }
 
     // Minimum track record length gate (Bailey & López de Prado): checked
@@ -227,16 +354,6 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
         }
     }
 
-    // Information Ratio gate.
-    if let Some(ir) = inputs.information_ratio {
-        if ir < VerdictThresholds::PROMISING_MIN_IR {
-            return Some(
-                "information ratio negative — strategy did not generate excess return above the risk-free rate on OOS data"
-                    .to_string(),
-            );
-        }
-    }
-
     // Block-bootstrap gate: preserves trade-return autocorrelation.
     if let Some(bb) = inputs.bb_p5_total_pnl {
         if bb < 0.0 {
@@ -275,7 +392,8 @@ pub fn promotion_block_reason(inputs: &VerdictInputs) -> Option<String> {
         );
     }
 
-    // Portfolio gate.
+    // Portfolio gate: restored (was briefly, incorrectly, considered dead --
+    // see num_assets_failing_gate's own doc comment).
     if inputs.is_portfolio == Some(true) {
         if let Some(n) = inputs.num_assets_failing_gate {
             if n > 0 {
@@ -605,6 +723,98 @@ mod tests {
         };
         assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
         assert!(promotion_block_reason(&inputs).unwrap().contains("significant"));
+    }
+
+    #[test]
+    fn demotes_promising_to_inconclusive_when_liquidated() {
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            ..promising_base()
+        };
+        assert_eq!(compute_verdict(&inputs), Verdict::Inconclusive);
+        assert!(promotion_block_reason(&inputs).unwrap().contains("margin call"));
+    }
+
+    #[test]
+    fn does_not_block_when_liquidation_tracking_is_unavailable() {
+        // `None` (the path that produced this result doesn't track
+        // liquidations) must never gate -- only an explicit `Some(true)` does,
+        // same convention as every other gate in this function.
+        let inputs = VerdictInputs {
+            had_liquidation: None,
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).is_none());
+        let explicit_false = VerdictInputs {
+            had_liquidation: Some(false),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&explicit_false).is_none());
+    }
+
+    #[test]
+    fn one_margin_call_in_a_large_pool_is_a_flagged_risk_not_a_block() {
+        // ETC's May-2021 +115% day on one of fifteen assets: the member is
+        // already retired from the pooled series and its loss is in the
+        // pooled return. Promising stays reachable; the risk is surfaced.
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            liquidated_assets: Some(1),
+            pool_members: Some(15),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).is_none());
+        assert_eq!(compute_verdict(&inputs), Verdict::Promising);
+        let note = liquidation_risk_note(&inputs).unwrap();
+        assert!(note.contains("1 of 15"), "{note}");
+    }
+
+    #[test]
+    fn margin_calls_on_several_pool_members_still_block() {
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            liquidated_assets: Some(2),
+            pool_members: Some(15),
+            ..promising_base()
+        };
+        let reason = promotion_block_reason(&inputs).unwrap();
+        assert!(reason.contains("2 of 15"), "{reason}");
+        assert!(liquidation_risk_note(&inputs).is_none());
+    }
+
+    #[test]
+    fn one_margin_call_in_a_small_pool_exceeds_the_capital_fraction_and_blocks() {
+        // 1 of 5 members is 20% of the pool's capital -- past the 10% cap.
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            liquidated_assets: Some(1),
+            pool_members: Some(5),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).is_some());
+    }
+
+    #[test]
+    fn a_margin_call_during_holdout_confirmation_always_blocks() {
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            liquidated_assets: Some(1),
+            pool_members: Some(15),
+            is_holdout_confirmation: Some(true),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).unwrap().contains("holdout"));
+    }
+
+    #[test]
+    fn a_margin_call_without_per_member_counts_is_treated_as_pool_wide() {
+        // Paths that can't say which members were hit never get the tolerance.
+        let inputs = VerdictInputs {
+            had_liquidation: Some(true),
+            pool_members: Some(15),
+            ..promising_base()
+        };
+        assert!(promotion_block_reason(&inputs).is_some());
     }
 
     #[test]

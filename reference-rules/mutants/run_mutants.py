@@ -1,0 +1,225 @@
+﻿#!/usr/bin/env python3
+"""Hand-written mutation testing for `reference-rules` (BACKTESTER_TRUTH_DESIGN.md 6.1, stage T2).
+
+Each mutant is ONE exact source edit (the old text must occur exactly once). For every mutant the script applies the
+edit, runs the test command, records which tests FAILED (or that the build broke), and restores the file byte for byte.
+A mutant that no test kills is reported as SURVIVED and the script exits non-zero.
+
+Usage (from anywhere):
+    REFRULES_TEST_CMD="cargo test --locked --no-fail-fast" python3 mutants/run_mutants.py [--only M03,M07]
+`REFRULES_TEST_CMD` defaults to the command above and is run with the crate directory as its working directory.
+The real-history goldens are env-gated (REFRULES_LADDER_DIR) and skip themselves when it is unset, so a table
+produced without that variable is the one CI can reproduce (always-on tests only: unit, boundaries, refusals,
+properties, synthetic goldens, the FX clip golden).
+"""
+import os
+import re
+import subprocess
+import sys
+
+CRATE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# (id, description, file relative to the crate, old text (exactly once), new text)
+MUTANTS = [
+    ("M01", "crypto: off-by-one lookback (99-day SMA instead of 100)", "src/crypto.rs",
+     "pub const CRYPTO_SMA_DAYS: usize = 100;",
+     "pub const CRYPTO_SMA_DAYS: usize = 99;"),
+    ("M02", "crypto: SMA excludes today's close", "src/crypto.rs",
+     "let window = &s.closes()[lo..=pos];",
+     "let window = &s.closes()[lo..pos];"),
+    ("M03", "etf: off-by-one lookback (9 month-end closes instead of 10)", "src/etf.rs",
+     "pub const ETF_SMA_MONTH_ENDS: usize = 10;",
+     "pub const ETF_SMA_MONTH_ENDS: usize = 9;"),
+    ("M04", "etf: SMA excludes the current month-end close", "src/etf.rs",
+     "compare_to_mean(close, &g.month_end_closes[..])",
+     "compare_to_mean(close, &g.month_end_closes[..ETF_SMA_MONTH_ENDS - 1])"),
+    ("M05", "wrong month-end: the FIRST bar of a month is taken as the month-end", "src/months.rs",
+     "        .filter(|&i| i + 1 == dates.len() || !same_month(dates[i], dates[i + 1]))",
+     "        .filter(|&i| i == 0 || !same_month(dates[i], dates[i - 1]))"),
+    ("M06", "wrong month-end: same_month ignores the year", "src/months.rs",
+     "a.year() == b.year() && a.month() == b.month()",
+     "a.month() == b.month()"),
+    ("M07", "sign flip: crypto goes long BELOW the average", "src/crypto.rs",
+     "let signal = if cmp.ordering.is_gt() {",
+     "let signal = if cmp.ordering.is_lt() {"),
+    ("M08", "etf: a tie (close == average) counts as above (not strictly above)", "src/etf.rs",
+     "let signal = if cmp.ordering.is_gt() {",
+     "let signal = if cmp.ordering.is_ge() {"),
+    ("M09", "etf: wrong sizing (25% per ETF instead of 20%)", "src/etf.rs",
+     "pub const ETF_WEIGHT_PER_INSTRUMENT: f64 = 0.20;",
+     "pub const ETF_WEIGHT_PER_INSTRUMENT: f64 = 0.25;"),
+    ("M10", "crypto: wrong sizing (25% per coin instead of 50%)", "src/crypto.rs",
+     "pub const CRYPTO_WEIGHT_PER_INSTRUMENT: f64 = 0.50;",
+     "pub const CRYPTO_WEIGHT_PER_INSTRUMENT: f64 = 0.25;"),
+    ("M11", "fx: sign flip of the momentum sign", "src/fx.rs",
+     "sign[k] = sign_of(now / then - 1.0);",
+     "sign[k] = -sign_of(now / then - 1.0);"),
+    ("M12", "fx: off-by-one lookback (12 month-ends instead of 13)", "src/fx.rs",
+     "pub const FX_MOMENTUM_MONTH_ENDS: usize = 13;",
+     "pub const FX_MOMENTUM_MONTH_ENDS: usize = 12;"),
+    ("M13", "fx: wrong clip (upper cap 6 instead of 3)", "src/fx.rs",
+     "weight: scaled.clamp(-FX_WEIGHT_CAP, FX_WEIGHT_CAP),",
+     "weight: scaled.clamp(-FX_WEIGHT_CAP, 2.0 * FX_WEIGHT_CAP),"),
+    # (The tempting variant `>` -> `>=` is an EQUIVALENT mutant: it differs only when the scaled weight is exactly 3.0
+    # in binary floating point, which no input reaches; it is deliberately not in this list.)
+    ("M14", "fx: clipped flag threshold wrong (flag only when the weight exceeds twice the cap)", "src/fx.rs",
+     "clipped: scaled.abs() > FX_WEIGHT_CAP,",
+     "clipped: scaled.abs() > 2.0 * FX_WEIGHT_CAP,"),
+    ("M15", "fx: wrong vol window (59 returns instead of 60)", "src/fx.rs",
+     "pub const FX_VOL_WINDOW: usize = 60;",
+     "pub const FX_VOL_WINDOW: usize = 59;"),
+    ("M16", "fx: standard deviation with ddof 0 instead of 1", "src/fx.rs",
+     "Some((ss / (n - 1.0)).sqrt())",
+     "Some((ss / n).sqrt())"),
+    ("M17", "fx: ppy uses 365 instead of 365.25 days per year", "src/fx.rs",
+     "let years = days as f64 / 365.25;",
+     "let years = days as f64 / 365.0;"),
+    ("M18", "fx: wrong sleeve volatility target (11% instead of 10%)", "src/fx.rs",
+     "pub const FX_SLEEVE_VOL_TARGET: f64 = 0.10;",
+     "pub const FX_SLEEVE_VOL_TARGET: f64 = 0.11;"),
+    ("M19", "gap policy: missing-days count off by one (adjacent days count as one missing)", "src/months.rs",
+     "((b - a).num_days() - 1).max(0) as u32",
+     "(b - a).num_days().max(0) as u32"),
+    ("M20", "crypto: minimum history off by one (101 bars needed)", "src/crypto.rs",
+     "if pos + 1 < sma_days {",
+     "if pos + 1 <= sma_days {"),
+
+    # --- W3.6 new primitives (SENIOR_RESEARCHER_GAP_CLOSURE_PLAN.md, W3.6 / 9.9 point 2) ---
+    ("M21", "sma_crossover_trend: off-by-one lookback window (N+1 bars instead of N)", "src/sma_crossover_trend.rs",
+     "let window = &closes[closes.len() - n..];",
+     "let window = &closes[closes.len() - n - 1..];"),
+    ("M22", "turn_of_month: window closes one day too early (2 following days instead of 3)", "src/turn_of_month.rs",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 3;",
+     "pub const TURN_OF_MONTH_FOLLOWING_DAYS: usize = 2;"),
+    ("M23", "dual_ma_crossover: fast-window off-by-one (N1+1 bars instead of N1)", "src/dual_ma_crossover.rs",
+     "let fast = &closes[closes.len() - n1..];",
+     "let fast = &closes[closes.len() - n1 - 1..];"),
+    ("M24", "day_of_week: wrong default target (Tuesday instead of Monday)", "src/day_of_week.rs",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Mon;",
+     "pub const DAY_OF_WEEK_DEFAULT_TARGET: Weekday = Weekday::Tue;"),
+    ("M25", "top_n_winners: ranking direction flipped (buys LOSERS instead of winners)", "src/top_n_winners.rs",
+     "        rb.partial_cmp(&ra)",
+     "        ra.partial_cmp(&rb)"),
+    ("M26", "donchian_breakout: wrong breakout direction (sign flip on the upper/lower comparison)", "src/donchian_breakout.rs",
+     "if close > upper {",
+     "if close < upper {"),
+    ("M27", "volume_confirmed_breakout: volume confirmation multiplier weakened (1.0x instead of 1.5x)", "src/volume_confirmed_breakout.rs",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.5;",
+     "pub const VCB_VOLUME_MULTIPLIER: f64 = 1.0;"),
+    ("M28", "momentum_rank_weighted: rank-weight direction flipped (rank 1 gets the SMALLEST weight instead of the largest)", "src/momentum_rank_weighted.rs",
+     "weights[i] = (k + 1 - r) as f64 / denom;",
+     "weights[i] = r as f64 / denom;"),
+    ("M29", "vol_target_overlay: leverage cap removed (effectively unbounded scaling factor)", "src/vol_target_overlay.rs",
+     "let scale = (target_vol / trailing_realized_vol).min(VOL_TARGET_MAX_LEVERAGE);",
+     "let scale = target_vol / trailing_realized_vol;"),
+    ("M30", "stop_loss_overlay: long-stop boundary weakened from inclusive to strict (<= changed to <)", "src/stop_loss_overlay.rs",
+     "if current_price <= stop_level {",
+     "if current_price < stop_level {"),
+    ("M31", "one_day_reversal: zero-return boundary widened from strict to inclusive (< changed to <=)", "src/one_day_reversal.rs",
+     "if yesterday_return < 0.0 {",
+     "if yesterday_return <= 0.0 {"),
+    ("M32", "five_day_reversal_zscore: off-by-one on the 60-observation window (z-scores the SECOND-to-last 5-day return, not the current/last one)", "src/five_day_reversal_zscore.rs",
+     "let current_return = returns[window - 1];",
+     "let current_return = returns[window - 2];"),
+
+    # --- W3.6 batch-2 primitives (volatility ranking, allocation, pairs/spread) --- renumbered M21-M26 -> M33-M38
+    # to resolve a real ID collision: both this batch and the batch above independently claimed M21-M26 while
+    # built in parallel, zero-shared-context, per 9.9's two-agent protocol. Content unchanged from either batch's
+    # own original definition, only the id string changed.
+    ("M33", "inverse_volatility_weight: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_volatility_weight.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
+    ("M34", "low_vol_quintile_tilt: alphabetical tie-break reversed (descending instead of ascending ticker order)",
+     "src/low_vol_quintile_tilt.rs",
+     "                .then(a.1.cmp(b.1))\n        });",
+     "                .then(b.1.cmp(a.1))\n        });"),
+    ("M35", "equal_weight_rebalance: every_bar instead of on_decision (drift never happens)",
+     "src/equal_weight_rebalance.rs",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::OnDecision\n    }",
+     "fn rebalance_policy(&self) -> RebalancePolicy {\n        RebalancePolicy::EveryBar\n    }"),
+    ("M36", "inverse_vol_risk_parity: proportional-to-vol instead of inverse (sign of the vol/weight relationship flipped)",
+     "src/inverse_vol_risk_parity.rs",
+     "inv_vol[i] = 1.0 / stdev;",
+     "inv_vol[i] = stdev;"),
+    ("M37", "pairs_zscore_meanreversion: entry legs swapped (long-A/short-B and short-A/long-B reversed)",
+     "src/pairs_zscore_meanreversion.rs",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                }",
+     "if z < -PAIRS_ENTRY_THRESHOLD {\n                    Position::ShortALongB\n                } else if z > PAIRS_ENTRY_THRESHOLD {\n                    Position::LongAShortB\n                }"),
+    ("M38", "cointegration_spread_threshold: hedge ratio refreshed every bar instead of every L bars (defeats the whole point of the primitive)",
+     "src/cointegration_spread_threshold.rs",
+     "fn refresh_point(s: usize) -> usize {\n        let l = COINT_LOOKBACK_DAYS;\n        l * (s / l)\n    }",
+     "fn refresh_point(s: usize) -> usize {\n        s\n    }"),
+    ("M39", "dual_momentum_gem: absolute momentum gate boundary weakened from non-positive to strictly negative (a flat/zero trailing SPY return wrongly clears the gate instead of holding AGG)",
+     "src/dual_momentum_gem.rs",
+     "    if spy_return <= 0.0 {",
+     "    if spy_return < 0.0 {"),
+]
+
+
+def run(cmd):
+    p = subprocess.run(cmd, shell=True, cwd=CRATE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return p.returncode, p.stdout
+
+
+def failing_tests(out):
+    names = re.findall(r"^test (.+?) \.\.\. FAILED$", out, flags=re.M)
+    seen, uniq = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def main():
+    cmd = os.environ.get("REFRULES_TEST_CMD", "cargo test --locked --no-fail-fast")
+    only = None
+    if "--only" in sys.argv:
+        only = set(sys.argv[sys.argv.index("--only") + 1].split(","))
+    code, out = run(cmd)
+    if code != 0:
+        print("BASELINE FAILED; refusing to mutate a red tree\n" + out[-3000:])
+        sys.exit(2)
+    print("baseline: green\n")
+    survived = []
+    print("| id | mutant | outcome | failing tests |")
+    print("|---|---|---|---|")
+    for mid, desc, rel, old, new in MUTANTS:
+        if only and mid not in only:
+            continue
+        path = os.path.join(CRATE, rel)
+        with open(path, "r", newline="") as f:
+            original = f.read()
+        n = original.count(old)
+        if n != 1:
+            print(f"| {mid} | {desc} | BAD MUTANT (old text occurs {n}x) | |")
+            survived.append(mid)
+            continue
+        try:
+            with open(path, "w", newline="") as f:
+                f.write(original.replace(old, new))
+            code, out = run(cmd)
+        finally:
+            with open(path, "w", newline="") as f:
+                f.write(original)
+        fails = failing_tests(out)
+        compile_err = bool(re.search(r"^error(\[E\d+\])?:", out, flags=re.M)) and "could not compile" in out
+        if fails:
+            outcome = "KILLED"
+        elif compile_err:
+            outcome = "NOT COMPILABLE (invalid mutant)"
+            survived.append(mid)
+        elif code != 0:
+            outcome = "KILLED (build/test aborted)"
+        else:
+            outcome = "SURVIVED"
+            survived.append(mid)
+        print(f"| {mid} | {desc} | {outcome} | {', '.join(fails[:8])}{' ...(+%d)' % (len(fails) - 8) if len(fails) > 8 else ''} |", flush=True)
+    print()
+    print("SURVIVORS / INVALID:", survived if survived else "none")
+    sys.exit(1 if survived else 0)
+
+
+if __name__ == "__main__":
+    main()

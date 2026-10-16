@@ -144,6 +144,65 @@ struct TickerListResponse {
     status: Option<String>,
 }
 
+/// Most pages `list_tickers` will follow. Massive's page size caps at 1000, so this bounds one call to
+/// 40,000 tickers -- comfortably above any real catalog (US stocks are ~10-12k) while still stopping a
+/// runaway cursor. Past the cap the caller gets what was collected, never an error.
+const MAX_TICKER_PAGES: usize = 40;
+
+fn ticker_rows_to_info(rows: Vec<TickerResult>) -> Vec<TickerInfo> {
+    rows.into_iter()
+        // Skip any row genuinely missing a ticker symbol -- there's nothing usable to return for it.
+        .filter_map(|r| {
+            r.ticker.map(|ticker| TickerInfo {
+                ticker,
+                name: r.name,
+                market: r.market,
+                active: r.active,
+                primary_exchange: r.primary_exchange,
+                delisted_utc: r.delisted_utc,
+                security_type: r.security_type,
+            })
+        })
+        .collect()
+}
+
+/// Collect ticker rows across `next_url` pages until `want` rows are held, the cursor runs out, or
+/// `max_pages` pages have been read; at most `want` rows are returned. Pure of I/O -- the caller supplies
+/// `fetch_next` -- so the paging rules are unit-testable without the network.
+///
+/// Why this exists (2026-09-20): `list_tickers` used to make ONE request and read only `results`, so
+/// asking for more than a page silently returned just the first 1000 tickers in Massive's default
+/// ALPHABETICAL order. The Engine's asset browser then ranked that slice by liquidity and presented the
+/// result as "the most liquid stocks": for equities it was really the most liquid of the A-prefixed
+/// slice (AAPL, AMD, AVGO, AMZN ...), and 47% of the stock symbols the agent ever backtested started
+/// with "A".
+async fn collect_ticker_pages<E, F, Fut>(
+    first: TickerListResponse,
+    want: usize,
+    max_pages: usize,
+    mut fetch_next: F,
+) -> Result<Vec<TickerResult>, E>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<TickerListResponse, E>>,
+{
+    let max_pages = max_pages.max(1);
+    let mut rows: Vec<TickerResult> = Vec::new();
+    let mut page = first;
+    for n in 0..max_pages {
+        rows.extend(page.results.take().unwrap_or_default());
+        if rows.len() >= want {
+            break;
+        }
+        match page.next_url.take() {
+            Some(next) if !next.is_empty() && n + 1 < max_pages => page = fetch_next(next).await?,
+            _ => break,
+        }
+    }
+    rows.truncate(want);
+    Ok(rows)
+}
+
 /// One contract row from `/v3/reference/options/contracts`.
 #[derive(Debug, Deserialize)]
 struct OptionContractResult {
@@ -333,6 +392,60 @@ impl MassiveDataProvider {
     ///
     /// Forex examples:
     /// - `"EUR-USD"` → `"C:EURUSD"`
+    /// Swap the base/quote currency codes of a Polygon forex ticker, e.g.
+    /// `"C:SGDUSD"` -> `"C:USDSGD"`. `None` for anything that isn't exactly
+    /// `"C:"` + 6 letters (defensive -- never guess on a shape this
+    /// function doesn't recognize).
+    ///
+    /// 2026-09-15: confirmed live in production -- `symbol_to_ticker`'s
+    /// forex branch never reorders, it only strips separators
+    /// (`"SGD-USD"` -> `"C:SGDUSD"`). Real FX market convention quotes
+    /// several currencies (JPY, CHF, SGD, NOK, SEK among them) with USD as
+    /// the base (`USD/SGD`, not `SGD/USD`) -- confirmed against this
+    /// platform's own canonical majors list (`api/metadata.rs`'s
+    /// `FOREX_MAJORS`, which stores `"USD-CHF"`, never `"CHF-USD"`). A
+    /// caller that submits the reversed order (e.g. an AI-authored
+    /// `portfolio_assets` entry that got the convention backwards) silently
+    /// produces a Polygon ticker with no real data behind it, which
+    /// `fetch()` used to report as a flat "no data" error with no hint
+    /// that a working reversed-order ticker existed the whole time. Mirrors
+    /// `broker_tradability_service.rs`'s `reversed_oanda_pair` fallback,
+    /// which already solves the identical problem for the (separate)
+    /// tradability-check path.
+    fn reverse_forex_ticker(ticker: &str) -> Option<String> {
+        let code = ticker.strip_prefix("C:")?;
+        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let (base, quote) = code.split_at(3);
+        Some(format!("C:{}{}", quote, base))
+    }
+
+    /// Invert a forex bar's OHLC prices to express the RECIPROCAL currency
+    /// pair -- e.g. turn a real `USD/SGD` bar into the implied `SGD/USD`
+    /// bar. Reciprocal is monotonically DEcreasing for positive prices, so
+    /// the bar's high and low swap under inversion (the period's highest
+    /// `USD/SGD` price is the period's LOWEST `SGD/USD` price), not just
+    /// open/close. Volume and trade count are venue/instrument metadata,
+    /// not a price, so they pass through unchanged. Used only as a
+    /// fallback when the originally-requested ticker had no data of its
+    /// own but its reversed counterpart does -- returning the reversed
+    /// ticker's RAW prices directly (instead of inverting them) would
+    /// silently hand the caller a price series moving in the opposite
+    /// direction from what they asked for, corrupting any strategy signal
+    /// computed on it.
+    fn invert_forex_bar(bar: &AggBar) -> AggBar {
+        AggBar {
+            o: 1.0 / bar.o,
+            h: 1.0 / bar.l,
+            l: 1.0 / bar.h,
+            c: 1.0 / bar.c,
+            v: bar.v,
+            n: bar.n,
+            t: bar.t,
+        }
+    }
+
     fn symbol_to_ticker(symbol: &str, asset_class: Option<&str>) -> String {
         let symbol = Self::strip_polygon_prefix(symbol.trim());
         match asset_class {
@@ -490,12 +603,43 @@ impl MassiveDataProvider {
     /// reconstructs the universe as it existed on that historical date
     /// rather than today's live catalog (see `TickerQuery::as_of`'s doc
     /// comment for the survivorship-bias rationale).
+    /// One `/v3/reference/tickers` request (the first, with query params, or a `next_url` cursor URL,
+    /// which already carries its own params). Auth is the client's default header, so a `next_url` works
+    /// as-is.
+    async fn fetch_ticker_page(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<TickerListResponse, MassiveProviderError> {
+        let resp = request.send().await.map_err(|e| MassiveProviderError::HttpError(e.to_string()))?;
+
+        let status = resp.status();
+        if status == 429 {
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(60);
+            return Err(MassiveProviderError::RateLimited { retry_after_secs: retry });
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MassiveProviderError::ApiError { status: status.as_u16(), message: body });
+        }
+        resp.json().await.map_err(|e| MassiveProviderError::ParseError(e.to_string()))
+    }
+
+    /// `query.limit` is the TOTAL number of tickers wanted: pages are 1000 at most and are followed via
+    /// `next_url` until that many are held (see `collect_ticker_pages` for why). A limit of 1000 or less
+    /// makes exactly the one request it always did. If a LATER page fails (e.g. a rate limit), what was
+    /// already collected is returned rather than an error -- a partial catalog is still useful and the
+    /// first page's failure modes are unchanged.
     async fn list_tickers_impl(
         &self,
         query: &TickerQuery,
     ) -> Result<Vec<TickerInfo>, MassiveProviderError> {
-        let limit = query.limit.clamp(1, 1000).to_string();
-        let mut params: Vec<(&str, String)> = vec![("limit", limit)];
+        let want = query.limit.max(1) as usize;
+        let mut params: Vec<(&str, String)> = vec![("limit", want.min(1000).to_string())];
         if let Some(market) = &query.market {
             params.push(("market", market.clone()));
         }
@@ -512,41 +656,20 @@ impl MassiveDataProvider {
         // reqwest's .query() builds a correctly percent-encoded query string
         // (via the `url` crate internally) -- no reason to hand-roll that.
         let url = format!("{}/v3/reference/tickers", self.base_url);
-        let resp = self.client.get(&url).query(&params).send().await
-            .map_err(|e| MassiveProviderError::HttpError(e.to_string()))?;
+        let first = self.fetch_ticker_page(self.client.get(&url).query(&params)).await?;
 
-        let status = resp.status();
-        if status == 429 {
-            let retry = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(60);
-            return Err(MassiveProviderError::RateLimited { retry_after_secs: retry });
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MassiveProviderError::ApiError { status: status.as_u16(), message: body });
-        }
+        let rows = collect_ticker_pages(first, want, MAX_TICKER_PAGES, |next_url: String| async move {
+            match self.fetch_ticker_page(self.client.get(&next_url)).await {
+                Ok(page) => Ok::<TickerListResponse, MassiveProviderError>(page),
+                Err(e) => {
+                    log::warn!("Massive ticker listing stopped early ({e}); returning what was collected so far");
+                    Ok(TickerListResponse { results: None, next_url: None, status: None })
+                }
+            }
+        })
+        .await?;
 
-        let parsed: TickerListResponse = resp.json().await
-            .map_err(|e| MassiveProviderError::ParseError(e.to_string()))?;
-
-        Ok(parsed.results.unwrap_or_default()
-            .into_iter()
-            // Skip any row genuinely missing a ticker symbol -- there's
-            // nothing usable to return for it.
-            .filter_map(|r| r.ticker.map(|ticker| TickerInfo {
-                ticker,
-                name: r.name,
-                market: r.market,
-                active: r.active,
-                primary_exchange: r.primary_exchange,
-                delisted_utc: r.delisted_utc,
-                security_type: r.security_type,
-            }))
-            .collect())
+        Ok(ticker_rows_to_info(rows))
     }
 
     /// Parse Polygon's `contract_type` string ("call"/"put") into `OptionType`.
@@ -920,6 +1043,32 @@ impl MarketDataProvider for MassiveDataProvider {
             .await
             .map_err(ProviderError::from)?;
 
+        // Forex reversed-base/quote fallback (2026-09-15) -- see
+        // `reverse_forex_ticker`/`invert_forex_bar`'s doc comments for the
+        // live production case this closes. Only attempted for forex, and
+        // only when the primary-order ticker genuinely had nothing.
+        let (bars, inverted) = if bars.is_empty() && request.asset_class.as_deref() == Some("forex") {
+            match Self::reverse_forex_ticker(&ticker) {
+                Some(reversed_ticker) => {
+                    match self.fetch_bars(&reversed_ticker, request.from, request.to, granularity).await {
+                        Ok(reversed_bars) if !reversed_bars.is_empty() => {
+                            log_info_structured!(DATALOADER_LOGGER, "DATA_FETCH_REVERSED_PAIR_FALLBACK",
+                                "symbol" => &request.symbol,
+                                "primary_ticker" => &ticker,
+                                "reversed_ticker" => &reversed_ticker,
+                                "bars" => reversed_bars.len(),
+                            );
+                            (reversed_bars, true)
+                        }
+                        _ => (Vec::new(), false),
+                    }
+                }
+                None => (Vec::new(), false),
+            }
+        } else {
+            (bars, false)
+        };
+
         if bars.is_empty() {
             log_error_structured!(DATALOADER_LOGGER, "DATA_FETCH_ERROR",
                 "symbol" => &request.symbol,
@@ -932,6 +1081,11 @@ impl MarketDataProvider for MassiveDataProvider {
                 to: request.to.to_string(),
             });
         }
+        let bars: Vec<AggBar> = if inverted {
+            bars.iter().map(Self::invert_forex_bar).collect()
+        } else {
+            bars
+        };
 
         let symbol: Arc<str> = Arc::from(request.symbol.as_str());
         let exchange: Arc<str> = Arc::from("massive");
@@ -1271,5 +1425,166 @@ mod symbol_to_ticker_tests {
         // incorrectly formatted" error for that.
         assert_eq!(MassiveDataProvider::symbol_to_ticker("C:EURUSD", Some("forex")), "C:EURUSD");
         assert_eq!(MassiveDataProvider::symbol_to_ticker("X:BTCUSD", Some("crypto")), "X:BTCUSD");
+    }
+}
+
+#[cfg(test)]
+mod reversed_forex_pair_fallback_tests {
+    use super::{AggBar, MassiveDataProvider};
+
+    #[test]
+    fn reverse_forex_ticker_swaps_base_and_quote() {
+        // The exact live production case: a submitted "SGD-USD" produces
+        // ticker "C:SGDUSD", which has no real data -- the reversed
+        // "C:USDSGD" is the ticker that actually exists.
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:SGDUSD"), Some("C:USDSGD".to_string()));
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:USDSGD"), Some("C:SGDUSD".to_string()));
+    }
+
+    #[test]
+    fn reverse_forex_ticker_rejects_non_forex_shapes() {
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("X:BTCUSD"), None, "not a forex prefix");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("AAPL"), None, "no prefix at all");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:EURUSDX"), None, "not exactly 6 letters");
+        assert_eq!(MassiveDataProvider::reverse_forex_ticker("C:EU1USD"), None, "contains a digit");
+    }
+
+    fn bar(o: f64, h: f64, l: f64, c: f64) -> AggBar {
+        AggBar { o, h, l, c, v: 1234.0, n: Some(56), t: 789 }
+    }
+
+    #[test]
+    fn invert_forex_bar_takes_reciprocals_and_swaps_high_low() {
+        // Real USD/SGD-shaped bar: opened 1.30, ranged 1.28-1.32, closed 1.31.
+        let usd_sgd = bar(1.30, 1.32, 1.28, 1.31);
+        let sgd_usd = MassiveDataProvider::invert_forex_bar(&usd_sgd);
+        assert!((sgd_usd.o - 1.0 / 1.30).abs() < 1e-12);
+        assert!((sgd_usd.c - 1.0 / 1.31).abs() < 1e-12);
+        // The period's highest USD/SGD price (1.32) is the LOWEST implied
+        // SGD/USD price, and vice versa -- reciprocal is decreasing.
+        assert!((sgd_usd.h - 1.0 / 1.28).abs() < 1e-12, "high must come from the original LOW");
+        assert!((sgd_usd.l - 1.0 / 1.32).abs() < 1e-12, "low must come from the original HIGH");
+        assert!(sgd_usd.h > sgd_usd.l, "an inverted bar must still have high >= low");
+        // Volume and trade count are metadata, not price -- unchanged.
+        assert_eq!(sgd_usd.v, usd_sgd.v);
+        assert_eq!(sgd_usd.n, usd_sgd.n);
+        assert_eq!(sgd_usd.t, usd_sgd.t);
+    }
+
+    #[test]
+    fn invert_forex_bar_is_its_own_inverse() {
+        // Inverting twice must recover the original bar (up to float
+        // precision) -- this is the real mathematical guarantee the whole
+        // fallback depends on: the platform must see the SAME implied
+        // price series whichever order the real data actually came back
+        // in.
+        let original = bar(1.30, 1.32, 1.28, 1.31);
+        let twice = MassiveDataProvider::invert_forex_bar(&MassiveDataProvider::invert_forex_bar(&original));
+        assert!((twice.o - original.o).abs() < 1e-9);
+        assert!((twice.h - original.h).abs() < 1e-9);
+        assert!((twice.l - original.l).abs() < 1e-9);
+        assert!((twice.c - original.c).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod ticker_pagination_tests {
+    use super::*;
+
+    // ---- ticker pagination (2026-09-20) ----
+
+    fn ticker_row(n: usize) -> TickerResult {
+        TickerResult {
+            ticker: Some(format!("T{n:05}")),
+            name: None,
+            market: None,
+            active: Some(true),
+            primary_exchange: None,
+            delisted_utc: None,
+            security_type: None,
+        }
+    }
+
+    /// A page of `count` rows starting at index `from`, optionally pointing at a next page.
+    fn page(from: usize, count: usize, next: Option<&str>) -> TickerListResponse {
+        TickerListResponse {
+            results: Some((from..from + count).map(ticker_row).collect()),
+            next_url: next.map(String::from),
+            status: Some("OK".to_string()),
+        }
+    }
+
+    /// Serves pages by cursor name and records which cursors were requested.
+    fn fake_pages(
+        pages: Vec<(&'static str, TickerListResponse)>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        impl FnMut(String) -> std::future::Ready<Result<TickerListResponse, String>>,
+    ) {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requested.clone();
+        let mut by_cursor: std::collections::HashMap<&'static str, TickerListResponse> = pages.into_iter().collect();
+        (requested, move |cursor: String| {
+            log.lock().unwrap().push(cursor.clone());
+            std::future::ready(by_cursor.remove(cursor.as_str()).ok_or_else(|| format!("unexpected cursor {cursor}")))
+        })
+    }
+
+    #[tokio::test]
+    async fn one_page_is_enough_when_the_limit_fits_and_no_cursor_is_followed() {
+        let (requested, fetch) = fake_pages(vec![]);
+        let rows = collect_ticker_pages(page(0, 500, Some("p2")), 500, 40, fetch).await.unwrap();
+        assert_eq!(rows.len(), 500);
+        assert!(requested.lock().unwrap().is_empty(), "the limit was met by the first page, so no cursor may be followed");
+    }
+
+    #[tokio::test]
+    async fn pages_are_followed_until_the_limit_is_met_then_truncated() {
+        let (requested, fetch) = fake_pages(vec![("p2", page(1000, 1000, Some("p3"))), ("p3", page(2000, 1000, Some("p4")))]);
+        let rows = collect_ticker_pages(page(0, 1000, Some("p2")), 2500, 40, fetch).await.unwrap();
+        assert_eq!(rows.len(), 2500, "must reach past the first 1000 (the old behaviour stopped there)");
+        assert_eq!(rows.last().unwrap().ticker.as_deref(), Some("T02499"));
+        assert_eq!(*requested.lock().unwrap(), vec!["p2", "p3"], "p4 must not be requested once 2500 rows are held");
+    }
+
+    #[tokio::test]
+    async fn the_whole_catalog_is_returned_when_it_is_smaller_than_the_limit() {
+        let (_r, fetch) = fake_pages(vec![("p2", page(1000, 1000, Some("p3"))), ("p3", page(2000, 700, None))]);
+        let rows = collect_ticker_pages(page(0, 1000, Some("p2")), 20_000, 40, fetch).await.unwrap();
+        assert_eq!(rows.len(), 2700, "a catalog smaller than the limit ends at its own last page");
+    }
+
+    #[tokio::test]
+    async fn the_page_cap_stops_a_runaway_cursor_and_returns_what_was_collected() {
+        // every page points at another: only the cap can stop it
+        let (requested, fetch) = fake_pages(vec![
+            ("p2", page(1000, 1000, Some("p3"))), ("p3", page(2000, 1000, Some("p4"))), ("p4", page(3000, 1000, Some("p5"))),
+        ]);
+        let rows = collect_ticker_pages(page(0, 1000, Some("p2")), 1_000_000, 3, fetch).await.unwrap();
+        assert_eq!(rows.len(), 3000, "3 pages x 1000");
+        assert_eq!(requested.lock().unwrap().len(), 2, "the first page was given, so a cap of 3 fetches 2 more");
+    }
+
+    #[tokio::test]
+    async fn an_empty_next_url_ends_paging() {
+        let (requested, fetch) = fake_pages(vec![]);
+        let rows = collect_ticker_pages(page(0, 300, Some("")), 5000, 40, fetch).await.unwrap();
+        assert_eq!(rows.len(), 300);
+        assert!(requested.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_later_page_propagates_from_the_collector_so_the_caller_can_decide() {
+        let (_r, fetch) = fake_pages(vec![]); // "p2" is not served -> the fake errors
+        let err = collect_ticker_pages(page(0, 1000, Some("p2")), 5000, 40, fetch).await.unwrap_err();
+        assert!(err.contains("unexpected cursor p2"), "{err}");
+    }
+
+    #[test]
+    fn rows_without_a_ticker_are_dropped_and_the_rest_mapped() {
+        let mut blank = ticker_row(1);
+        blank.ticker = None;
+        let info = ticker_rows_to_info(vec![ticker_row(0), blank, ticker_row(2)]);
+        assert_eq!(info.iter().map(|i| i.ticker.as_str()).collect::<Vec<_>>(), vec!["T00000", "T00002"]);
     }
 }
