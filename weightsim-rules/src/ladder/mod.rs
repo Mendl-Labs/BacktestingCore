@@ -605,10 +605,8 @@ pub fn run_ladder_with(fx: &Fixtures, opts: &LadderOptions) -> Result<LadderRepo
 
     // Tier IV: the mutants in the amendment's table order (`Mutant::ALL`), each against its own sleeve's key.
     let mut mutant_reports = Vec::new();
-    let set_mutants: Vec<Mutant> = Mutant::ALL
-        .into_iter()
-        .filter(|m| registry.by_sleeve(m.sleeve()).is_ok_and(|e| e.set == fx.set))
-        .collect();
+    let set_mutants: Vec<Mutant> =
+        Mutant::ALL.into_iter().filter(|m| registry.by_sleeve(m.sleeve()).is_ok_and(|e| e.set == fx.set)).collect();
     for m in set_mutants.iter().copied() {
         let key =
             registry.by_sleeve(m.sleeve()).map_err(|e| LadderError::Inconsistent(e.to_string()))?.fixture(fx)?.key;
