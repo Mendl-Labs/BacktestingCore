@@ -129,8 +129,8 @@ pub use dual_momentum_gem::{
 pub use equal_weight_rebalance::{EqualWeightRebalanceRule, EQUAL_WEIGHT_REBALANCE_SYMBOLS};
 pub use error::RuleError;
 pub use etf::{
-    decide_etf_trend, decide_etf_trend_with, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
-    ETF_WEIGHT_PER_INSTRUMENT,
+    decide_etf_trend, decide_etf_trend_with, decide_etf_trend_with_weight, ETF_SMA_MONTH_ENDS,
+    ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
 };
 pub use fingerprint::data_fingerprint;
 pub use five_day_reversal_zscore::{

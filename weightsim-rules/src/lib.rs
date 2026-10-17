@@ -32,4 +32,7 @@
 pub mod adapters;
 pub mod ladder;
 
-pub use adapters::{from_naive, map_rule_error, to_naive, CryptoTrendRule, EtfTrendRule, FlatUntil, ADAPTER_VERSION};
+pub use adapters::{
+    from_naive, map_rule_error, to_naive, CryptoTrendRule, EtfTrendRule, FlatUntil, WeightPolicy, ADAPTER_VERSION,
+    ETF_EQUAL_OVER_N_MIN_UNIVERSE,
+};
