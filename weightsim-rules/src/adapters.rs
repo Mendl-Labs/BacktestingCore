@@ -23,9 +23,9 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
 use reference_rules::{
-    decide_crypto_trend_with, decide_etf_trend_with_weight, GapPolicy, MomentumRankWeighted, MonthEndMode, Options,
-    Panel as RrPanel, PriceSeries, RankWeightedRanking, RuleError, CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS,
-    CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
+    decide_crypto_trend_with, decide_etf_trend_with_weight, DualMomentumGemRule, GapPolicy, MomentumRankWeighted,
+    MonthEndMode, Options, Panel as RrPanel, PriceSeries, RankWeightedRanking, RuleError, CRYPTO_SMA_DAYS,
+    CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
     MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, HistoryView, RebalancePolicy, RefusalKind, RuleRefusal, WeightRule};
@@ -494,6 +494,54 @@ impl WeightRule for MomentumRankWeightedRule {
             ("rebalance_policy", "\"on_decision\"".to_string()),
             ("max_weight_per_instrument", (k / (k * (k + 1.0) / 2.0)).to_string()),
         ])
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        self.inner.decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.inner.rebalance_policy()
+    }
+    fn min_history_bars(&self) -> usize {
+        self.inner.min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        self.inner.target_weights(h)
+    }
+}
+
+/// `dual_momentum_gem` (Amendment 16, library entry `etf_dual_relative_momentum`): the compiled
+/// `reference_rules::DualMomentumGemRule` over SPY, EFA and AGG. At each month-end, if SPY's trailing 12-month-end
+/// return is positive the sleeve holds whichever of SPY and EFA returned more (an exact tie goes to EFA), otherwise AGG;
+/// exactly one of the three is held at 100%.
+///
+/// The reference rule already IS a `WeightRule`, so this adapter only stamps the adapter version on the run and adds
+/// the one parameter the library entry pins beyond the rule's own four (`max_weight_per_instrument`, written with
+/// `{:?}` so the JSON literal is the float `1.0` exactly as the entry declares it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DualMomentumGemAdapter {
+    inner: DualMomentumGemRule,
+}
+
+impl DualMomentumGemAdapter {
+    pub fn new() -> Self {
+        DualMomentumGemAdapter::default()
+    }
+}
+
+impl WeightRule for DualMomentumGemAdapter {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn impl_version(&self) -> String {
+        ADAPTER_VERSION.to_string()
+    }
+    fn universe(&self) -> &[&'static str] {
+        self.inner.universe()
+    }
+    fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
+        let mut p = self.inner.declared_parameters();
+        p.insert("max_weight_per_instrument", format!("{:?}", 1.0_f64));
+        p
     }
     fn decision_schedule(&self) -> DecisionSchedule {
         self.inner.decision_schedule()

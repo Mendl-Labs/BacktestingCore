@@ -23,18 +23,34 @@
 //! | `momentum_lookback_off_by_one` | the real rule with `L = 125` (`close_(t-125)` instead of `close_(t-126)`) |
 //! | `momentum_half_sizing` | wrapper rule: the rank weights times 0.5 (50% cash) |
 //! | `momentum_equal_weight_not_rank_weight` | the real ranking's eligibility with `1/K` for every eligible instrument instead of `(K+1-r)/(K(K+1)/2)` |
+//!
+//! The five mutants of the GEM evidence set (Amendment 16 section 6, T4; sleeve `S6`, rule `dual_momentum_gem`) are
+//! listed in [`Mutant::GEM`]. Each is built so that it provably differs from the rule on a window in which the rule
+//! visits all three of its holdings (the Amendment's branch-coverage pre-check, T0), and none is equivalent to the
+//! rule by mathematics (the Amendment 15 `ddof` lesson):
+//!
+//! | mutant | how it is built here |
+//! |---|---|
+//! | `gem_lookahead_peek` | wrapper rule that evaluates the rule at the NEXT month-end close (its own copy of the panel) instead of the current one |
+//! | `gem_extra_1day_delay` | configuration: `execution_delay_bars = 1` |
+//! | `gem_lookback_off_by_one` | independent rule with an 11-month instead of a 12-month trailing return |
+//! | `gem_relative_pick_inverted` | independent rule that holds the LOWER of SPY and EFA when the gate is open (an exact tie goes to SPY, the rule's goes to EFA) |
+//! | `gem_gate_always_open` | independent rule that skips the absolute-momentum gate, so it never holds AGG |
 
 use weightsim::{
-    DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
+    Date, DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
 };
 
-use reference_rules::{CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, ETF_SYMBOLS, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK};
+use reference_rules::{
+    CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, DUAL_MOMENTUM_GEM_SYMBOLS, DUAL_MOMENTUM_GEM_TRAILING_MONTHS, ETF_SYMBOLS,
+    MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+};
 
 use super::checks::SeriesRows;
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
 use super::registry::FixtureSetId;
 use super::runner::{rows_from_sim, run_gross};
-use crate::adapters::{crypto_weights, CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{crypto_weights, CryptoTrendRule, DualMomentumGemAdapter, EtfTrendRule, MomentumRankWeightedRule};
 
 /// The eight mutants, in the order of the amendment's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +69,12 @@ pub enum Mutant {
     S4LookbackOffByOne,
     S4HalfSizing,
     S4EqualWeight,
+    // The GEM evidence set (Amendment 16 section 6, T4), in the amendment's order.
+    S6LookaheadPeek,
+    S6ExtraDelay,
+    S6LookbackOffByOne,
+    S6RelativePickInverted,
+    S6GateAlwaysOpen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +83,8 @@ pub enum MutantSleeve {
     S3,
     /// `momentum_rank_weighted` in the `MomentumEvidence` fixture set.
     S4,
+    /// `dual_momentum_gem` in the `GemEvidence` fixture set. (`S5` is reserved for the low-vol evidence set.)
+    S6,
 }
 
 impl MutantSleeve {
@@ -70,6 +94,7 @@ impl MutantSleeve {
             MutantSleeve::S1 => "S1",
             MutantSleeve::S3 => "S3",
             MutantSleeve::S4 => "S4",
+            MutantSleeve::S6 => "S6",
         }
     }
 
@@ -78,6 +103,7 @@ impl MutantSleeve {
             "S1" => Some(MutantSleeve::S1),
             "S3" => Some(MutantSleeve::S3),
             "S4" => Some(MutantSleeve::S4),
+            "S6" => Some(MutantSleeve::S6),
             _ => None,
         }
     }
@@ -104,12 +130,22 @@ impl Mutant {
         Mutant::S4EqualWeight,
     ];
 
+    /// The five mutants of the GEM evidence set (sleeve `S6`), in the order of Amendment 16 section 6 (T4).
+    pub const GEM: [Mutant; 5] = [
+        Mutant::S6LookaheadPeek,
+        Mutant::S6ExtraDelay,
+        Mutant::S6LookbackOffByOne,
+        Mutant::S6RelativePickInverted,
+        Mutant::S6GateAlwaysOpen,
+    ];
+
     /// The mutants of one fixture set, in table order: what its ladder runs in Tier IV. [`Mutant::ALL`] is the
     /// legacy set's eight, unchanged.
     pub fn of_set(set: FixtureSetId) -> &'static [Mutant] {
         match set {
             FixtureSetId::Legacy => &Mutant::ALL,
             FixtureSetId::MomentumEvidence => &Mutant::MOMENTUM,
+            FixtureSetId::GemEvidence => &Mutant::GEM,
         }
     }
 
@@ -129,6 +165,11 @@ impl Mutant {
             Mutant::S4LookbackOffByOne => "momentum_lookback_off_by_one",
             Mutant::S4HalfSizing => "momentum_half_sizing",
             Mutant::S4EqualWeight => "momentum_equal_weight_not_rank_weight",
+            Mutant::S6LookaheadPeek => "gem_lookahead_peek",
+            Mutant::S6ExtraDelay => "gem_extra_1day_delay",
+            Mutant::S6LookbackOffByOne => "gem_lookback_off_by_one",
+            Mutant::S6RelativePickInverted => "gem_relative_pick_inverted",
+            Mutant::S6GateAlwaysOpen => "gem_gate_always_open",
         }
     }
 
@@ -140,6 +181,11 @@ impl Mutant {
             | Mutant::S4LookbackOffByOne
             | Mutant::S4HalfSizing
             | Mutant::S4EqualWeight => MutantSleeve::S4,
+            Mutant::S6LookaheadPeek
+            | Mutant::S6ExtraDelay
+            | Mutant::S6LookbackOffByOne
+            | Mutant::S6RelativePickInverted
+            | Mutant::S6GateAlwaysOpen => MutantSleeve::S6,
             _ => MutantSleeve::S3,
         }
     }
@@ -161,6 +207,11 @@ impl Mutant {
             Mutant::S4LookbackOffByOne => "trailing return over 125 bars instead of 126",
             Mutant::S4HalfSizing => "rank weights halved, 50% cash",
             Mutant::S4EqualWeight => "1/K for every ranked instrument instead of the linear rank weights",
+            Mutant::S6LookaheadPeek => "decides on the next month-end's closes instead of the current one's",
+            Mutant::S6ExtraDelay => "one extra day between decision and fill",
+            Mutant::S6LookbackOffByOne => "11-month trailing return instead of 12",
+            Mutant::S6RelativePickInverted => "holds the lower of SPY and EFA instead of the higher",
+            Mutant::S6GateAlwaysOpen => "no absolute-momentum gate: never holds AGG",
         }
     }
 }
@@ -416,6 +467,125 @@ impl WeightRule for EqualWeightMomentum {
     }
 }
 
+/// Indices of the month-end bars of `dates`: a bar is a month-end if it is the last bar or the next bar falls in a
+/// different calendar month. A deliberately independent re-statement of the rule's own predicate, used by the GEM
+/// mutants that need to decide on data the rule is not given or with one thing changed.
+fn gem_month_ends(dates: &[Date]) -> Vec<usize> {
+    let n = dates.len();
+    (0..n).filter(|t| *t + 1 == n || !dates[*t].same_month(dates[*t + 1])).collect()
+}
+
+/// GEM weights `[SPY, EFA, AGG]` from raw close slices (each ending at the decision bar) with `trailing_months`
+/// month-end-to-month-end returns. `invert_relative` holds the LOWER of SPY and EFA when the gate is open (an exact tie
+/// then goes to SPY); `gate_open` skips the absolute-momentum gate. With both off and 12 months it is the rule.
+fn gem_weights(
+    spy: &[f64],
+    efa: &[f64],
+    dates: &[Date],
+    trailing_months: usize,
+    invert_relative: bool,
+    gate_open: bool,
+) -> Result<Vec<f64>, RuleRefusal> {
+    let ends = gem_month_ends(dates);
+    let need = trailing_months + 1;
+    if ends.len() < need {
+        return Err(RuleRefusal::warmup(format!("need {need} month-end closes, have {}", ends.len())));
+    }
+    let now = ends[ends.len() - 1];
+    let then = ends[ends.len() - need];
+    let spy_ret = spy[now] / spy[then] - 1.0;
+    let efa_ret = efa[now] / efa[then] - 1.0;
+    if !spy_ret.is_finite() || !efa_ret.is_finite() {
+        return Err(RuleRefusal::data("non_finite_trailing_return", "trailing return is non-finite"));
+    }
+    if !gate_open && spy_ret <= 0.0 {
+        return Ok(vec![0.0, 0.0, 1.0]);
+    }
+    let rule_picks_efa = efa_ret >= spy_ret;
+    let picks_efa = if invert_relative { !rule_picks_efa } else { rule_picks_efa };
+    Ok(if picks_efa { vec![0.0, 1.0, 0.0] } else { vec![1.0, 0.0, 0.0] })
+}
+
+/// GEM rule with one thing changed: its trailing window, the direction of the SPY/EFA choice, or the gate. Everything
+/// else (universe, month-end schedule, rebalance on decision) is the real rule's.
+pub struct GemVariant {
+    pub name: &'static str,
+    pub trailing_months: usize,
+    pub invert_relative: bool,
+    pub gate_open: bool,
+}
+
+impl WeightRule for GemVariant {
+    fn id(&self) -> &'static str {
+        self.name
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        &DUAL_MOMENTUM_GEM_SYMBOLS
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        DecisionSchedule::LastBarOfMonth
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::OnDecision
+    }
+    fn min_history_bars(&self) -> usize {
+        1
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        gem_weights(h.closes(0), h.closes(1), h.dates(), self.trailing_months, self.invert_relative, self.gate_open)
+    }
+}
+
+/// GEM rule that peeks: at the month-end close of bar `t` it decides on the closes through the NEXT month-end of its
+/// own copy of the panel (or through `t` itself when there is none). That is exactly what a leaky rule looks like.
+pub struct PeekGem {
+    full: Panel,
+}
+
+impl PeekGem {
+    pub fn new(panel: &Panel) -> PeekGem {
+        PeekGem { full: panel.clone() }
+    }
+}
+
+impl WeightRule for PeekGem {
+    fn id(&self) -> &'static str {
+        "mutant_gem_lookahead_peek"
+    }
+    fn impl_version(&self) -> String {
+        "mutant".into()
+    }
+    fn universe(&self) -> &[&'static str] {
+        &DUAL_MOMENTUM_GEM_SYMBOLS
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        DecisionSchedule::LastBarOfMonth
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        RebalancePolicy::OnDecision
+    }
+    fn min_history_bars(&self) -> usize {
+        1
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        let t = h.len() - 1;
+        let dates = self.full.dates();
+        let next_month_end = gem_month_ends(dates).into_iter().find(|e| *e > t).unwrap_or(t);
+        let end = (next_month_end + 1).min(self.full.n_bars());
+        gem_weights(
+            &self.full.closes(0)[..end],
+            &self.full.closes(1)[..end],
+            &dates[..end],
+            DUAL_MOMENTUM_GEM_TRAILING_MONTHS,
+            false,
+            false,
+        )
+    }
+}
+
 /// Two independent sub-accounts of 0.5 each, invested in a coin (whole account) when its base-run target is on and
 /// never rebalanced back to 50/50. Returns are those of the summed equity, over the sleeve's counted window.
 fn drifting_subaccounts(panel: &Panel, base: &SimResult, key: &SleeveKey) -> Result<SeriesRows, LadderError> {
@@ -531,6 +701,35 @@ pub fn run_mutant_on(panel: &Panel, key: &SleeveKey, m: Mutant) -> Result<Mutant
         }
         Mutant::S4EqualWeight => {
             let rule = EqualWeightMomentum { inner: MomentumRankWeightedRule::default() };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S6LookaheadPeek => from_sim(&run_gross(panel, &PeekGem::new(panel), key, 0)?, key),
+        Mutant::S6ExtraDelay => from_sim(&run_gross(panel, &DualMomentumGemAdapter::default(), key, 1)?, key),
+        Mutant::S6LookbackOffByOne => {
+            let rule = GemVariant {
+                name: "mutant_gem_lookback_off_by_one",
+                trailing_months: DUAL_MOMENTUM_GEM_TRAILING_MONTHS - 1,
+                invert_relative: false,
+                gate_open: false,
+            };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S6RelativePickInverted => {
+            let rule = GemVariant {
+                name: "mutant_gem_relative_pick_inverted",
+                trailing_months: DUAL_MOMENTUM_GEM_TRAILING_MONTHS,
+                invert_relative: true,
+                gate_open: false,
+            };
+            from_sim(&run_gross(panel, &rule, key, 0)?, key)
+        }
+        Mutant::S6GateAlwaysOpen => {
+            let rule = GemVariant {
+                name: "mutant_gem_gate_always_open",
+                trailing_months: DUAL_MOMENTUM_GEM_TRAILING_MONTHS,
+                invert_relative: false,
+                gate_open: true,
+            };
             from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
     }
