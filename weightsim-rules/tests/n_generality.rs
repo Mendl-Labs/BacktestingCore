@@ -118,5 +118,5 @@ fn the_default_policy_run_is_unchanged_and_equal_over_n_at_five_reproduces_it() 
     assert_eq!(equal.held_weights, published.held_weights);
     assert_eq!(equal.ret, published.ret);
     assert_eq!(equal.equity, published.equity);
-    assert!(published.target_weights.iter().any(|w| *w == 0.2), "the published run holds something");
+    assert!(published.target_weights.contains(&0.2), "the published run holds something");
 }

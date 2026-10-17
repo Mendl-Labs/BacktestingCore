@@ -510,7 +510,10 @@ mod tests {
             let rank = beaten_by + 1;
             weights[i] = (k + 1 - rank) as f64 / ((k * (k + 1) / 2) as f64);
         }
-        let excluded = (0..n).filter(|&i| ticks[i].len() <= l).map(|i| names[i]).collect();
+        let excluded = (0..n)
+            .filter(|&i| ticks[i].len() <= l)
+            .map(|i| names[i])
+            .collect();
         (weights, excluded)
     }
 
@@ -578,7 +581,10 @@ mod tests {
         let k = ticks.iter().filter(|c| c.len() > l).count();
         assert_eq!(r.excluded.len(), ticks.len() - k, "{tag}");
         if k == 0 {
-            assert!(r.weights.iter().all(|w| *w == 0.0), "{tag}: K = 0 is all zero");
+            assert!(
+                r.weights.iter().all(|w| *w == 0.0),
+                "{tag}: K = 0 is all zero"
+            );
             return;
         }
         let denom = (k * (k + 1) / 2) as f64;
@@ -596,10 +602,20 @@ mod tests {
             }
         }
         numerators.sort_unstable();
-        assert_eq!(numerators, (1..=k as i64).collect::<Vec<_>>(), "{tag}: ranks 1..=K once each");
-        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12, "{tag}: gross is 100%");
+        assert_eq!(
+            numerators,
+            (1..=k as i64).collect::<Vec<_>>(),
+            "{tag}: ranks 1..=K once each"
+        );
+        assert!(
+            (r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+            "{tag}: gross is 100%"
+        );
         let top = r.weights.iter().cloned().fold(0.0_f64, f64::max);
-        assert!((top - 2.0 / (k as f64 + 1.0)).abs() < 1e-12, "{tag}: top weight is 2/(K+1)");
+        assert!(
+            (top - 2.0 / (k as f64 + 1.0)).abs() < 1e-12,
+            "{tag}: top weight is 2/(K+1)"
+        );
     }
 
     #[test]
@@ -627,7 +643,10 @@ mod tests {
         }
         // The scenarios cover what the attestation claims: K = N at each of N = 5, 9 and 11,
         // short-history exclusions in the scenarios, and (copied/doubled columns) exact ties.
-        assert!(k_seen[5] && k_seen[9] && k_seen[11], "K = N occurs: {k_seen:?}");
+        assert!(
+            k_seen[5] && k_seen[9] && k_seen[11],
+            "K = N occurs: {k_seen:?}"
+        );
         assert!(with_exclusion > 100, "exclusions: {with_exclusion}");
         assert!(with_tie > 50, "exact ties: {with_tie}");
     }
@@ -649,7 +668,12 @@ mod tests {
             let denom = (n * (n + 1) / 2) as f64;
             for (rank_minus_one, &i) in by_ticker.iter().enumerate() {
                 let want = (n - rank_minus_one) as f64 / denom;
-                assert_eq!(r.weights[i].to_bits(), want.to_bits(), "N = {n}, {}", TICKERS[i]);
+                assert_eq!(
+                    r.weights[i].to_bits(),
+                    want.to_bits(),
+                    "N = {n}, {}",
+                    TICKERS[i]
+                );
             }
         }
     }
@@ -674,7 +698,10 @@ mod tests {
                 let want = (k + 1 - rank) as f64 / denom;
                 assert_eq!(r.weights[i].to_bits(), want.to_bits(), "K = {k}, asset {i}");
             }
-            assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12, "K = {k}");
+            assert!(
+                (r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+                "K = {k}"
+            );
             let top = r.weights.iter().cloned().fold(0.0_f64, f64::max);
             assert!((top - 2.0 / (k as f64 + 1.0)).abs() < 1e-12, "K = {k}");
         }
