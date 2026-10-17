@@ -155,8 +155,8 @@ pub use low_vol_quintile_tilt::{
     LOW_VOL_QUINTILE_SYMBOLS,
 };
 pub use momentum_rank_weighted::{
-    MomentumRankWeighted, RankWeightedRanking, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
-    MOMENTUM_RANK_WEIGHTED_VERSION,
+    momentum_rank_weights, MomentumRankWeighted, MomentumRankWeights, RankWeightedRanking,
+    MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK, MOMENTUM_RANK_WEIGHTED_VERSION,
 };
 pub use months::{
     completed_month_end_dates, is_calendar_month_end, latest_decision_date, month_end_dates,

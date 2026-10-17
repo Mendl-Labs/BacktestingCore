@@ -150,17 +150,32 @@ pub(crate) fn rank_weighted(
     universe: &[&'static str],
     lookback: usize,
 ) -> RankWeightedRanking {
+    let (weights, excluded) = rank_weighted_core(closes_by_asset, universe, lookback);
+    RankWeightedRanking {
+        weights,
+        excluded: excluded.into_iter().map(|i| universe[i]).collect(),
+    }
+}
+
+/// The ranking body shared by the rule ([`rank_weighted`], `'static` tickers) and the public pure entry point
+/// [`momentum_rank_weights`] (any tickers): returns the weights aligned to `tickers` and the indices (in input
+/// order) of the excluded assets. ONE implementation, so the two can never disagree.
+fn rank_weighted_core(
+    closes_by_asset: &[&[f64]],
+    tickers: &[&str],
+    lookback: usize,
+) -> (Vec<f64>, Vec<usize>) {
     assert_eq!(
         closes_by_asset.len(),
-        universe.len(),
+        tickers.len(),
         "momentum_rank_weighted: one close slice per universe asset"
     );
-    let mut weights = vec![0.0; universe.len()];
+    let mut weights = vec![0.0; tickers.len()];
     let mut excluded = Vec::new();
     let mut candidates: Vec<(usize, f64)> = Vec::new();
     for (i, &closes) in closes_by_asset.iter().enumerate() {
         if closes.len() < lookback + 1 {
-            excluded.push(universe[i]);
+            excluded.push(i);
             continue;
         }
         let last = *closes.last().expect("closes.len() >= lookback + 1 >= 2");
@@ -172,7 +187,7 @@ pub(crate) fn rank_weighted(
     candidates.sort_by(|&(ia, ra), &(ib, rb)| {
         rb.partial_cmp(&ra)
             .expect("trailing returns are finite: computed from finite positive closes")
-            .then_with(|| universe[ia].cmp(universe[ib]))
+            .then_with(|| tickers[ia].cmp(tickers[ib]))
     });
     let k = candidates.len();
     if k > 0 {
@@ -182,7 +197,38 @@ pub(crate) fn rank_weighted(
             weights[i] = (k + 1 - r) as f64 / denom;
         }
     }
-    RankWeightedRanking { weights, excluded }
+    (weights, excluded)
+}
+
+/// Result of [`momentum_rank_weights`]: `weights` aligned to the input tickers, `excluded` the input indices (in
+/// input order) of the assets with fewer than `lookback + 1` closes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MomentumRankWeights {
+    pub weights: Vec<f64>,
+    pub excluded: Vec<usize>,
+}
+
+/// The `momentum_rank_weighted` ranking as a PURE function of closes, for callers that have no
+/// `weightsim::HistoryView` (a live runtime holding a validated price panel). `closes_by_asset[i]` is asset `i`'s
+/// causal close slice ending at the decision bar, `tickers[i]` its ticker (tie-break: ascending alphabetical), the
+/// same inputs [`MomentumRankWeighted::rank`] feeds the rule from `HistoryView::closes(i)`. Weights, tie-break,
+/// exclusion and denominator are the rule's own: both call one implementation, and a test pins them bit for bit.
+///
+/// Closes must be finite and positive (a `Panel` guarantees it); `lookback` must be >= 1.
+///
+/// # Panics
+/// If `closes_by_asset.len() != tickers.len()`, `lookback == 0`, or a trailing return is not finite.
+pub fn momentum_rank_weights(
+    closes_by_asset: &[&[f64]],
+    tickers: &[&str],
+    lookback: usize,
+) -> MomentumRankWeights {
+    assert!(
+        lookback >= 1,
+        "momentum_rank_weights: lookback L must be >= 1, got {lookback}"
+    );
+    let (weights, excluded) = rank_weighted_core(closes_by_asset, tickers, lookback);
+    MomentumRankWeights { weights, excluded }
 }
 
 impl WeightRule for MomentumRankWeighted {
@@ -741,5 +787,48 @@ mod tests {
             }
             assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn the_pure_entry_point_is_bit_identical_to_the_rule_at_n_5_9_and_11() {
+        let mut rng = Lcg(0xA11CE);
+        for n in [5usize, 9, 11] {
+            let names: Vec<&'static str> = TICKERS[..n].to_vec();
+            for _ in 0..40 {
+                let ticks = scenario(&mut rng, n, L, 12);
+                let closes: Vec<Vec<f64>> = ticks.iter().map(|c| to_closes(c)).collect();
+                let rule = rank_weighted(&slices(&closes), &names, L);
+                let pure = momentum_rank_weights(&slices(&closes), &names, L);
+                assert_eq!(pure.weights.len(), rule.weights.len());
+                for (a, b) in pure.weights.iter().zip(&rule.weights) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                let pure_names: Vec<&str> = pure.excluded.iter().map(|&i| names[i]).collect();
+                assert_eq!(pure_names, rule.excluded);
+            }
+        }
+    }
+
+    #[test]
+    fn the_pure_entry_point_takes_owned_tickers_and_handles_ties_and_exclusion() {
+        let tickers = vec!["ZZZ".to_string(), "AAA".to_string(), "NEW".to_string()];
+        let refs: Vec<&str> = tickers.iter().map(String::as_str).collect();
+        // ZZZ and AAA tie exactly (both +30% over 3 bars): ascending ticker puts AAA at rank 1; NEW has too little history.
+        let closes = vec![
+            vec![100.0, 110.0, 120.0, 130.0],
+            vec![100.0, 105.0, 120.0, 130.0],
+            vec![50.0, 51.0],
+        ];
+        let r = momentum_rank_weights(&slices(&closes), &refs, L);
+        assert_eq!(r.excluded, vec![2]);
+        assert_eq!(r.weights, vec![1.0 / 3.0, 2.0 / 3.0, 0.0]);
+        let none = momentum_rank_weights(&slices(&[vec![1.0], vec![2.0]]), &["A", "B"], L);
+        assert_eq!((none.weights, none.excluded), (vec![0.0, 0.0], vec![0, 1]));
+    }
+
+    #[test]
+    #[should_panic(expected = "lookback L must be >= 1")]
+    fn the_pure_entry_point_refuses_a_zero_lookback() {
+        let _ = momentum_rank_weights(&[&[1.0, 2.0][..]], &["A"], 0);
     }
 }
