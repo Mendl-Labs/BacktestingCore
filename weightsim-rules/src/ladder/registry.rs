@@ -28,7 +28,7 @@ use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 use super::fixtures::{Fixtures, LadderError, RecordedMetrics, SleeveKey};
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
-use crate::adapters::{CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{CryptoTrendEvidenceRule, CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
 
 /// What a rule's signal reads. The sampling of the signal is the rule's decision schedule ([`CadenceSpec::decision`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,11 +96,17 @@ pub enum FixtureSetId {
     /// `etf_cross_sectional_momentum` (rule `momentum_rank_weighted`, sleeve `S4`), pinned on its own. Its pins are the
     /// caller's (the Engine's `certified.rs`); they are not constants of this crate.
     MomentumEvidence,
+    /// `replication_ladder_crypto_evidence/` (Amendment 13): the evidence window (2020-03-16 to 2026-10-03) of
+    /// `crypto_trend_100d`, certified by the rule `crypto_trend_100d_evidence` (the very same compiled rule as the
+    /// legacy S3, see `CryptoTrendEvidenceRule`) on sleeve `S3e`. Its pins are the caller's (the Engine's
+    /// `certified.rs`); they are not constants of this crate. The legacy set's S3 registration is untouched.
+    CryptoEvidence,
 }
 
 impl FixtureSetId {
     /// Every fixture set, in table order.
-    pub const ALL: [FixtureSetId; 2] = [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence];
+    pub const ALL: [FixtureSetId; 3] =
+        [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence, FixtureSetId::CryptoEvidence];
 }
 
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
@@ -230,8 +236,12 @@ fn make_momentum() -> Box<dyn WeightRule> {
     Box::new(MomentumRankWeightedRule::default())
 }
 
+fn make_crypto_evidence() -> Box<dyn WeightRule> {
+    Box::new(CryptoTrendEvidenceRule::default())
+}
+
 /// The reviewed table. Order matters: it is the order sleeves are run and reported in, which the ladder digest covers.
-pub const LIBRARY_RULES: [RegisteredRule; 3] = [
+pub const LIBRARY_RULES: [RegisteredRule; 4] = [
     RegisteredRule {
         id: "etf_trend_faber",
         spec: RuleSpec {
@@ -314,6 +324,38 @@ pub const LIBRARY_RULES: [RegisteredRule; 3] = [
         ],
         canaries: &[],
     },
+    // Amendment 13: `crypto_trend_100d` on the evidence window, in its own fixture set, as a NEW sleeve (`S3e`) of the
+    // same compiled rule under the id `crypto_trend_100d_evidence`. The spec is the legacy S3's, so this entry shares
+    // it across sets (a spec is unique WITHIN a fixture set). The legacy S3 entry above, and with it the legacy
+    // manifest, candles pin and ladder digest, is untouched. As with the momentum set, the same-day-peek and
+    // extra-delay Sharpe ordering is REPORTED (Amendment 13 T4), not a pinned number: the legacy canaries (3.39 and
+    // 2.16) were measured on 2016-2020 and "do not transfer", so there are no Layer C canaries here.
+    RegisteredRule {
+        id: "crypto_trend_100d_evidence",
+        spec: RuleSpec {
+            signal: SignalSpec::CloseAboveSma { window: CRYPTO_SMA_DAYS },
+            universe: UniverseSpec::Fixed(&CRYPTO_SYMBOLS),
+            weighting: WeightingSpec::FixedPerInstrument { weight: CRYPTO_WEIGHT_PER_INSTRUMENT },
+            cadence: CadenceSpec { decision: DecisionSchedule::Daily, rebalance: RebalancePolicy::EveryBar },
+            overlay: OverlaySpec::None,
+        },
+        factory: make_crypto_evidence,
+        set: FixtureSetId::CryptoEvidence,
+        panel: PanelSpec::Crypto,
+        key: KeyRef {
+            sleeve_code: "S3e",
+            perbar_file: "key/S3e_crypto_trend_100d_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S3e_daily_returns.csv",
+        },
+        mutants: &[
+            Mutant::S3eSameDayPeek,
+            Mutant::S3eExtraDelay,
+            Mutant::S3eSmaExcludesToday,
+            Mutant::S3eHalfSizing,
+            Mutant::S3eDriftingSubaccounts,
+        ],
+        canaries: &[],
+    },
 ];
 
 /// Why a registry lookup or construction failed. (`PartialEq` only: a [`RuleSpec`] holds a weight, an `f64`.)
@@ -329,7 +371,7 @@ pub enum RegistryError {
     DuplicateSleeve {
         sleeve_code: String,
     },
-    /// Two entries carry the same [`RuleSpec`].
+    /// Two entries of ONE fixture set carry the same [`RuleSpec`] (the same rule may be certified in two sets).
     DuplicateSpec {
         spec: RuleSpec,
     },
@@ -371,7 +413,7 @@ impl Registry {
     pub fn from_rules(rules: Vec<RegisteredRule>) -> Result<Registry, RegistryError> {
         let mut ids: BTreeMap<&str, ()> = BTreeMap::new();
         let mut sleeves: BTreeMap<&str, ()> = BTreeMap::new();
-        let mut specs: Vec<RuleSpec> = Vec::with_capacity(rules.len());
+        let mut specs: Vec<(FixtureSetId, RuleSpec)> = Vec::with_capacity(rules.len());
         for r in &rules {
             if ids.insert(r.id, ()).is_some() {
                 return Err(RegistryError::DuplicateRule { rule_id: r.id.to_string() });
@@ -379,10 +421,10 @@ impl Registry {
             if sleeves.insert(r.key.sleeve_code, ()).is_some() {
                 return Err(RegistryError::DuplicateSleeve { sleeve_code: r.key.sleeve_code.to_string() });
             }
-            if specs.contains(&r.spec) {
+            if specs.contains(&(r.set, r.spec)) {
                 return Err(RegistryError::DuplicateSpec { spec: r.spec });
             }
-            specs.push(r.spec);
+            specs.push((r.set, r.spec));
         }
         Ok(Registry { rules })
     }
@@ -401,9 +443,16 @@ impl Registry {
             .ok_or_else(|| RegistryError::UnknownRule { rule_id: rule_id.to_string() })
     }
 
-    /// The entry carrying this [`RuleSpec`] (the registry's own key).
+    /// The entry carrying this [`RuleSpec`] (the registry's own key). When several fixture sets certify the same spec
+    /// (the legacy `crypto_trend_100d` and its evidence-window twin), the first in table order, i.e. the earlier set's;
+    /// [`Registry::get_spec_in_set`] names the set.
     pub fn get_spec(&self, spec: &RuleSpec) -> Result<&RegisteredRule, RegistryError> {
         self.rules.iter().find(|r| r.spec == *spec).ok_or(RegistryError::UnknownSpec { spec: *spec })
+    }
+
+    /// The entry of fixture set `set` carrying this [`RuleSpec`] (a spec is unique within a set).
+    pub fn get_spec_in_set(&self, set: FixtureSetId, spec: &RuleSpec) -> Result<&RegisteredRule, RegistryError> {
+        self.rules.iter().find(|r| r.set == set && r.spec == *spec).ok_or(RegistryError::UnknownSpec { spec: *spec })
     }
 
     /// The entry certified against a sleeve.
