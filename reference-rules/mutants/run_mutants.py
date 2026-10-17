@@ -154,6 +154,12 @@ MUTANTS = [
      "src/dual_momentum_gem.rs",
      "    if spy_return <= 0.0 {",
      "    if spy_return < 0.0 {"),
+    ("M40", "etf: decide_etf_trend_with delegates with a 25% weight instead of the published 20% constant", "src/etf.rs",
+     "        ETF_WEIGHT_PER_INSTRUMENT,\n    )\n}",
+     "        0.25,\n    )\n}"),
+    ("M41", "momentum_rank_weighted: denominator hard-coded to the N = 5 triangular number (15) instead of K (K + 1) / 2", "src/momentum_rank_weighted.rs",
+     "    if k > 0 {\n        let denom = (k * (k + 1) / 2) as f64;",
+     "    if k > 0 {\n        let denom = 15.0_f64;"),
 ]
 
 

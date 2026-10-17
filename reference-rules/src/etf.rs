@@ -56,6 +56,35 @@ pub fn decide_etf_trend_with(
     symbols: &[&str],
     sma_month_ends: usize,
 ) -> Result<EtfDecision, RuleError> {
+    decide_etf_trend_with_weight(
+        panel,
+        decision_date,
+        opts,
+        symbols,
+        sma_month_ends,
+        ETF_WEIGHT_PER_INSTRUMENT,
+    )
+}
+
+/// [`decide_etf_trend_with`] with the per-instrument target weight of a `Long` signal made explicit
+/// (`weight_per_instrument`; the published rule's is `ETF_WEIGHT_PER_INSTRUMENT` = 0.20). The weight is the only
+/// difference: signals, validation and errors are identical. R41-A(1) uses `1.0 / N` for an N-instrument universe
+/// (max gross 100%); `decide_etf_trend_with` is this function at the constant, so every certified point is unchanged.
+///
+/// # Panics
+/// As [`decide_etf_trend_with`], and if `weight_per_instrument` is not finite or not in `(0, 1]`.
+pub fn decide_etf_trend_with_weight(
+    panel: &Panel,
+    decision_date: NaiveDate,
+    opts: &Options,
+    symbols: &[&str],
+    sma_month_ends: usize,
+    weight_per_instrument: f64,
+) -> Result<EtfDecision, RuleError> {
+    assert!(
+        weight_per_instrument > 0.0 && weight_per_instrument <= 1.0,
+        "decide_etf_trend_with_weight: weight must be in (0, 1], got {weight_per_instrument}"
+    );
     assert!(
         !symbols.is_empty(),
         "decide_etf_trend_with: empty instrument list"
@@ -112,7 +141,7 @@ pub fn decide_etf_trend_with(
             Signal::Cash
         };
         let weight = if signal == Signal::Long {
-            ETF_WEIGHT_PER_INSTRUMENT
+            weight_per_instrument
         } else {
             0.0
         };

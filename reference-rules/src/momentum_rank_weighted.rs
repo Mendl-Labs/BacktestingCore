@@ -454,4 +454,265 @@ mod tests {
         assert!((r.weights[0] - 2.0 / 3.0).abs() < 1e-9);
         assert!((r.weights[1] - 1.0 / 3.0).abs() < 1e-9);
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // R41-A(2)/(3)(b): N-generality of the linear-rank weights, and the per-rule differential
+    // attestation against an independent reference at N in {5, 9, 11}.
+    // ------------------------------------------------------------------------------------------------
+
+    /// Deliberately NOT in alphabetical order, so the ascending-ticker tie-break is exercised.
+    const TICKERS: [&str; 11] = [
+        "T07", "T02", "T10", "T01", "T05", "T11", "T03", "T09", "T04", "T08", "T06",
+    ];
+
+    /// Seeded linear congruential generator (no dependency, fully reproducible).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            let scaled = self.0.wrapping_mul(6_364_136_223_846_793_005);
+            self.0 = scaled.wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    fn to_closes(ticks: &[i64]) -> Vec<f64> {
+        ticks.iter().map(|&k| k as f64).collect()
+    }
+
+    /// Independent reference (integer arithmetic, no shared code, no sort): the asset's rank is one
+    /// plus the number of eligible assets that beat it, where `j` beats `i` if its trailing return is
+    /// strictly higher (exact cross-multiplication of the integer closes) or equal with a smaller
+    /// ticker. Eligible = at least `l + 1` closes. Returns the weights and the excluded tickers in
+    /// universe order.
+    fn reference_rank_weights(
+        ticks: &[Vec<i64>],
+        names: &[&'static str],
+        l: usize,
+    ) -> (Vec<f64>, Vec<&'static str>) {
+        let n = ticks.len();
+        let eligible: Vec<usize> = (0..n).filter(|&i| ticks[i].len() > l).collect();
+        let k = eligible.len();
+        let last = |i: usize| ticks[i][ticks[i].len() - 1];
+        let base = |i: usize| ticks[i][ticks[i].len() - 1 - l];
+        let mut weights = vec![0.0; n];
+        for &i in &eligible {
+            let mut beaten_by = 0usize;
+            for &j in &eligible {
+                if j == i {
+                    continue;
+                }
+                let (lhs, rhs) = (last(j) * base(i), last(i) * base(j));
+                if lhs > rhs || (lhs == rhs && names[j] < names[i]) {
+                    beaten_by += 1;
+                }
+            }
+            let rank = beaten_by + 1;
+            weights[i] = (k + 1 - rank) as f64 / ((k * (k + 1) / 2) as f64);
+        }
+        let excluded = (0..n).filter(|&i| ticks[i].len() <= l).map(|i| names[i]).collect();
+        (weights, excluded)
+    }
+
+    /// Does any pair of eligible assets have exactly equal trailing returns (cross-multiplied)?
+    fn has_exact_tie(ticks: &[Vec<i64>], l: usize) -> bool {
+        let eligible: Vec<&Vec<i64>> = ticks.iter().filter(|c| c.len() > l).collect();
+        for (a, x) in eligible.iter().enumerate() {
+            for y in &eligible[a + 1..] {
+                let (lx, bx) = (x[x.len() - 1], x[x.len() - 1 - l]);
+                let (ly, by) = (y[y.len() - 1], y[y.len() - 1 - l]);
+                if lx * by == ly * bx {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// One seeded scenario: `n` assets, mostly `bars` long, some with too short a history (at and
+    /// just below the `l + 1` boundary included), some copies or exact multiples of another asset
+    /// (exact trailing-return ties).
+    fn scenario(rng: &mut Lcg, n: usize, l: usize, bars: usize) -> Vec<Vec<i64>> {
+        let mut cols: Vec<Vec<i64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            // 0: anywhere in 1 ..= l + 1 closes; 1: one close short (excluded); 2: exactly l + 1 (eligible).
+            let len = match rng.next() % 6 {
+                0 => (rng.next() % (l as u64 + 1)) as usize + 1,
+                1 => l,
+                2 => l + 1,
+                _ => bars,
+            };
+            let mut p: i64 = 100 + (rng.next() % 200) as i64;
+            let mut col = Vec::with_capacity(len);
+            for _ in 0..len {
+                p = (p + (rng.next() % 9) as i64 - 4).max(50);
+                col.push(p);
+            }
+            if i > 0 && rng.next() % 4 == 0 {
+                // Tie: the same ticks or twice the ticks as an earlier asset, same length.
+                let src = (rng.next() % i as u64) as usize;
+                let mult = 1 + (rng.next() % 2) as i64;
+                let src_len = cols[src].len();
+                col = cols[src].iter().map(|&x| x * mult).collect();
+                assert_eq!(col.len(), src_len);
+            }
+            cols.push(col);
+        }
+        cols
+    }
+
+    fn check_against_reference(ticks: &[Vec<i64>], names: &[&'static str], l: usize, tag: &str) {
+        let closes: Vec<Vec<f64>> = ticks.iter().map(|c| to_closes(c)).collect();
+        let got = rank_weighted(&slices(&closes), names, l);
+        let (want, want_excluded) = reference_rank_weights(ticks, names, l);
+        assert_eq!(got.excluded, want_excluded, "{tag}");
+        assert_eq!(got.weights.len(), want.len(), "{tag}");
+        for (a, (g, w)) in got.weights.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "{tag}, asset {a}: {g} vs {w}");
+        }
+        check_invariants(&got, l, ticks, tag);
+    }
+
+    /// The R41-A(2) invariants, for any N and any set of excluded names.
+    fn check_invariants(r: &RankWeightedRanking, l: usize, ticks: &[Vec<i64>], tag: &str) {
+        let k = ticks.iter().filter(|c| c.len() > l).count();
+        assert_eq!(r.excluded.len(), ticks.len() - k, "{tag}");
+        if k == 0 {
+            assert!(r.weights.iter().all(|w| *w == 0.0), "{tag}: K = 0 is all zero");
+            return;
+        }
+        let denom = (k * (k + 1) / 2) as f64;
+        // Integer-valued numerators: the K ranks use each of 1 ..= K exactly once, so they sum to the
+        // triangular number and the weights sum to 1 (to f64 accuracy) at any K.
+        let mut numerators: Vec<i64> = Vec::new();
+        for (i, w) in r.weights.iter().enumerate() {
+            if ticks[i].len() > l {
+                assert!(*w > 0.0, "{tag}: every eligible asset is held");
+                let num = w * denom;
+                assert!((num - num.round()).abs() < 1e-9, "{tag}: numerator {num}");
+                numerators.push(num.round() as i64);
+            } else {
+                assert_eq!(*w, 0.0, "{tag}: an excluded asset gets exactly zero");
+            }
+        }
+        numerators.sort_unstable();
+        assert_eq!(numerators, (1..=k as i64).collect::<Vec<_>>(), "{tag}: ranks 1..=K once each");
+        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12, "{tag}: gross is 100%");
+        let top = r.weights.iter().cloned().fold(0.0_f64, f64::max);
+        assert!((top - 2.0 / (k as f64 + 1.0)).abs() < 1e-12, "{tag}: top weight is 2/(K+1)");
+    }
+
+    #[test]
+    fn rank_weights_match_an_independent_reference_at_n_5_9_and_11() {
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        let mut k_seen = [false; 12];
+        let mut with_exclusion = 0;
+        let mut with_tie = 0;
+        for s in 0..300 {
+            for n in [5usize, 9, 11] {
+                for l in [3usize, 20, 126] {
+                    let ticks = scenario(&mut rng, n, l, l + 40);
+                    let k = ticks.iter().filter(|c| c.len() > l).count();
+                    k_seen[k] = true;
+                    if k < n {
+                        with_exclusion += 1;
+                    }
+                    if has_exact_tie(&ticks, l) {
+                        with_tie += 1;
+                    }
+                    let tag = format!("s={s} n={n} l={l}");
+                    check_against_reference(&ticks, &TICKERS[..n], l, &tag);
+                }
+            }
+        }
+        // The scenarios cover what the attestation claims: K = N at each of N = 5, 9 and 11,
+        // short-history exclusions in the scenarios, and (copied/doubled columns) exact ties.
+        assert!(k_seen[5] && k_seen[9] && k_seen[11], "K = N occurs: {k_seen:?}");
+        assert!(with_exclusion > 100, "exclusions: {with_exclusion}");
+        assert!(with_tie > 50, "exact ties: {with_tie}");
+    }
+
+    /// Exact trailing-return ties (identical and doubled columns) resolve by ascending ticker, never
+    /// by universe order, at N = 9 and 11.
+    #[test]
+    fn exact_ties_break_by_ascending_ticker_not_universe_order() {
+        for n in [5usize, 9, 11] {
+            let base: Vec<i64> = vec![100, 104, 109, 115];
+            let ticks: Vec<Vec<i64>> = (0..n)
+                .map(|i| base.iter().map(|x| x * (1 + (i % 2) as i64)).collect())
+                .collect();
+            let closes: Vec<Vec<f64>> = ticks.iter().map(|c| to_closes(c)).collect();
+            let r = rank_weighted(&slices(&closes), &TICKERS[..n], 3);
+            // All N returns are identical, so the ranking is the ascending-ticker order.
+            let mut by_ticker: Vec<usize> = (0..n).collect();
+            by_ticker.sort_by(|&a, &b| TICKERS[a].cmp(TICKERS[b]));
+            let denom = (n * (n + 1) / 2) as f64;
+            for (rank_minus_one, &i) in by_ticker.iter().enumerate() {
+                let want = (n - rank_minus_one) as f64 / denom;
+                assert_eq!(r.weights[i].to_bits(), want.to_bits(), "N = {n}, {}", TICKERS[i]);
+            }
+        }
+    }
+
+    /// No hidden dependence on N = 5: for every K from 1 to 11, strictly ordered returns give weights
+    /// `(K + 1 - r) / (K (K + 1) / 2)` exactly, summing to 1 with top weight `2 / (K + 1)`.
+    #[test]
+    fn rank_weights_have_the_closed_form_for_every_k_from_1_to_11() {
+        for k in 1..=11usize {
+            // Asset i has return (i + 1) / 10 over L = 1: strictly increasing in i, so the last asset is rank 1.
+            let mut ticks: Vec<Vec<i64>> = Vec::new();
+            for i in 0..k as i64 {
+                ticks.push(vec![100, 100 + 10 * (i + 1)]);
+            }
+            let closes: Vec<Vec<f64>> = ticks.iter().map(|c| to_closes(c)).collect();
+            let names: Vec<&'static str> = (0..k).map(|i| TICKERS[i]).collect();
+            let r = rank_weighted(&slices(&closes), &names, 1);
+            assert!(r.excluded.is_empty());
+            let denom = (k * (k + 1) / 2) as f64;
+            for i in 0..k {
+                let rank = k - i; // the highest return is rank 1
+                let want = (k + 1 - rank) as f64 / denom;
+                assert_eq!(r.weights[i].to_bits(), want.to_bits(), "K = {k}, asset {i}");
+            }
+            assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12, "K = {k}");
+            let top = r.weights.iter().cloned().fold(0.0_f64, f64::max);
+            assert!((top - 2.0 / (k as f64 + 1.0)).abs() < 1e-12, "K = {k}");
+        }
+        // The disclosed concentration of R41-A(2): K = 5, 9, 11 hold 33.3%, 20.0%, 16.7% on top.
+        for (k, top) in [(5.0_f64, 1.0 / 3.0), (9.0, 0.2), (11.0, 1.0 / 6.0)] {
+            assert!((2.0 / (k + 1.0) - top).abs() < 1e-15);
+        }
+    }
+
+    /// Amendment 14: a name with fewer than `L + 1` closes is excluded (weight 0) and removed from K and the
+    /// denominator, so the remaining names are weighted exactly as if it were not in the universe.
+    #[test]
+    fn an_excluded_name_is_removed_from_k_and_the_denominator_at_any_n() {
+        for n in [9usize, 11] {
+            let mut full: Vec<Vec<i64>> = Vec::new();
+            for i in 0..n as i64 {
+                full.push(vec![100, 100 + 7 * (i + 1), 100 + 11 * (i + 1)]);
+            }
+            let mut with_short = full.clone();
+            with_short[2] = vec![100, 150]; // 2 closes < L + 1 = 3: excluded
+            let closes: Vec<Vec<f64>> = with_short.iter().map(|c| to_closes(c)).collect();
+            let r = rank_weighted(&slices(&closes), &TICKERS[..n], 2);
+            assert_eq!(r.excluded, vec![TICKERS[2]]);
+            assert_eq!(r.weights[2], 0.0);
+            // Same ranking with that name deleted from the universe.
+            let mut kept = full.clone();
+            kept.remove(2);
+            let mut kept_names: Vec<&'static str> = TICKERS[..n].to_vec();
+            kept_names.remove(2);
+            let kept_closes: Vec<Vec<f64>> = kept.iter().map(|c| to_closes(c)).collect();
+            let without = rank_weighted(&slices(&kept_closes), &kept_names, 2);
+            let mut remaining = r.weights.clone();
+            remaining.remove(2);
+            assert_eq!(remaining.len(), without.weights.len());
+            for (a, b) in remaining.iter().zip(&without.weights) {
+                assert_eq!(a.to_bits(), b.to_bits(), "N = {n}");
+            }
+            assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        }
+    }
 }
