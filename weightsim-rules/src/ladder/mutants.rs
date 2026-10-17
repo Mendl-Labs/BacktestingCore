@@ -50,7 +50,9 @@ use super::checks::SeriesRows;
 use super::fixtures::{Fixtures, LadderError, SleeveKey};
 use super::registry::FixtureSetId;
 use super::runner::{rows_from_sim, run_gross};
-use crate::adapters::{crypto_weights, CryptoTrendRule, DualMomentumGemAdapter, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{
+    crypto_weights, CryptoTrendRule, DualMomentumGemAdapter, EtfTrendRule, MomentumRankWeightedRule,
+};
 
 /// The eight mutants, in the order of the amendment's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
