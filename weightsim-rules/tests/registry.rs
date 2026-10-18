@@ -55,10 +55,13 @@ fn the_registry_changes_no_digest_over_the_synthetic_fixtures() {
 #[test]
 fn the_library_table_is_the_certified_rules_in_sleeve_order() {
     let reg = Registry::library();
-    assert_eq!(reg.ids(), vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted"]);
+    assert_eq!(
+        reg.ids(),
+        vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted", "crypto_trend_100d_evidence"]
+    );
     let legacy: Vec<&str> = reg.iter_set(FixtureSetId::Legacy).map(|r| r.id).collect();
     assert_eq!(legacy, LIBRARY_RULE_IDS.to_vec(), "LIBRARY_RULE_IDS is a view of the legacy set of the registry");
-    assert_eq!(reg.len(), 3);
+    assert_eq!(reg.len(), 4);
     assert!(!reg.is_empty());
     let s1 = reg.get("etf_trend_faber").unwrap();
     let s3 = reg.get("crypto_trend_100d").unwrap();
@@ -102,7 +105,7 @@ fn every_entrys_mutants_are_exactly_its_sleeves_mutants_in_table_order() {
     }
     assert_eq!(
         seen,
-        Mutant::ALL.len() + Mutant::MOMENTUM.len(),
+        Mutant::ALL.len() + Mutant::MOMENTUM.len() + Mutant::CRYPTO_EVIDENCE.len(),
         "every named mutant belongs to exactly one registered rule"
     );
 }
@@ -173,7 +176,8 @@ fn the_registry_is_keyed_by_rule_spec_and_each_spec_describes_its_compiled_rule(
     let reg = Registry::library();
     for e in reg.iter() {
         // The spec is the registry's key: looking it up returns the entry that carries it.
-        assert_eq!(reg.get_spec(&e.spec).unwrap().id, e.id);
+        // (A spec is unique within a fixture set; the evidence-window twin of S3 shares the legacy S3's spec.)
+        assert_eq!(reg.get_spec_in_set(e.set, &e.spec).unwrap().id, e.id);
         // The cadence and universe the spec declares are the compiled rule's own.
         let rule = (e.factory)();
         assert_eq!(e.spec.cadence.decision, rule.decision_schedule(), "{}", e.id);
@@ -275,6 +279,11 @@ fn a_fixture_set_never_loads_another_sets_files() {
     match Fixtures::load_set(&reader, pins, FixtureSetId::MomentumEvidence) {
         Err(LadderError::Pin(m)) => assert!(m.contains("S4_momentum_rank_weighted_perbar.csv"), "{m}"),
         other => panic!("expected a Pin error for the missing S4 key, got {:?}", other.map(|_| ())),
+    }
+    // Likewise the crypto evidence set: the legacy files carry no S3e key.
+    match Fixtures::load_set(&reader, pins, FixtureSetId::CryptoEvidence) {
+        Err(LadderError::Pin(m)) => assert!(m.contains("S3e_crypto_trend_100d_perbar.csv"), "{m}"),
+        other => panic!("expected a Pin error for the missing S3e key, got {:?}", other.map(|_| ())),
     }
     assert_eq!(
         required_files_for(FixtureSetId::MomentumEvidence),
