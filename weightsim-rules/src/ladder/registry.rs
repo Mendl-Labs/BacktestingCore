@@ -20,15 +20,18 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use reference_rules::{
-    CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS,
-    ETF_WEIGHT_PER_INSTRUMENT, MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
+    CRYPTO_SMA_DAYS, CRYPTO_SYMBOLS, CRYPTO_WEIGHT_PER_INSTRUMENT, DUAL_MOMENTUM_GEM_SYMBOLS,
+    DUAL_MOMENTUM_GEM_TRAILING_MONTHS, ETF_SMA_MONTH_ENDS, ETF_SYMBOLS, ETF_WEIGHT_PER_INSTRUMENT,
+    MOMENTUM_RANK_WEIGHTED_DEFAULT_LOOKBACK,
 };
 use weightsim::{Date, DecisionSchedule, Panel, RebalancePolicy, WeightRule};
 
 use super::fixtures::{Fixtures, LadderError, RecordedMetrics, SleeveKey};
 use super::mutants::{Mutant, MutantSleeve};
 use super::{CANARY_DELAY_SHARPE, CANARY_PEEK_SHARPE};
-use crate::adapters::{CryptoTrendEvidenceRule, CryptoTrendRule, EtfTrendRule, MomentumRankWeightedRule};
+use crate::adapters::{
+    CryptoTrendEvidenceRule, CryptoTrendRule, DualMomentumGemAdapter, EtfTrendRule, MomentumRankWeightedRule,
+};
 
 /// What a rule's signal reads. The sampling of the signal is the rule's decision schedule ([`CadenceSpec::decision`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +42,11 @@ pub enum SignalSpec {
     /// Instruments are ranked by their trailing `lookback`-bar return (`close_t / close_(t-lookback) - 1`), descending,
     /// ties broken by ascending ticker; an instrument with fewer than `lookback + 1` closes is not ranked.
     TrailingReturnRank { lookback: usize },
+    /// Sampled on the month-end bars: the FIRST universe member's trailing `months` month-end-to-month-end return
+    /// (`close_t / close_(t - months month-ends) - 1`) is the absolute-momentum gate (it must be strictly positive);
+    /// when it passes, the higher of the first two members' returns wins (an exact tie goes to the second member, the
+    /// alphabetically earlier ticker), otherwise the third member is held. The third member's own history is never read.
+    MonthEndTrailingReturnGate { months: usize },
 }
 
 /// Which instruments a rule trades.
@@ -56,6 +64,8 @@ pub enum WeightingSpec {
     /// With `K` ranked instruments, the one at rank `r` (1 = best) gets `(K + 1 - r) / (K (K + 1) / 2)` of the sleeve:
     /// strictly positive, summing to 1, no cutoff. Instruments that are not ranked get 0 and leave `K`.
     LinearRank,
+    /// Exactly one instrument is held, at 100% of the sleeve; every other instrument gets 0.
+    SingleHolding,
 }
 
 /// When the rule decides, and how the book is traded between decisions.
@@ -96,6 +106,11 @@ pub enum FixtureSetId {
     /// `etf_cross_sectional_momentum` (rule `momentum_rank_weighted`, sleeve `S4`), pinned on its own. Its pins are the
     /// caller's (the Engine's `certified.rs`); they are not constants of this crate.
     MomentumEvidence,
+    /// `replication_ladder_gem_evidence/` (Amendment 16): the evidence window of `etf_dual_relative_momentum` (rule
+    /// `dual_momentum_gem`, sleeve `S6`), pinned on its own like [`FixtureSetId::MomentumEvidence`]. The directory does
+    /// not exist until the owner-only data step has run: its pins are the caller's (the Engine's `certified.rs`), and
+    /// no constant of this crate names them.
+    GemEvidence,
     /// `replication_ladder_crypto_evidence/` (Amendment 13): the evidence window (2020-03-16 to 2026-10-03) of
     /// `crypto_trend_100d`, certified by the rule `crypto_trend_100d_evidence` (the very same compiled rule as the
     /// legacy S3, see `CryptoTrendEvidenceRule`) on sleeve `S3e`. Its pins are the caller's (the Engine's
@@ -105,8 +120,8 @@ pub enum FixtureSetId {
 
 impl FixtureSetId {
     /// Every fixture set, in table order.
-    pub const ALL: [FixtureSetId; 3] =
-        [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence, FixtureSetId::CryptoEvidence];
+    pub const ALL: [FixtureSetId; 4] =
+        [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence, FixtureSetId::CryptoEvidence, FixtureSetId::GemEvidence];
 }
 
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
@@ -117,6 +132,9 @@ pub enum PanelSpec {
     Etf,
     /// BTC and ETH (`reference_rules::CRYPTO_SYMBOLS`).
     Crypto,
+    /// SPY, EFA and AGG (`reference_rules::DUAL_MOMENTUM_GEM_SYMBOLS`): the registry asserts the panel's symbols equal
+    /// the rule's universe, so the three-symbol GEM universe needs a panel of its own.
+    Gem,
 }
 
 impl PanelSpec {
@@ -125,6 +143,7 @@ impl PanelSpec {
         match self {
             PanelSpec::Etf => &ETF_SYMBOLS,
             PanelSpec::Crypto => &CRYPTO_SYMBOLS,
+            PanelSpec::Gem => &DUAL_MOMENTUM_GEM_SYMBOLS,
         }
     }
 }
@@ -236,12 +255,16 @@ fn make_momentum() -> Box<dyn WeightRule> {
     Box::new(MomentumRankWeightedRule::default())
 }
 
+fn make_gem() -> Box<dyn WeightRule> {
+    Box::new(DualMomentumGemAdapter::default())
+}
+
 fn make_crypto_evidence() -> Box<dyn WeightRule> {
     Box::new(CryptoTrendEvidenceRule::default())
 }
 
 /// The reviewed table. Order matters: it is the order sleeves are run and reported in, which the ladder digest covers.
-pub const LIBRARY_RULES: [RegisteredRule; 4] = [
+pub const LIBRARY_RULES: [RegisteredRule; 5] = [
     RegisteredRule {
         id: "etf_trend_faber",
         spec: RuleSpec {
@@ -321,6 +344,35 @@ pub const LIBRARY_RULES: [RegisteredRule; 4] = [
             Mutant::S4LookbackOffByOne,
             Mutant::S4HalfSizing,
             Mutant::S4EqualWeight,
+        ],
+        canaries: &[],
+    },
+    // Amendment 16: `etf_dual_relative_momentum` (Antonacci GEM), in its own fixture set (the evidence window) on a
+    // dedicated three-symbol panel, so neither the legacy nor the momentum set's manifest, candles pin or ladder digest
+    // is touched. The set's pins are placeholders in the Engine until the owner-only data step has run.
+    RegisteredRule {
+        id: "dual_momentum_gem",
+        spec: RuleSpec {
+            signal: SignalSpec::MonthEndTrailingReturnGate { months: DUAL_MOMENTUM_GEM_TRAILING_MONTHS },
+            universe: UniverseSpec::Fixed(&DUAL_MOMENTUM_GEM_SYMBOLS),
+            weighting: WeightingSpec::SingleHolding,
+            cadence: CadenceSpec { decision: DecisionSchedule::LastBarOfMonth, rebalance: RebalancePolicy::OnDecision },
+            overlay: OverlaySpec::None,
+        },
+        factory: make_gem,
+        set: FixtureSetId::GemEvidence,
+        panel: PanelSpec::Gem,
+        key: KeyRef {
+            sleeve_code: "S6",
+            perbar_file: "key/S6_dual_momentum_gem_perbar.csv",
+            shadow_file: "shadow_saved/shadow_S6_daily_returns.csv",
+        },
+        mutants: &[
+            Mutant::S6LookaheadPeek,
+            Mutant::S6ExtraDelay,
+            Mutant::S6LookbackOffByOne,
+            Mutant::S6RelativePickInverted,
+            Mutant::S6GateAlwaysOpen,
         ],
         canaries: &[],
     },

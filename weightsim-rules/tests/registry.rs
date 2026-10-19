@@ -57,11 +57,17 @@ fn the_library_table_is_the_certified_rules_in_sleeve_order() {
     let reg = Registry::library();
     assert_eq!(
         reg.ids(),
-        vec!["etf_trend_faber", "crypto_trend_100d", "momentum_rank_weighted", "crypto_trend_100d_evidence"]
+        vec![
+            "etf_trend_faber",
+            "crypto_trend_100d",
+            "momentum_rank_weighted",
+            "dual_momentum_gem",
+            "crypto_trend_100d_evidence",
+        ]
     );
     let legacy: Vec<&str> = reg.iter_set(FixtureSetId::Legacy).map(|r| r.id).collect();
     assert_eq!(legacy, LIBRARY_RULE_IDS.to_vec(), "LIBRARY_RULE_IDS is a view of the legacy set of the registry");
-    assert_eq!(reg.len(), 4);
+    assert_eq!(reg.len(), 5);
     assert!(!reg.is_empty());
     let s1 = reg.get("etf_trend_faber").unwrap();
     let s3 = reg.get("crypto_trend_100d").unwrap();
@@ -105,7 +111,7 @@ fn every_entrys_mutants_are_exactly_its_sleeves_mutants_in_table_order() {
     }
     assert_eq!(
         seen,
-        Mutant::ALL.len() + Mutant::MOMENTUM.len() + Mutant::CRYPTO_EVIDENCE.len(),
+        Mutant::ALL.len() + Mutant::MOMENTUM.len() + Mutant::GEM.len() + Mutant::CRYPTO_EVIDENCE.len(),
         "every named mutant belongs to exactly one registered rule"
     );
 }
@@ -301,4 +307,32 @@ fn a_fixture_set_never_loads_another_sets_files() {
 fn every_panel_spec_names_the_symbols_of_its_universe() {
     assert_eq!(PanelSpec::Etf.symbols(), &reference_rules::ETF_SYMBOLS[..]);
     assert_eq!(PanelSpec::Crypto.symbols(), &reference_rules::CRYPTO_SYMBOLS[..]);
+    assert_eq!(PanelSpec::Gem.symbols(), &reference_rules::DUAL_MOMENTUM_GEM_SYMBOLS[..]);
+}
+
+#[test]
+fn the_gem_files_are_exactly_its_own_sets_and_loading_another_set_never_finds_them() {
+    assert_eq!(
+        required_files_for(FixtureSetId::GemEvidence),
+        vec![
+            "ladder_candles.csv",
+            "key/key_metrics.json",
+            "key/mutants.json",
+            "key/S6_dual_momentum_gem_perbar.csv",
+            "shadow_saved/shadow_S6_daily_returns.csv",
+        ]
+    );
+    // The legacy files carry S1/S3 only: loading them as the GEM set fails on the missing S6 key.
+    let (files, ms, cs) = common::ready();
+    let reader = |name: &str| -> Result<Vec<u8>, String> {
+        files.files.get(name).cloned().ok_or_else(|| format!("{name}: not in the synthetic table"))
+    };
+    let pins = Pins { manifest_sha256: ms, candles_sha256: cs };
+    match Fixtures::load_set(&reader, pins, FixtureSetId::GemEvidence) {
+        Err(LadderError::Pin(m)) => assert!(m.contains("S6_dual_momentum_gem_perbar.csv"), "{m}"),
+        other => panic!("expected a Pin error for the missing S6 key, got {:?}", other.map(|_| ())),
+    }
+    // The legacy set still loads, and loads no GEM panel.
+    let fx = Fixtures::load_set(&reader, pins, FixtureSetId::Legacy).unwrap();
+    assert!(fx.try_panel(PanelSpec::Gem).is_none());
 }
