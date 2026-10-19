@@ -261,6 +261,8 @@ fn make_momentum() -> Box<dyn WeightRule> {
 
 fn make_gem() -> Box<dyn WeightRule> {
     Box::new(DualMomentumGemAdapter::default())
+}
+
 fn make_crypto_evidence() -> Box<dyn WeightRule> {
     Box::new(CryptoTrendEvidenceRule::default())
 }
