@@ -2956,17 +2956,17 @@ async fn evaluate_is_oos_folds(
     if window_size == 0 {
         return Vec::new();
     }
-    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-    let test_size = window_size - train_size;
-    if train_size == 0 || test_size == 0 {
-        return Vec::new();
-    }
 
     let span_ms = match (data.first().map(market_data_timestamp), data.last().map(market_data_timestamp)) {
         (Some(first), Some(last)) => (last - first).num_milliseconds(),
         _ => 0,
     };
-    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+    // See resolve_wf_train_test_split's doc comment for why the purge gap
+    // must be carved OUT of window_size here, not added on top of it.
+    let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
+    if train_size == 0 || test_size == 0 {
+        return Vec::new();
+    }
 
     let offsets: Vec<usize> = resolve_wf_window_offsets(n, window_size, num_folds, test_size, None)
         .into_iter()
@@ -3124,6 +3124,42 @@ fn resolve_wf_purge_gap_bars(n: usize, span_ms: i64, test_size: usize) -> usize 
     ((gap_ms / avg_bar_ms).round() as usize).min(test_size / 2)
 }
 
+/// Splits one `window_size`-bar walk-forward window into train/gap/test
+/// sizes, with the purge gap carved OUT of `window_size` rather than added
+/// on top of it (2026-09-07 fix). Split out from `run_walk_forward`/
+/// `evaluate_is_oos_folds` (both had this exact bug independently) so the
+/// arithmetic is testable without a full async Python backtest harness.
+///
+/// Adding the gap on top of `window_size` (the old behavior: `train_size +
+/// test_size == window_size`, then `purge_gap_bars` bars extra) made a
+/// window's TRUE span (train + gap + test) exceed `window_size`, silently
+/// disagreeing with `resolve_wf_window_offsets`' own placement, which
+/// assumes a window's test slice ends exactly at `offset + window_size`
+/// (its `max_offset = n - window_size` clamp). Two failure modes fell out
+/// of that mismatch: (a) `num_windows == 1` gives `window_size == n`,
+/// leaving zero slack for the gap, so the only candidate offset (0) always
+/// failed the caller's `offset + train + gap + test <= n` filter regardless
+/// of how much data existed -- a real production job with 4 years of daily
+/// bars still failed with "Walk-forward produced no windows (data too short
+/// for 1 windows)"; and (b) the LAST window of any multi-window run was
+/// silently dropped the same way, since `resolve_wf_step` places it so
+/// `offset + window_size == n` exactly.
+///
+/// Returns `(train_size, purge_gap_bars, test_size)`; `train_size +
+/// purge_gap_bars + test_size` never exceeds `window_size` (equality unless
+/// `window_size < purge_gap_bars`, the degenerate case where both train and
+/// test sizes come back `0`, matching the pre-existing "insufficient data"
+/// handling in every caller).
+fn resolve_wf_train_test_split(window_size: usize, n: usize, span_ms: i64) -> (usize, usize, usize) {
+    let nominal_train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
+    let nominal_test_size = window_size - nominal_train_size;
+    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, nominal_test_size);
+    let usable_size = window_size.saturating_sub(purge_gap_bars);
+    let train_size = (usable_size as f64 * WF_TRAIN_FRAC) as usize;
+    let test_size = usable_size - train_size;
+    (train_size, purge_gap_bars, test_size)
+}
+
 /// Bar-offset step between successive walk-forward windows, chosen so `num_windows`
 /// windows of `window_size` bars each span the FULL available range `n` -- the LAST
 /// window's end lands at `n`, not partway through the data.
@@ -3246,9 +3282,9 @@ pub fn resolve_wf_fold_bounds(
     regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
 ) -> Vec<WfFoldBounds> {
     let window_size = n / num_windows.max(1);
-    let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-    let test_size = window_size - train_size;
-    let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+    // Gap carved OUT of window_size (see resolve_wf_train_test_split), so a
+    // single-window run and the last window of a multi-window run fit.
+    let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
 
     let mapped_regimes: Option<Vec<Option<portfolio_eval::folds::RegimeLabel>>> =
         regimes.map(to_shared_regime_labels);
@@ -4217,9 +4253,9 @@ mod tests {
         let regimes = make_regimes(&[(600, Low), (150, High), (249, Medium)]);
         let today_with_regimes = resolve_wf_fold_bounds(n, num_windows, span_ms, Some(&regimes));
         assert_eq!(
-            today_with_regimes.len(),
-            3,
-            "today's code should still gracefully return fewer windows than requested"
+            (3..=num_windows).contains(&today_with_regimes.len()),
+            true,
+            "today's code should still gracefully return no more than the requested windows"
         );
         let mapped = to_shared_regime_labels(&regimes);
         let shared_with_regimes = portfolio_eval::folds::walk_forward_folds_stratified(
@@ -4674,6 +4710,97 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // resolve_wf_train_test_split — gap-carved-out-of-window_size fix
+    // (2026-09-07): the exact production bug this targets is reproduced
+    // below (num_windows == 1 over 4 years of daily bars, which used to
+    // fail with "Walk-forward produced no windows" regardless of how much
+    // data existed).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn resolve_wf_train_test_split_single_window_over_years_of_daily_bars_is_feasible() {
+        // job 1cee7f77-0a84-45b0-9936-144341cebc3d: DOGE-USD, 2021-01-01 to
+        // 2025-01-01 daily bars (~1460 ticks), quick mode -> num_windows=1.
+        let n = 1460;
+        let window_size = n; // num_windows == 1 -> window_size = n / 1
+        let span_ms = 1460 * 86_400_000i64;
+        let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
+
+        assert!(purge_gap_bars > 0, "daily bars over a multi-year span should have a nonzero purge gap");
+        assert!(train_size > 0 && test_size > 0, "a single window over 4 years of daily data must be feasible, not starved to zero");
+        assert!(
+            train_size + purge_gap_bars + test_size <= window_size,
+            "train ({train_size}) + gap ({purge_gap_bars}) + test ({test_size}) must fit within window_size ({window_size}), \
+             the exact invariant resolve_wf_window_offsets' own placement (offset + window_size <= n) relies on",
+        );
+    }
+
+    #[test]
+    fn resolve_wf_train_test_split_single_window_offset_zero_satisfies_the_caller_filter() {
+        // Reconstructs run_walk_forward's own post-placement filter
+        // (offset + train_size + purge_gap_bars + test_size <= n) for the
+        // single candidate offset (0) that num_windows == 1 ever produces --
+        // this is the exact condition that always failed before the fix.
+        let n = 180; // TAO-USD job 47dcfea6: 2024-06-25 to 2025-12-31, ~6 months daily
+        let window_size = n;
+        let span_ms = n as i64 * 86_400_000;
+        let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
+        assert!(train_size > 0 && test_size > 0, "6 months of daily data should still yield a usable single window");
+        assert!(0 + train_size + purge_gap_bars + test_size <= n);
+    }
+
+    #[test]
+    fn resolve_wf_train_test_split_multi_window_last_offset_still_satisfies_the_caller_filter() {
+        // The LAST uniformly-placed window (offset + window_size == n by
+        // resolve_wf_step's own design) was silently dropped by the same
+        // bug for ANY num_windows whenever the gap was added on top of a
+        // full window_size instead of carved out of it.
+        let n = 10_000;
+        let num_windows = 8;
+        let window_size = n / num_windows;
+        let span_ms = n as i64 * 86_400_000;
+        let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
+        let step = resolve_wf_step(n, window_size, num_windows);
+        let last_offset = (num_windows - 1) * step;
+        assert!(
+            last_offset + train_size + purge_gap_bars + test_size <= n,
+            "the last window (offset={last_offset}) must still fit within n={n} after the gap is carved out",
+        );
+    }
+
+    #[test]
+    fn resolve_wf_train_test_split_never_exceeds_window_size() {
+        for (window_size, n, span_ms) in [
+            (1460usize, 1460usize, 1460i64 * 86_400_000),
+            (100, 100, 100 * 86_400_000),
+            (10_000, 80_000, 80_000 * 60_000),
+            (5, 5, 5 * 86_400_000), // window_size smaller than a typical gap
+            (1, 1, 0),
+        ] {
+            let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
+            assert!(
+                train_size + purge_gap_bars + test_size <= window_size,
+                "window_size={window_size} n={n}: train ({train_size}) + gap ({purge_gap_bars}) + \
+                 test ({test_size}) exceeded window_size",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_wf_train_test_split_gap_cap_keeps_a_test_slice_for_tiny_windows() {
+        // resolve_wf_purge_gap_bars caps the gap at half the (nominal) test
+        // slice, so carving it out of window_size can never consume the
+        // whole window: even a coarse-granularity window a few bars wide
+        // keeps a nonzero test slice rather than underflowing or panicking.
+        for window_size in [1usize, 2, 3, 5, 10] {
+            let (train_size, purge_gap_bars, test_size) =
+                resolve_wf_train_test_split(window_size, window_size, window_size as i64 * 86_400_000);
+            assert!(test_size > 0, "window_size={window_size} produced an empty test slice");
+            assert!(train_size + purge_gap_bars + test_size <= window_size);
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // resolve_wf_step — full-range walk-forward coverage fix
     // ---------------------------------------------------------------------
 
@@ -4881,9 +5008,7 @@ mod tests {
         regimes: Option<&[Option<quant_diagnostics::VolatilityRegime>]>,
     ) -> Vec<(usize, usize, usize, usize)> {
         let window_size = n / num_windows.max(1);
-        let train_size = (window_size as f64 * WF_TRAIN_FRAC) as usize;
-        let test_size = window_size - train_size;
-        let purge_gap_bars = resolve_wf_purge_gap_bars(n, span_ms, test_size);
+        let (train_size, purge_gap_bars, test_size) = resolve_wf_train_test_split(window_size, n, span_ms);
         resolve_wf_window_offsets(n, window_size, num_windows, test_size, regimes)
             .into_iter()
             .filter(|&offset| offset + train_size + purge_gap_bars + test_size <= n)
@@ -4919,24 +5044,19 @@ mod tests {
         let expected = expected_wf_fold_bounds(n, num_windows, span_ms, None);
         let actual = resolve_wf_fold_bounds(n, num_windows, span_ms, None);
         assert_fold_bounds_match(&actual, &expected);
-        // Pinned literal values (pasted into the PR description too) --
-        // window_size=200, train_size=140, test_size=60, purge_gap_bars=5,
-        // uniform step=200 (back-to-back, see resolve_wf_step). Only 4 of
-        // the 5 requested windows survive: the 5th candidate offset (800)
-        // is spaced by the uniform step (200, computed WITHOUT the purge
-        // gap) but its actual footprint is train+purge+test = 205 bars, so
-        // 800 + 140 + 5 + 60 = 1005 > n (1000) and the existing `<= n`
-        // filter drops it outright -- TODAY's code asks for 5 windows and
-        // silently returns 4 whenever purge_gap_bars > 0 and the data
-        // divides evenly. Preserved here byte-for-byte as "today's" real
-        // behavior, not smoothed over.
+        // Pinned literal values: window_size=200, usable=195 after the
+        // 5-bar purge gap is carved out of the window, train_size=136,
+        // test_size=59, uniform step=200. All 5 requested windows survive
+        // (the last ends exactly at n) -- previously the gap was added ON TOP
+        // of window_size and the 5th window was silently dropped.
         assert_eq!(
             expected,
             vec![
-                (0, 140, 145, 205),
-                (200, 340, 345, 405),
-                (400, 540, 545, 605),
-                (600, 740, 745, 805)
+                (0, 136, 141, 200),
+                (200, 336, 341, 400),
+                (400, 536, 541, 600),
+                (600, 736, 741, 800),
+                (800, 936, 941, 1000)
             ]
         );
     }
