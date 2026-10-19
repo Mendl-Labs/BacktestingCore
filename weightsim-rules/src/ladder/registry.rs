@@ -120,12 +120,8 @@ pub enum FixtureSetId {
 
 impl FixtureSetId {
     /// Every fixture set, in table order.
-    pub const ALL: [FixtureSetId; 4] = [
-        FixtureSetId::Legacy,
-        FixtureSetId::MomentumEvidence,
-        FixtureSetId::CryptoEvidence,
-        FixtureSetId::GemEvidence,
-    ];
+    pub const ALL: [FixtureSetId; 4] =
+        [FixtureSetId::Legacy, FixtureSetId::MomentumEvidence, FixtureSetId::CryptoEvidence, FixtureSetId::GemEvidence];
 }
 
 /// Which pinned price panel of the fixture set a rule runs on. The loader builds one panel per universe from the
