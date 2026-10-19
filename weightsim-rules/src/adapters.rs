@@ -437,6 +437,62 @@ impl WeightRule for CryptoTrendRule {
     }
 }
 
+/// The compiled `crypto_trend_100d` rule as certified on the CRYPTO EVIDENCE window (Amendment 13, fixture set
+/// `FixtureSetId::CryptoEvidence`, sleeve `S3e`): the published [`CryptoTrendRule`] point, run unchanged.
+///
+/// It exists only because the registry keys a rule by its compiled id and the legacy set already holds
+/// `crypto_trend_100d` (sleeve `S3`, the 2016-2020 window, engine certification only). The evidence window needs a
+/// second sleeve of the SAME rule, and a second entry under the same id would make every id-keyed lookup ambiguous;
+/// so the evidence sleeve is registered under the id `crypto_trend_100d_evidence`, and the library entry
+/// `crypto_trend_100d` resolves to it in the Engine's entry-id table. Every behaviour (universe, parameters,
+/// schedule, rebalance policy, warm-up, weights) is the inner rule's, so the evidence key is checked against exactly
+/// the code S3 is checked against; only [`WeightRule::id`] differs.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CryptoTrendEvidenceRule {
+    inner: CryptoTrendRule,
+}
+
+impl CryptoTrendEvidenceRule {
+    /// The published point (`CryptoTrendRule::default()`): the only certified one.
+    pub fn new() -> Self {
+        CryptoTrendEvidenceRule::default()
+    }
+    /// The wrapped rule.
+    pub fn inner(&self) -> &CryptoTrendRule {
+        &self.inner
+    }
+}
+
+impl WeightRule for CryptoTrendEvidenceRule {
+    fn id(&self) -> &'static str {
+        "crypto_trend_100d_evidence"
+    }
+    fn impl_version(&self) -> String {
+        self.inner.impl_version()
+    }
+    fn universe(&self) -> &[&'static str] {
+        self.inner.universe()
+    }
+    fn declared_parameters(&self) -> BTreeMap<&'static str, String> {
+        self.inner.declared_parameters()
+    }
+    fn decision_schedule(&self) -> DecisionSchedule {
+        self.inner.decision_schedule()
+    }
+    fn rebalance_policy(&self) -> RebalancePolicy {
+        self.inner.rebalance_policy()
+    }
+    fn execution_lag_bars(&self) -> usize {
+        self.inner.execution_lag_bars()
+    }
+    fn min_history_bars(&self) -> usize {
+        self.inner.min_history_bars()
+    }
+    fn target_weights(&self, h: &HistoryView<'_>) -> Result<Vec<f64>, RuleRefusal> {
+        self.inner.target_weights(h)
+    }
+}
+
 /// `momentum_rank_weighted` (Amendment 14, library entry `etf_cross_sectional_momentum`): the compiled
 /// `reference_rules::MomentumRankWeighted` over the five ETFs, ranked daily by trailing 126-bar return, every ranked
 /// instrument weighted `(K + 1 - r) / (K (K + 1) / 2)`.

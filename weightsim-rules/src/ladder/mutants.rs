@@ -36,6 +36,11 @@
 //! | `gem_lookback_off_by_one` | independent rule with an 11-month instead of a 12-month trailing return |
 //! | `gem_relative_pick_inverted` | independent rule that holds the LOWER of SPY and EFA when the gate is open (an exact tie goes to SPY, the rule's goes to EFA) |
 //! | `gem_gate_always_open` | independent rule that skips the absolute-momentum gate, so it never holds AGG |
+//!
+//! The five mutants of the crypto evidence set (Amendment 13 section 5 and T4; sleeve `S3e`, rule
+//! `crypto_trend_100d_evidence`) are listed in [`Mutant::CRYPTO_EVIDENCE`]: the five `s3_*` mutants of Amendment 11 under
+//! their pre-registered names, each the very same wrong implementation as its `S3*` twin (the `S3e*` variants delegate
+//! to it) replayed on the evidence panel against the evidence key.
 
 use weightsim::{
     Date, DecisionSchedule, HistoryView, Panel, RebalancePolicy, RefusalKind, RuleRefusal, SimResult, WeightRule,
@@ -77,6 +82,14 @@ pub enum Mutant {
     S6LookbackOffByOne,
     S6RelativePickInverted,
     S6GateAlwaysOpen,
+    // The crypto evidence set (Amendment 13 sections 5 and 6, T4): the five S3 mutants of Amendment 11, replayed on
+    // the evidence window against sleeve `S3e`. The same wrong implementations as the `S3*` variants (these delegate
+    // to them); only the sleeve (panel, key, counted window) differs.
+    S3eSameDayPeek,
+    S3eExtraDelay,
+    S3eSmaExcludesToday,
+    S3eHalfSizing,
+    S3eDriftingSubaccounts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +100,8 @@ pub enum MutantSleeve {
     S4,
     /// `dual_momentum_gem` in the `GemEvidence` fixture set. (`S5` is reserved for the low-vol evidence set.)
     S6,
+    /// `crypto_trend_100d_evidence` in the `CryptoEvidence` fixture set (Amendment 13).
+    S3e,
 }
 
 impl MutantSleeve {
@@ -97,6 +112,7 @@ impl MutantSleeve {
             MutantSleeve::S3 => "S3",
             MutantSleeve::S4 => "S4",
             MutantSleeve::S6 => "S6",
+            MutantSleeve::S3e => "S3e",
         }
     }
 
@@ -106,6 +122,7 @@ impl MutantSleeve {
             "S3" => Some(MutantSleeve::S3),
             "S4" => Some(MutantSleeve::S4),
             "S6" => Some(MutantSleeve::S6),
+            "S3e" => Some(MutantSleeve::S3e),
             _ => None,
         }
     }
@@ -141,6 +158,15 @@ impl Mutant {
         Mutant::S6GateAlwaysOpen,
     ];
 
+    /// The five mutants of the crypto evidence set (sleeve `S3e`), in the order of Amendment 13 section 5.
+    pub const CRYPTO_EVIDENCE: [Mutant; 5] = [
+        Mutant::S3eSameDayPeek,
+        Mutant::S3eExtraDelay,
+        Mutant::S3eSmaExcludesToday,
+        Mutant::S3eHalfSizing,
+        Mutant::S3eDriftingSubaccounts,
+    ];
+
     /// The mutants of one fixture set, in table order: what its ladder runs in Tier IV. [`Mutant::ALL`] is the
     /// legacy set's eight, unchanged.
     pub fn of_set(set: FixtureSetId) -> &'static [Mutant] {
@@ -148,6 +174,7 @@ impl Mutant {
             FixtureSetId::Legacy => &Mutant::ALL,
             FixtureSetId::MomentumEvidence => &Mutant::MOMENTUM,
             FixtureSetId::GemEvidence => &Mutant::GEM,
+            FixtureSetId::CryptoEvidence => &Mutant::CRYPTO_EVIDENCE,
         }
     }
 
@@ -172,6 +199,12 @@ impl Mutant {
             Mutant::S6LookbackOffByOne => "gem_lookback_off_by_one",
             Mutant::S6RelativePickInverted => "gem_relative_pick_inverted",
             Mutant::S6GateAlwaysOpen => "gem_gate_always_open",
+            // The names Amendment 13 section 5 pre-registers (the S3 names of Amendment 11), unchanged.
+            Mutant::S3eSameDayPeek => "s3_same_day_peek",
+            Mutant::S3eExtraDelay => "s3_extra_1day_delay",
+            Mutant::S3eSmaExcludesToday => "s3_sma_excludes_today",
+            Mutant::S3eHalfSizing => "s3_half_sizing",
+            Mutant::S3eDriftingSubaccounts => "s3_drifting_subaccounts",
         }
     }
 
@@ -188,6 +221,11 @@ impl Mutant {
             | Mutant::S6LookbackOffByOne
             | Mutant::S6RelativePickInverted
             | Mutant::S6GateAlwaysOpen => MutantSleeve::S6,
+            Mutant::S3eSameDayPeek
+            | Mutant::S3eExtraDelay
+            | Mutant::S3eSmaExcludesToday
+            | Mutant::S3eHalfSizing
+            | Mutant::S3eDriftingSubaccounts => MutantSleeve::S3e,
             _ => MutantSleeve::S3,
         }
     }
@@ -214,6 +252,11 @@ impl Mutant {
             Mutant::S6LookbackOffByOne => "11-month trailing return instead of 12",
             Mutant::S6RelativePickInverted => "holds the lower of SPY and EFA instead of the higher",
             Mutant::S6GateAlwaysOpen => "no absolute-momentum gate: never holds AGG",
+            Mutant::S3eSameDayPeek => Mutant::S3SameDayPeek.description(),
+            Mutant::S3eExtraDelay => Mutant::S3ExtraDelay.description(),
+            Mutant::S3eSmaExcludesToday => Mutant::S3SmaExcludesToday.description(),
+            Mutant::S3eHalfSizing => Mutant::S3HalfSizing.description(),
+            Mutant::S3eDriftingSubaccounts => Mutant::S3DriftingSubaccounts.description(),
         }
     }
 }
@@ -734,5 +777,11 @@ pub fn run_mutant_on(panel: &Panel, key: &SleeveKey, m: Mutant) -> Result<Mutant
             };
             from_sim(&run_gross(panel, &rule, key, 0)?, key)
         }
+        // The crypto evidence set replays the S3 wrong implementations unchanged on its own panel and key.
+        Mutant::S3eSameDayPeek => run_mutant_on(panel, key, Mutant::S3SameDayPeek),
+        Mutant::S3eExtraDelay => run_mutant_on(panel, key, Mutant::S3ExtraDelay),
+        Mutant::S3eSmaExcludesToday => run_mutant_on(panel, key, Mutant::S3SmaExcludesToday),
+        Mutant::S3eHalfSizing => run_mutant_on(panel, key, Mutant::S3HalfSizing),
+        Mutant::S3eDriftingSubaccounts => run_mutant_on(panel, key, Mutant::S3DriftingSubaccounts),
     }
 }
